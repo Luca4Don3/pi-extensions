@@ -20,11 +20,36 @@ const jiti = createJiti(import.meta.url);
 const loaded = await jiti.import(fileURLToPath(new URL("../index.ts", import.meta.url)));
 const plugin = loaded.default ?? loaded;
 
-/** mock Pi 的 ExtensionAPI：只收集注册的工具。 */
-const tools = [];
-plugin({ registerTool: (tool) => tools.push(tool) });
-const tool = tools[0];
-if (tool === undefined) throw new Error("扩展没有注册任何工具");
+/** fake 密钥库：默认「不可用」，测试永不触碰真实 Keychain / Secret Service。 */
+function createFakeStore(overrides = {}) {
+	return {
+		kind: "none",
+		read: async () => ({ status: "unavailable", reason: "测试未注入密钥库" }),
+		clear: async () => ({ status: "unavailable", reason: "测试未注入密钥库" }),
+		...overrides,
+	};
+}
+
+/**
+ * 创建一个独立的扩展实例（工具 + 命令），并注入 fake 凭据存储。
+ * 每个实例独立注册，避免用例之间互相污染。
+ */
+function setup(options = {}) {
+	const tools = [];
+	const commands = [];
+	plugin(
+		{
+			registerTool: (tool) => tools.push(tool),
+			registerCommand: (name, command) => commands.push({ name, ...command }),
+		},
+		{ credentialStore: options.credentialStore ?? createFakeStore() },
+	);
+	if (tools.length === 0) throw new Error("扩展没有注册任何工具");
+	return { tool: tools[0], tools, commands };
+}
+
+/** 默认实例：供既有用例使用。 */
+const { tool, commands } = setup();
 
 /** 落盘目录，与 index.ts 中 join(tmpdir(), "pi-web-search") 保持一致。 */
 const SPILL_DIR = join(tmpdir(), "pi-web-search");
@@ -152,7 +177,12 @@ test("5. 调用方取消：aborted 且快速返回", async () => {
 				const startedAt = Date.now();
 				await assert.rejects(
 					tool.execute("t5", { query: "cancel", provider: "exa" }, controller.signal),
-					/aborted/,
+					(error) => {
+						assert.ok(error instanceof DOMException);
+						assert.match(error.message, /aborted/);
+						assert.equal(error.name, "AbortError");
+						return true;
+					},
 				);
 				assert.ok(Date.now() - startedAt < 2000, "取消应在 2 秒内返回");
 			},

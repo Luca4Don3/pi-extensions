@@ -32,5 +32,5 @@ jobs:
             ln -sfn "$PI_PKG/node_modules/@earendil-works/$p" "node_modules/@earendil-works/$p"
           done
 
-      - name: Run offline mock tests
-        run: node --test extensions/*/tests/mock.test.mjs
+      - name: Run offline tests
+        run: npm test

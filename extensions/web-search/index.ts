@@ -11,6 +11,9 @@
  * - 路由为「Key 优先、失败降级免费通道」：Exa Key → Exa Free → Parallel Key → Parallel Free。
  * - 失败按错误类型决策：额度/鉴权直接换通道，限流与 5xx 退避重试，取消立即终止。
  * - 模型可见正文截断到 MAX_TEXT_CHARS，原文落盘供模型按需 read。
+ * - Exa / Parallel key 解析顺序：环境变量优先，其次系统密钥库
+ *   （macOS Keychain / Linux secret-tool，用 `/web-search-auth` 查看与删除）。
+ *   key 不写入 session、不进入命令行参数、不落盘；错误文本统一脱敏。
  *
  * @module pi-web-search
  */
@@ -20,6 +23,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
+import { createSecretStore, type SecretStore } from "./credentials.js";
+import { resolvePlanKeys, redactSecrets, safeDiagnostic } from "./auth.js";
+import { registerAuthCommand } from "./auth-ui.js";
 
 /** Exa 远程 MCP 端点（可选 key 以查询参数附加）。 */
 const EXA_MCP_URL = "https://mcp.exa.ai/mcp";
@@ -43,10 +49,8 @@ const SPILL_MAX_BYTES = 2 * 1024 * 1024;
 const SPILL_KEEP_FILES = 20;
 /** 落盘目录名（位于系统临时目录下，不进入任何公开目录）。 */
 const SPILL_DIR_NAME = "pi-web-search";
-/** 单个后端错误进入工具结果的字符上限。 */
-const MAX_ERROR_CHARS = 300;
 /** 归属标识，便于端点侧识别调用方。 */
-const USER_AGENT = "pi-web-search/0.3.0";
+const USER_AGENT = "pi-web-search/0.4.0-beta.1";
 
 /** 后端选择：auto 表示按计划依次尝试。 */
 type Provider = "auto" | "exa" | "parallel";
@@ -70,6 +74,8 @@ type SearchErrorKind =
 interface RouteStep {
 	backend: Backend;
 	channel: Channel;
+	/** key 通道使用的凭据；仅存在于内存，绝不写入日志、session 或落盘内容。 */
+	apiKey?: string;
 }
 
 /** 归一化后的来源条目。 */
@@ -169,12 +175,6 @@ function readIntEnv(name: string, fallback: number, min: number): number {
 	return Number.isInteger(value) && value >= min ? value : fallback;
 }
 
-/** 环境变量是否给出了非空凭据。 */
-function hasEnvKey(name: string): boolean {
-	const value = process.env[name];
-	return typeof value === "string" && value.trim().length > 0;
-}
-
 /** 按 HTTP 状态码归类。 */
 function statusKind(status: number): SearchErrorKind {
 	if (status === 401 || status === 403) return "invalid_key";
@@ -208,21 +208,23 @@ function parseRetryAfter(value: string | null): number | undefined {
 	return Math.min(Math.max(at - Date.now(), 0), RETRY_MAX_WAIT_MS);
 }
 
-/** 单后端的通道顺序：配置了 key 就先走 key 通道，再走免费通道。 */
-function backendSteps(backend: Backend): RouteStep[] {
+/**
+ * 单后端的通道顺序：解析到 key 就先走 key 通道，再走免费通道。
+ * key 由调用方在本次搜索开始时解析一次（环境变量优先，其次系统密钥库），
+ * 之后只随 RouteStep 在内存中流转。
+ */
+function backendSteps(backend: Backend, key: string | undefined): RouteStep[] {
 	const steps: RouteStep[] = [];
-	if (hasEnvKey(backend === "exa" ? "EXA_API_KEY" : "PARALLEL_API_KEY")) {
-		steps.push({ backend, channel: "key" });
-	}
+	if (key !== undefined && key.length > 0) steps.push({ backend, channel: "key", apiKey: key });
 	steps.push({ backend, channel: "free" });
 	return steps;
 }
 
 /** 完整尝试计划：Exa 的 key / free，再到 Parallel 的 key / free。 */
-function routePlan(provider: Provider): RouteStep[] {
-	if (provider === "exa") return backendSteps("exa");
-	if (provider === "parallel") return backendSteps("parallel");
-	return [...backendSteps("exa"), ...backendSteps("parallel")];
+function routePlan(provider: Provider, keys: Record<Backend, string | undefined>): RouteStep[] {
+	if (provider === "exa") return backendSteps("exa", keys.exa);
+	if (provider === "parallel") return backendSteps("parallel", keys.parallel);
+	return [...backendSteps("exa", keys.exa), ...backendSteps("parallel", keys.parallel)];
 }
 
 /** 失败信息里标识具体通道。 */
@@ -230,11 +232,12 @@ function stepLabel(step: RouteStep): string {
 	return step.channel === "key" ? `${step.backend}(key)` : step.backend;
 }
 
-/** 后端错误信息截断，避免把上游长文本灌进工具结果。 */
-function errorMessage(error: unknown): string {
-	const raw = error instanceof Error ? error.message : String(error);
-	return raw.length > MAX_ERROR_CHARS ? `${raw.slice(0, MAX_ERROR_CHARS)}…` : raw;
+/** 统一创建可被运行时识别的取消错误，不传播底层错误文本。 */
+function createAbortError(): DOMException {
+	return new DOMException("web_search aborted", "AbortError");
 }
+
+/** 后端错误信息不再在内部预截断：截断必须发生在脱敏之后（见 safeDiagnostic）。 */
 
 /** 可被 AbortSignal 立即打断的等待。 */
 function sleep(ms: number, signal?: AbortSignal): Promise<void> {
@@ -242,7 +245,7 @@ function sleep(ms: number, signal?: AbortSignal): Promise<void> {
 		const abort = (): void => {
 			clearTimeout(timer);
 			signal?.removeEventListener("abort", abort);
-			reject(new Error("web_search aborted"));
+			reject(createAbortError());
 		};
 		const timer = setTimeout(() => {
 			signal?.removeEventListener("abort", abort);
@@ -257,12 +260,9 @@ function sleep(ms: number, signal?: AbortSignal): Promise<void> {
 }
 
 /** Exa 端点：key 通道带 Key，free 通道不带任何凭据。 */
-function exaEndpoint(channel: Channel): string {
-	if (channel === "key") {
-		const key = process.env.EXA_API_KEY;
-		if (typeof key === "string" && key.length > 0) {
-			return `${EXA_MCP_URL}?exaApiKey=${encodeURIComponent(key)}`;
-		}
+function exaEndpoint(step: RouteStep): string {
+	if (step.channel === "key" && step.apiKey !== undefined && step.apiKey.length > 0) {
+		return `${EXA_MCP_URL}?exaApiKey=${encodeURIComponent(step.apiKey)}`;
 	}
 	return EXA_MCP_URL;
 }
@@ -404,7 +404,7 @@ function parsePayload(line: string): string | undefined {
 	if (envelope.error !== undefined) {
 		const detail = typeof envelope.error === "string" ? envelope.error : envelope.error.message;
 		const message = typeof detail === "string" && detail.length > 0 ? detail : "MCP search error";
-		throw new BackendError(errorMessage(message), messageKind(message) ?? "protocol_error");
+		throw new BackendError(message, messageKind(message) ?? "protocol_error");
 	}
 	const content = envelope.result?.content;
 	const item = Array.isArray(content)
@@ -415,7 +415,7 @@ function parsePayload(line: string): string | undefined {
 	// 这种情况必须当成错误，不能把 content 里的错误文本当作搜索结果交给模型。
 	if (envelope.result?.isError === true) {
 		const message = typeof text === "string" && text.length > 0 ? text : "MCP search tool failed";
-		throw new BackendError(errorMessage(message), messageKind(message) ?? "protocol_error");
+		throw new BackendError(message, messageKind(message) ?? "protocol_error");
 	}
 	return text;
 }
@@ -474,6 +474,20 @@ async function spillFullText(text: string): Promise<SpillResult> {
 	await writeFile(file, buffer.subarray(0, SPILL_MAX_BYTES), { mode: 0o600 });
 	await pruneSpillDirectory(directory);
 	return { path: file, complete: buffer.byteLength <= SPILL_MAX_BYTES };
+}
+
+/**
+ * 对单条来源的所有可见字段统一脱敏。
+ * 上游响应可能回显 key（例如错误链接或 URL 查询参数），这里保证 key
+ * 不会经 content / details / 落盘进入模型上下文。
+ */
+function redactSource(source: WebSource, secrets: readonly (string | undefined)[]): WebSource {
+	return {
+		url: redactSecrets(source.url, secrets),
+		...(source.title !== undefined ? { title: redactSecrets(source.title, secrets) } : {}),
+		...(source.snippet !== undefined ? { snippet: redactSecrets(source.snippet, secrets) } : {}),
+		...(source.publishedAt !== undefined ? { publishedAt: redactSecrets(source.publishedAt, secrets) } : {}),
+	};
 }
 
 /** Parallel 的来源列表转 Markdown；没有可用来源时退回原始正文。 */
@@ -546,9 +560,8 @@ async function searchChannel(
 		"content-type": "application/json",
 		"user-agent": USER_AGENT,
 	};
-	if (backend === "parallel" && channel === "key") {
-		const key = process.env.PARALLEL_API_KEY;
-		if (typeof key === "string" && key.length > 0) headers.authorization = `Bearer ${key}`;
+	if (backend === "parallel" && channel === "key" && step.apiKey !== undefined && step.apiKey.length > 0) {
+		headers.authorization = `Bearer ${step.apiKey}`;
 	}
 
 	/** 执行一次请求；失败一律以带分类的 BackendError 抛出。 */
@@ -563,12 +576,12 @@ async function searchChannel(
 		const onAbort = (): void => controller.abort(signal?.reason);
 		if (signal?.aborted === true) {
 			clearTimeout(timer);
-			throw new Error("web_search aborted");
+			throw createAbortError();
 		}
 		signal?.addEventListener("abort", onAbort, { once: true });
 
 		try {
-			const response = await fetch(backend === "exa" ? exaEndpoint(channel) : PARALLEL_MCP_URL, {
+			const response = await fetch(backend === "exa" ? exaEndpoint(step) : PARALLEL_MCP_URL, {
 				method: "POST",
 				headers,
 				body: JSON.stringify(payload),
@@ -591,7 +604,7 @@ async function searchChannel(
 			if (text === undefined) throw new BackendError(`${backend} returned no usable results`, "protocol_error");
 			return { text, sources: extractSources(text) };
 		} catch (error) {
-			if (signal?.aborted === true) throw new Error("web_search aborted");
+			if (signal?.aborted === true) throw createAbortError();
 			if (timedOut) throw new BackendError(`${backend} timed out after ${timeoutMs}ms`, "timeout");
 			if (error instanceof BackendError) throw error;
 			// fetch 网络层错误（DNS、连接重置等）值得重试。
@@ -607,7 +620,7 @@ async function searchChannel(
 			const result = await attempt();
 			return { ...result, attempts: round + 1 };
 		} catch (error) {
-			if (signal?.aborted === true) throw new Error("web_search aborted");
+			if (signal?.aborted === true) throw createAbortError();
 			if (error instanceof BackendError) error.attempts = round + 1;
 			if (!(error instanceof BackendError) || !error.retryable || round >= retries) throw error;
 			// 退避等待可被取消打断；上游给出的 Retry-After 不短于本地退避。
@@ -616,8 +629,17 @@ async function searchChannel(
 	}
 }
 
-/** 注册 `web_search` 工具。 */
-export default function piWebSearch(pi: ExtensionAPI): void {
+/** 扩展的可注入选项（测试用）。 */
+export interface WebSearchOptions {
+	/** 系统密钥库；默认按平台选择（macOS Keychain / Linux secret-tool）。测试注入 fake，不触碰真实密钥库。 */
+	credentialStore?: SecretStore;
+}
+
+/** 注册 `web_search` 工具与 `/web-search-auth` 命令。 */
+export default function piWebSearch(pi: ExtensionAPI, options: WebSearchOptions = {}): void {
+	const store: SecretStore = options.credentialStore ?? createSecretStore();
+	registerAuthCommand(pi, store);
+
 	pi.registerTool({
 		name: "web_search",
 		label: "Web Search",
@@ -629,18 +651,27 @@ export default function piWebSearch(pi: ExtensionAPI): void {
 			const query = params.query.trim();
 			if (query.length === 0) throw new Error("query must not be empty");
 
+			const provider = params.provider ?? "auto";
 			const numResults = params.maxResults ?? DEFAULT_NUM_RESULTS;
+			// 每次搜索只为可能用到的后端解析一次 key（环境变量优先，其次系统密钥库）。
+			const keys = await resolvePlanKeys(provider, store);
+			// 本次请求涉及的全部 key，用于把所有对外错误文本中的凭据抹掉。
+			const secrets = [keys.exa, keys.parallel];
 			const failures: { label: string; kind: SearchErrorKind | "unknown"; message: string }[] = [];
 			let attemptCount = 0;
 
 			// Key 通道失败会降级到同后端的免费通道，再进入下一个后端。
-			for (const step of routePlan(params.provider ?? "auto")) {
+			for (const step of routePlan(provider, keys)) {
 				try {
-					if (signal?.aborted === true) throw new Error("web_search aborted");
-					const { text, sources: rawSources, attempts } = await searchChannel(step, query, numResults, signal);
+					if (signal?.aborted === true) throw createAbortError();
+					const { text: rawText, sources: rawSources, attempts } = await searchChannel(step, query, numResults, signal);
 					attemptCount += attempts;
+					// 上游响应可能回显 key（错误正文、URL 查询参数等）：在进入模型上下文
+					// （content / details）与落盘前统一脱敏，key 绝不流出。
+					const text = redactSecrets(rawText, secrets);
+					const safeQuery = redactSecrets(query, secrets);
 					// Exa 自身遵守 numResults；Parallel 不受该参数约束，这里统一截断到请求条数。
-					const sources = rawSources.slice(0, numResults);
+					const sources = rawSources.map((source) => redactSource(source, secrets)).slice(0, numResults);
 					const outcome: SearchOutcome = {
 						backend: step.backend,
 						text,
@@ -648,21 +679,22 @@ export default function piWebSearch(pi: ExtensionAPI): void {
 						truncated: text.length > MAX_TEXT_CHARS,
 					};
 					// 取消贯穿整个生命周期：拿到结果后、落盘前再确认一次。
-					if (signal?.aborted === true) throw new Error("web_search aborted");
+					if (signal?.aborted === true) throw createAbortError();
 					// 超限正文落盘，模型仍可按需 read 完整内容（沿用 Pi 对大结果的惯例）。
 					const spill = outcome.truncated ? await spillFullText(text) : undefined;
 					const fallbackReason =
 						failures.length > 0
-							? errorMessage(
+							? safeDiagnostic(
 									failures.map((failure) => `${failure.label}[${failure.kind}]: ${failure.message}`).join(" | "),
+									secrets,
 								)
 							: undefined;
 					return {
-						content: [{ type: "text" as const, text: renderOutcome(query, outcome, spill) }],
+						content: [{ type: "text" as const, text: renderOutcome(safeQuery, outcome, spill) }],
 						details: {
 							provider: step.backend,
 							channel: step.channel,
-							query,
+							query: safeQuery,
 							numResults,
 							sourceCount: sources.length,
 							sources,
@@ -673,12 +705,12 @@ export default function piWebSearch(pi: ExtensionAPI): void {
 						},
 					};
 				} catch (error) {
-					if (signal?.aborted === true) throw error;
+					if (signal?.aborted === true) throw createAbortError();
 					attemptCount += error instanceof BackendError ? error.attempts : 1;
 					failures.push({
 						label: stepLabel(step),
 						kind: error instanceof BackendError ? error.kind : "unknown",
-						message: errorMessage(error),
+						message: safeDiagnostic(error, secrets),
 					});
 				}
 			}

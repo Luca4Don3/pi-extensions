@@ -15,7 +15,15 @@ const module_ = await jiti.import(fileURLToPath(new URL("../index.ts", import.me
 const plugin = module_.default ?? module_;
 
 const tools = [];
-plugin({ registerTool: (tool) => tools.push(tool) });
+const noSystemStore = {
+	kind: "none",
+	read: async () => ({ status: "unavailable", reason: "smoke test skips system key stores" }),
+	clear: async () => ({ status: "unavailable", reason: "smoke test skips system key stores" }),
+};
+plugin(
+	{ registerTool: (tool) => tools.push(tool), registerCommand: () => undefined },
+	{ credentialStore: noSystemStore },
+);
 
 const tool = tools[0];
 if (!tool) throw new Error("扩展没有注册任何工具");

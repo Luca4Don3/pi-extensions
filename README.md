@@ -22,9 +22,13 @@ pi-extensions/
 ├── extensions/
 │   ├── web-search/
 │   │   ├── index.ts              # 扩展入口
+│   │   ├── auth.ts               # 凭据解析 / 状态 / 脱敏
+│   │   ├── auth-ui.ts            # /web-search-auth 菜单
+│   │   ├── credentials.ts        # Keychain / secret-tool 访问层
 │   │   ├── package.json          # 让该插件可被单独安装
 │   │   └── tests/
 │   │       ├── mock.test.mjs     # 离线测试（CI 跑这个）
+│   │       ├── auth.test.mjs     # 认证离线测试
 │   │       └── smoke.mjs         # 真实网络冒烟
 │   ├── subagent/
 │   │   ├── index.ts              # 工具入口
@@ -286,6 +290,7 @@ Pi 的内置工具只有 `read` / `bash` / `edit` / `write` / `grep` / `find` / 
 - 限流（429）尊重上游 `Retry-After`，5xx 与网络抖动按指数退避重试
 - 取消贯穿完整生命周期：请求、响应体读取、退避等待、故障切换、落盘
 - MCP `result.isError` 被识别为失败，不会把错误文本当成搜索结果
+- `/web-search-auth` 菜单管理凭据：macOS Keychain / Linux secret-tool，环境变量优先，错误文本统一脱敏
 
 **暂不承诺**：匿名端点的无限额度、所有模型（仅在作者本地的一个模型上实测过）、长期运行稳定性。
 
@@ -294,6 +299,7 @@ Pi 的内置工具只有 `read` / `bash` / `edit` / `write` / `grep` / `find` / 
 - 原生 `web_search` 工具，模型可直接调用，无需再拼 `curl` 命令
 - 双后端：Exa（`mcp.exa.ai`）与 Parallel（`search.parallel.ai`）的远程 MCP 端点，默认免 key
 - **Key 优先、失败降级**：配了 key 先走认证通道，额度耗尽或鉴权失败自动改用免费通道，不浪费付费额度
+- **凭据可托管给系统密钥库**：`/web-search-auth` 菜单查看状态、生成安全配置命令、删除条目；环境变量优先，macOS Keychain / Linux secret-tool 次之
 - `provider: "auto"` 依次尝试 Exa 与 Parallel 的全部可用通道
 - 同时解析直接 JSON 与 SSE 事件块（同一事件的多行 `data:` 拼接）
 - 单请求预算可注入（默认 25 秒），取消信号贯穿请求、读体、退避、切换与落盘
@@ -324,16 +330,44 @@ Pi 的内置工具只有 `read` / `bash` / `edit` / `write` / `grep` / `find` / 
 
 ## 配置
 
-全部通过环境变量，均有默认值：
+以下环境变量均可选，都有默认值（也可以把 key 交给系统密钥库，见下一节）：
 
 | 环境变量 | 默认 | 作用 |
 | --- | --- | --- |
-| `EXA_API_KEY` | 空 | 以 `?exaApiKey=` 查询参数附加到 Exa 端点 |
-| `PARALLEL_API_KEY` | 空 | 以 `Authorization: Bearer` 头附加到 Parallel 端点 |
+| `EXA_API_KEY` | 空 | 以 `?exaApiKey=` 查询参数附加到 Exa 端点；优先于系统密钥库 |
+| `PARALLEL_API_KEY` | 空 | 以 `Authorization: Bearer` 头附加到 Parallel 端点；优先于系统密钥库 |
 | `PI_WEB_SEARCH_TIMEOUT_MS` | `25000` | 单请求预算，最小 `100` |
 | `PI_WEB_SEARCH_RETRIES` | `1` | 可重试错误的最大重试次数，`0` 表示不重试 |
 
 两个端点默认免 key；填 key 只是为了更高额度。
+
+## 认证（`/web-search-auth`）
+
+两个后端都遵循「环境变量优先，系统密钥库其次」：
+
+| 平台 | 系统密钥库 | 配置方式 |
+| --- | --- | --- |
+| macOS | Keychain | `security add-generic-password` |
+| Linux | Secret Service（`secret-tool`） | `secret-tool store` |
+| 其它 | 无 | 用外部 secret manager（1Password CLI、Vault、sops、direnv 等）注入进程环境变量，或直接用免 key 通道 |
+
+在 Pi 里执行 `/web-search-auth` 打开 select 菜单：
+
+- **查看状态**：分别报告 exa / parallel 的凭据来源，并区分「未配置」与「系统密钥库不可用」。密钥库读取失败不会阻断搜索，仍会退到免 key 通道。
+- **查看配置说明**：输出安全的终端命令，key 只从命令的交互提示读取，**绝不放进命令参数**：
+
+  ```bash
+  # macOS
+  security add-generic-password -U -a "$USER" -s "pi-web-search-exa" -w
+  # Linux
+  secret-tool store --label="Pi web search: exa" service pi-web-search provider exa
+  ```
+
+- **删除系统密钥库中的密钥**：二次确认后删除对应后端的条目；成功、未找到、失败都有明确诊断。
+
+设计上不在 Pi 的输入框里接收 key（也不使用自定义掩码输入框），密钥写入完全交给系统自带命令，避免 key 进入 Pi 会话、日志或 shell 历史（关键是 `-w` / `store` 后不要跟任何 key 参数）。
+
+> 环境变量始终优先于系统密钥库；每次 `web_search` 只为用到的后端各解析一次凭据，key 仅存在于内存，不进入 `details`、session 或落盘内容；所有对外错误文本（含 URL 编码形式）都会脱敏。
 
 ## 搜索路由
 
@@ -396,15 +430,16 @@ Exa 返回的正文本身已是大模型友好的文本布局（`Title:` / `URL:
 - 文件：`results-<时间戳>-<随机>.txt`，权限 `0600`
 - 单文件上限 2 MB，超出时 `details.fullTextComplete` 为 `false`
 - 目录只保留最近 20 个文件，更旧的自动清理
-- 仅写入公开网页正文；API key 只出现在请求头或 URL，不进入落盘内容
+- 仅写入公开网页正文；API key 只在内存与请求头 / URL 中，不进入落盘内容，也不会出现在错误文本里
+- 上游响应回显 key（正文、来源 URL 或错误文本）时，`content`、`details` 与落盘内容都会先脱敏再截断
 
 ## 开发与测试
 
 以下测试覆盖仓库内**所有**插件：
 
 ```bash
-# 离线测试（55 例）：web-search 27 + opencode-fallback 17 + subagent 11
-node --test extensions/*/tests/mock.test.mjs
+# 离线测试（83 例）：web-search 27 + web-search auth 23 + opencode-fallback 17 + subagent 16
+node --test extensions/*/tests/*.test.mjs
 
 # 真实网络冒烟（会调用 Exa / Parallel，仅 web-search）
 node extensions/web-search/tests/smoke.mjs
@@ -434,7 +469,7 @@ CI（`.github/workflows/ci.yml`）固定安装 `@earendil-works/pi-coding-agent@
 
 ## 路线图
 
-- Key 冷却与状态管理：避免重复请求已确认不可用的认证通道
+- Key 冷却：避免重复请求已确认不可用的认证通道
 - `web_fetch`：读取指定 URL 的正文，进一步减少对 `curl` 的依赖
 - 结果缓存：减少重复查询
 - 更多后端的可插拔注册

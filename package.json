@@ -38,7 +38,7 @@
     "typebox": "*"
   },
   "scripts": {
-    "test": "node --test extensions/*/tests/mock.test.mjs",
+    "test": "node --test extensions/*/tests/*.test.mjs",
     "test:live": "node extensions/web-search/tests/smoke.mjs"
   }
 }
