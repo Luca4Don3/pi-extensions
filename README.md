@@ -6,9 +6,11 @@
 
 ## 包含的扩展
 
-| 扩展 | 目录 | 作用 |
-| --- | --- | --- |
-| Web Search | `extensions/web-search/` | 原生 `web_search` 工具：免 key 直连 Exa / Parallel MCP 端点，Key → Free 自动降级 |
+每个插件目录都是**完整独立的 Pi 包**（自带 `package.json`），可以单独安装：
+
+| 插件 | 目录 | 安装 | 作用 |
+| --- | --- | --- | --- |
+| Web Search | `extensions/web-search/` | `pi install ~/pi-extensions/extensions/web-search` | 原生 `web_search` 工具：免 key 直连 Exa / Parallel MCP，Key → Free 自动降级 |
 
 ## 仓库结构
 
@@ -17,11 +19,12 @@ pi-extensions/
 ├── extensions/
 │   └── web-search/
 │       ├── index.ts              # 扩展入口
+│       ├── package.json          # 让该插件可被单独安装
 │       └── tests/
 │           ├── mock.test.mjs     # 离线测试（CI 跑这个）
 │           └── smoke.mjs         # 真实网络冒烟
 ├── .github/workflows/ci.yml
-├── package.json                  # pi.extensions 声明所有插件入口
+├── package.json                  # 根 manifest：pi.extensions 声明所有插件入口
 └── README.md
 ```
 
@@ -35,13 +38,48 @@ pi-extensions/
 }
 ```
 
-## 安装
+## 安装与启用
+
+这个仓库是**插件集合**，不是一个「装上就全用」的单一扩展。设计上仓库只是「存放位置 + 分发渠道」，**每个插件目录都是完整的独立包**，按需单独安装。
+
+Pi 的 git 源在源码层面把 `packageRoot` 固定为 clone 目录（`package-manager.js`：`metadata.packageRoot = installedPath`），所以 `pi install git:...` 只能按**仓库**粒度安装；要按**目录**粒度安装，用下面的本地路径源。
+
+### 方式一：克隆后按目录独立安装（推荐）
+
+```bash
+git clone https://github.com/Luca4Don3/pi-extensions ~/pi-extensions
+
+# 只安装需要的插件，每个都是独立的包条目
+pi install ~/pi-extensions/extensions/web-search
+```
+
+这样 `pi list` / `pi remove` / `pi config` 都以单个插件为粒度，互不影响：
+
+```bash
+pi list
+# User packages:
+#   ~/pi-extensions/extensions/web-search
+
+pi remove ~/pi-extensions/extensions/web-search
+```
+
+更新只需要拉取仓库：
+
+```bash
+git -C ~/pi-extensions pull
+```
+
+本地路径包是「直接读解析后的路径、不复制文件」，所以 `git pull` 后下次启动 Pi 就是新版本，**不需要重新安装**。
+
+### 方式二：整仓安装 + 过滤启用
+
+如果不想自己 clone，也可以用 git 源整仓安装，再用过滤列表决定加载哪些插件：
 
 ```bash
 pi install git:github.com/Luca4Don3/pi-extensions
 ```
 
-默认会加载本仓库声明的**全部**扩展。只想启用其中一部分，就把 `settings.json` 里的条目改成对象形式，列出需要的入口：
+然后把 `settings.json` 写成对象形式，只列出要启用的插件入口：
 
 ```json
 {
@@ -54,25 +92,19 @@ pi install git:github.com/Luca4Don3/pi-extensions
 }
 ```
 
-`extensions` 数组支持 glob 与排除，例如 `["extensions/*/index.ts", "!extensions/legacy/index.ts"]`；`[]` 表示一个都不加载，`+path` / `-path` 精确包含或排除。
-
-更新：
+写成字符串形式会加载 manifest 声明的**全部**插件，集合会越来越大，建议一律用对象形式。
 
 ```bash
-# 只更新本仓库
 pi update git:github.com/Luca4Don3/pi-extensions
-
-# 更新所有已安装包
-pi update --extensions
 ```
 
-固定到某个版本：
+`extensions` 数组支持 glob 与排除，例如 `["extensions/*/index.ts", "!extensions/legacy/index.ts"]`；`[]` 表示一个都不加载，`+path` / `-path` 用于精确包含或排除。
+
+### 方式三：单次试跑（不写入任何配置）
 
 ```bash
-pi install git:github.com/Luca4Don3/pi-extensions@v0.4.0-beta.1
+pi -e ~/pi-extensions/extensions/web-search/index.ts
 ```
-
-固定 tag 后不会自动跟随新版本，需要手动更新引用。
 
 ## 需要理解的两件事
 
@@ -83,10 +115,10 @@ pi install git:github.com/Luca4Don3/pi-extensions@v0.4.0-beta.1
 ## 新增一个插件
 
 1. 创建 `extensions/<name>/index.ts`，默认导出一个接收 `ExtensionAPI` 的工厂函数
-2. 在 `extensions/<name>/tests/` 下补离线测试
-3. 根 `package.json` 的 `pi.extensions` 已用 glob，通常无需改动
-4. 提交并推送，本地执行 `pi update` 拉取
-5. 需要按需启用时，调整自己 `settings.json` 中的 `extensions` 过滤列表
+2. 创建 `extensions/<name>/package.json`，声明 `pi.extensions: ["./index.ts"]`，让该插件可被单独安装（方式二）
+3. 在 `extensions/<name>/tests/` 下补离线测试
+4. 根 `package.json` 的 `pi.extensions` 已用 glob（`extensions/*/index.ts`），通常无需改动
+5. 提交并推送；本地执行 `pi update` 拉取，再在 `settings.json` 的过滤列表里按需启用
 
 ---
 
