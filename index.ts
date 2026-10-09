@@ -6,10 +6,11 @@
  * 完全不依赖 opencode、DSH 或任何额外服务端进程：只要 Pi 能联网就能用。
  *
  * 设计要点：
- * - 25 秒单请求预算，与 opencode 的 websearch 工具一致；外部取消信号会被转发。
- * - 响应体既可能是直接 JSON，也可能是 SSE（`data: ` 行），两种都解析。
- * - auto 模式先试 Exa，失败自动回退 Parallel。
- * - 模型可见正文截断到 MAX_TEXT_CHARS，结构化来源同时进 details。
+ * - 单请求预算可注入（默认 25 秒），外部取消信号会被转发且立即生效。
+ * - 响应体既可能是直接 JSON，也可能是 SSE（`data:` 事件块），两种都解析。
+ * - 路由为「Key 优先、失败降级免费通道」：Exa Key → Exa Free → Parallel Key → Parallel Free。
+ * - 失败按错误类型决策：额度/鉴权直接换通道，限流与 5xx 退避重试，取消立即终止。
+ * - 模型可见正文截断到 MAX_TEXT_CHARS，原文落盘供模型按需 read。
  *
  * @module pi-web-search
  */
@@ -30,6 +31,8 @@ const DEFAULT_TIMEOUT_MS = 25_000;
 const DEFAULT_RETRIES = 1;
 /** 重试退避基数：第 n 次重试等待 RETRY_BASE_MS * 2^n。 */
 const RETRY_BASE_MS = 400;
+/** 单次退避等待上限，避免上游 Retry-After 把一次搜索拖太久。 */
+const RETRY_MAX_WAIT_MS = 5_000;
 /** 默认返回条数。 */
 const DEFAULT_NUM_RESULTS = 8;
 /** 模型可见正文上限，超出部分被截断并显式告知模型。 */
@@ -40,13 +43,34 @@ const SPILL_MAX_BYTES = 2 * 1024 * 1024;
 const SPILL_KEEP_FILES = 20;
 /** 落盘目录名（位于系统临时目录下，不进入任何公开目录）。 */
 const SPILL_DIR_NAME = "pi-web-search";
+/** 单个后端错误进入工具结果的字符上限。 */
+const MAX_ERROR_CHARS = 300;
 /** 归属标识，便于端点侧识别调用方。 */
-const USER_AGENT = "pi-web-search/0.2.0";
+const USER_AGENT = "pi-web-search/0.3.0";
 
-/** 后端选择：auto 表示按顺序尝试。 */
+/** 后端选择：auto 表示按计划依次尝试。 */
 type Provider = "auto" | "exa" | "parallel";
 /** 具体后端。 */
 type Backend = "exa" | "parallel";
+/** 认证通道：key 使用配置的 API Key，free 不带任何凭据。 */
+type Channel = "key" | "free";
+
+/** 失败分类：决定重试、换通道还是立即终止。 */
+type SearchErrorKind =
+	| "quota_exhausted"
+	| "rate_limited"
+	| "invalid_key"
+	| "server_error"
+	| "network_error"
+	| "timeout"
+	| "aborted"
+	| "protocol_error";
+
+/** 一次尝试：某个后端的某个通道。 */
+interface RouteStep {
+	backend: Backend;
+	channel: Channel;
+}
 
 /** 归一化后的来源条目。 */
 export interface WebSource {
@@ -70,23 +94,24 @@ interface SpillResult {
 	complete: boolean;
 }
 
-/** 带可重试标记的后端错误。 */
+/** 带分类与可选 Retry-After 的后端错误。 */
 class BackendError extends Error {
+	/** 该通道实际发出的请求次数，由 searchChannel 在抛出前回填。 */
+	attempts = 0;
+
 	constructor(
 		message: string,
-		readonly retryable: boolean,
+		readonly kind: SearchErrorKind,
+		readonly retryAfterMs?: number,
 	) {
 		super(message);
 		this.name = "BackendError";
 	}
-}
 
-/** 读取整数环境变量，非法或越界时回退默认值。 */
-function readIntEnv(name: string, fallback: number, min: number): number {
-	const raw = process.env[name];
-	if (raw === undefined || raw.trim().length === 0) return fallback;
-	const value = Number(raw);
-	return Number.isInteger(value) && value >= min ? value : fallback;
+	/** 限流、服务端错误与网络抖动值得重试；额度、鉴权与协议问题不值得。 */
+	get retryable(): boolean {
+		return this.kind === "rate_limited" || this.kind === "server_error" || this.kind === "network_error";
+	}
 }
 
 /** 工具参数表。 */
@@ -96,7 +121,7 @@ const WebSearchParams = Type.Object({
 			"The query. Describe the page you want in natural language instead of stacking keywords, e.g. 'a blog post comparing React and Vue performance'.",
 	}),
 	maxResults: Type.Optional(
-		Type.Number({
+		Type.Integer({
 			description: `Number of results to return. Defaults to ${DEFAULT_NUM_RESULTS}.`,
 			minimum: 1,
 			maximum: 20,
@@ -109,8 +134,10 @@ const WebSearchParams = Type.Object({
 	),
 });
 
-/** URL 以空白或闭合标点结束。 */
+/** URL 以空白或闭合标点结束；带 g 标志，仅供 matchAll 使用。 */
 const URL_RE = /https?:\/\/[^\s<>()"'`\]]+/gu;
+/** 同一模式的非全局副本，供 test() 使用，避免 lastIndex 状态串联。 */
+const URL_CHECK_RE = /https?:\/\/[^\s<>()"'`\]]+/u;
 /** 部分后端会在标题周围带上零宽字符与 BOM。 */
 const ZWSP_RE = /[\u200B-\u200D\uFEFF]/gu;
 /** 纯省略号行不是摘要。 */
@@ -126,8 +153,118 @@ interface McpRequest {
 
 /** MCP `tools/call` 的响应信封（直接 JSON 或单个 SSE 帧）。 */
 interface McpEnvelope {
-	result?: { content?: { type?: string; text?: string }[] };
+	result?: {
+		/** MCP 允许 HTTP 200 + JSON-RPC 成功时用该字段表示工具执行失败。 */
+		isError?: boolean;
+		content?: { type?: string; text?: string }[];
+	};
 	error?: { code?: number; message?: string } | string;
+}
+
+/** 读取整数环境变量，非法或越界时回退默认值。 */
+function readIntEnv(name: string, fallback: number, min: number): number {
+	const raw = process.env[name];
+	if (raw === undefined || raw.trim().length === 0) return fallback;
+	const value = Number(raw);
+	return Number.isInteger(value) && value >= min ? value : fallback;
+}
+
+/** 环境变量是否给出了非空凭据。 */
+function hasEnvKey(name: string): boolean {
+	const value = process.env[name];
+	return typeof value === "string" && value.trim().length > 0;
+}
+
+/** 按 HTTP 状态码归类。 */
+function statusKind(status: number): SearchErrorKind {
+	if (status === 401 || status === 403) return "invalid_key";
+	if (status === 402) return "quota_exhausted";
+	if (status === 429) return "rate_limited";
+	if (status >= 500) return "server_error";
+	return "protocol_error";
+}
+
+/** 按错误文本归类；无明确信号时返回 undefined，让状态码决定。 */
+function messageKind(message: string): SearchErrorKind | undefined {
+	const text = message.toLowerCase();
+	if (/quota|credit|balance|insufficient|payment required|no remaining/.test(text)) return "quota_exhausted";
+	if (/rate limit|too many requests/.test(text)) return "rate_limited";
+	if (/unauthoriz|forbidden|invalid api key|authentication|api key/.test(text)) return "invalid_key";
+	return undefined;
+}
+
+/** HTTP 错误归类：文本信号优先于状态码。 */
+function httpKind(status: number, detail: string): SearchErrorKind {
+	return messageKind(detail) ?? statusKind(status);
+}
+
+/** 解析 Retry-After（秒数或 HTTP 日期），并夹到上限内。 */
+function parseRetryAfter(value: string | null): number | undefined {
+	if (value === null) return undefined;
+	const seconds = Number(value);
+	if (Number.isFinite(seconds) && seconds >= 0) return Math.min(seconds * 1000, RETRY_MAX_WAIT_MS);
+	const at = Date.parse(value);
+	if (Number.isNaN(at)) return undefined;
+	return Math.min(Math.max(at - Date.now(), 0), RETRY_MAX_WAIT_MS);
+}
+
+/** 单后端的通道顺序：配置了 key 就先走 key 通道，再走免费通道。 */
+function backendSteps(backend: Backend): RouteStep[] {
+	const steps: RouteStep[] = [];
+	if (hasEnvKey(backend === "exa" ? "EXA_API_KEY" : "PARALLEL_API_KEY")) {
+		steps.push({ backend, channel: "key" });
+	}
+	steps.push({ backend, channel: "free" });
+	return steps;
+}
+
+/** 完整尝试计划：Exa 的 key / free，再到 Parallel 的 key / free。 */
+function routePlan(provider: Provider): RouteStep[] {
+	if (provider === "exa") return backendSteps("exa");
+	if (provider === "parallel") return backendSteps("parallel");
+	return [...backendSteps("exa"), ...backendSteps("parallel")];
+}
+
+/** 失败信息里标识具体通道。 */
+function stepLabel(step: RouteStep): string {
+	return step.channel === "key" ? `${step.backend}(key)` : step.backend;
+}
+
+/** 后端错误信息截断，避免把上游长文本灌进工具结果。 */
+function errorMessage(error: unknown): string {
+	const raw = error instanceof Error ? error.message : String(error);
+	return raw.length > MAX_ERROR_CHARS ? `${raw.slice(0, MAX_ERROR_CHARS)}…` : raw;
+}
+
+/** 可被 AbortSignal 立即打断的等待。 */
+function sleep(ms: number, signal?: AbortSignal): Promise<void> {
+	return new Promise((resolve, reject) => {
+		const abort = (): void => {
+			clearTimeout(timer);
+			signal?.removeEventListener("abort", abort);
+			reject(new Error("web_search aborted"));
+		};
+		const timer = setTimeout(() => {
+			signal?.removeEventListener("abort", abort);
+			resolve();
+		}, ms);
+		if (signal?.aborted === true) {
+			abort();
+			return;
+		}
+		signal?.addEventListener("abort", abort, { once: true });
+	});
+}
+
+/** Exa 端点：key 通道带 Key，free 通道不带任何凭据。 */
+function exaEndpoint(channel: Channel): string {
+	if (channel === "key") {
+		const key = process.env.EXA_API_KEY;
+		if (typeof key === "string" && key.length > 0) {
+			return `${EXA_MCP_URL}?exaApiKey=${encodeURIComponent(key)}`;
+		}
+	}
+	return EXA_MCP_URL;
 }
 
 /** Exa 文本布局中一块结果的解析结果。 */
@@ -181,6 +318,8 @@ function extractSourcesByLines(text: string): WebSource[] {
 		.filter((line) => line.length > 0);
 	const seen = new Set<string>();
 	const sources: WebSource[] = [];
+	const isUrlLine = (line: string | undefined): boolean =>
+		line === undefined || /^(?:url|link|source):/iu.test(line) || URL_CHECK_RE.test(line);
 	for (let i = 0; i < lines.length; i++) {
 		for (const match of lines[i].matchAll(URL_RE)) {
 			const url = match[0].replace(/[.,;:!?)\]]+$/u, "");
@@ -188,14 +327,12 @@ function extractSourcesByLines(text: string): WebSource[] {
 			seen.add(url);
 			const prev = i > 0 ? lines[i - 1] : undefined;
 			const next = i + 1 < lines.length ? lines[i + 1] : undefined;
-			const isUrlLine = (line: string | undefined): boolean =>
-				line === undefined || /^(?:url|link|source):/iu.test(line) || URL_RE.test(line);
-			const title = prev !== undefined && !isUrlLine(prev) ? prev.replace(ZWSP_RE, "").trim() : undefined;
-			const snippet = next !== undefined && !isUrlLine(next) ? next.slice(0, 200) : undefined;
+			const title = isUrlLine(prev) ? undefined : prev?.replace(ZWSP_RE, "").trim();
+			const snippet = isUrlLine(next) ? undefined : next?.slice(0, 200);
 			sources.push({
 				url,
 				...(title !== undefined && title.length > 0 ? { title } : {}),
-				...(snippet !== undefined ? { snippet } : {}),
+				...(snippet !== undefined && snippet.length > 0 ? { snippet } : {}),
 			});
 		}
 	}
@@ -254,7 +391,7 @@ function extractSources(text: string): WebSource[] {
 	return extractSourcesByLines(text);
 }
 
-/** 解析一个 JSON 载荷：JSON-RPC 错误成员抛错，否则返回首个非空 text 内容。 */
+/** 解析一个 JSON 载荷：JSON-RPC 错误与 MCP isError 都归类抛出，否则返回首个非空 text。 */
 function parsePayload(line: string): string | undefined {
 	let parsed: unknown;
 	try {
@@ -266,146 +403,50 @@ function parsePayload(line: string): string | undefined {
 	if (envelope === null || typeof envelope !== "object") return undefined;
 	if (envelope.error !== undefined) {
 		const detail = typeof envelope.error === "string" ? envelope.error : envelope.error.message;
-		throw new Error(typeof detail === "string" && detail.length > 0 ? detail : "MCP search error");
+		const message = typeof detail === "string" && detail.length > 0 ? detail : "MCP search error";
+		throw new BackendError(errorMessage(message), messageKind(message) ?? "protocol_error");
 	}
 	const content = envelope.result?.content;
-	if (!Array.isArray(content)) return undefined;
-	const item = content.find((entry) => typeof entry?.text === "string" && entry.text.length > 0);
-	return item?.text;
+	const item = Array.isArray(content)
+		? content.find((entry) => typeof entry?.text === "string" && entry.text.length > 0)
+		: undefined;
+	const text = item?.text;
+	// MCP 协议允许 HTTP 200 + JSON-RPC 成功时用 result.isError 表示工具执行失败，
+	// 这种情况必须当成错误，不能把 content 里的错误文本当作搜索结果交给模型。
+	if (envelope.result?.isError === true) {
+		const message = typeof text === "string" && text.length > 0 ? text : "MCP search tool failed";
+		throw new BackendError(errorMessage(message), messageKind(message) ?? "protocol_error");
+	}
+	return text;
 }
 
-/** 解析 MCP HTTP 响应体：先按直接 JSON，再按 SSE 的 `data: ` 帧。 */
+/** 解析 MCP HTTP 响应体：先按直接 JSON，再按 SSE 事件块（同一事件的多行 data 拼接）。 */
 function parseMcpResponse(body: string): string | undefined {
 	const trimmed = body.trim();
 	if (trimmed.startsWith("{")) {
 		const direct = parsePayload(trimmed);
 		if (direct !== undefined) return direct;
 	}
+
+	let buffer: string[] = [];
+	const flush = (): string | undefined => {
+		if (buffer.length === 0) return undefined;
+		const payload = buffer.join("\n");
+		buffer = [];
+		return parsePayload(payload);
+	};
 	for (const line of trimmed.split("\n")) {
-		if (!line.startsWith("data: ")) continue;
-		const data = parsePayload(line.slice("data: ".length));
-		if (data !== undefined) return data;
-	}
-	return undefined;
-}
-
-/** Exa 端点，带可选 key（与 opencode 一致，以查询参数附加）。 */
-function exaEndpoint(): string {
-	const key = process.env.EXA_API_KEY;
-	return typeof key === "string" && key.length > 0
-		? `${EXA_MCP_URL}?exaApiKey=${encodeURIComponent(key)}`
-		: EXA_MCP_URL;
-}
-
-/** 构造一次后端调用，返回正文与结构化来源；限流 / 5xx / 网络抖动会按指数退避重试。 */
-async function searchBackend(
-	backend: Backend,
-	query: string,
-	numResults: number,
-	signal?: AbortSignal,
-): Promise<{ text: string; sources: WebSource[] }> {
-	// 每次调用时读取，便于测试注入（PI_WEB_SEARCH_TIMEOUT_MS / PI_WEB_SEARCH_RETRIES）。
-	const timeoutMs = readIntEnv("PI_WEB_SEARCH_TIMEOUT_MS", DEFAULT_TIMEOUT_MS, 100);
-	const retries = readIntEnv("PI_WEB_SEARCH_RETRIES", DEFAULT_RETRIES, 0);
-
-	const payload: McpRequest = {
-		jsonrpc: "2.0",
-		id: 1,
-		method: "tools/call",
-		params:
-			backend === "exa"
-				? {
-						name: "web_search_exa",
-						arguments: {
-							query,
-							type: "auto",
-							numResults,
-							livecrawl: "fallback",
-							contextMaxCharacters: 10_000,
-						},
-					}
-				: {
-						name: "web_search",
-						arguments: { objective: query, search_queries: [query] },
-					},
-	};
-
-	const headers: Record<string, string> = {
-		accept: "application/json, text/event-stream",
-		"content-type": "application/json",
-		"user-agent": USER_AGENT,
-	};
-	if (backend === "parallel") {
-		const key = process.env.PARALLEL_API_KEY;
-		if (typeof key === "string" && key.length > 0) headers.authorization = `Bearer ${key}`;
-	}
-
-	/** 执行一次请求；可重试的失败以 BackendError(retryable: true) 抛出。 */
-	const attempt = async (): Promise<{ text: string; sources: WebSource[] }> => {
-		// 一个控制器同时承担调用方取消与超时预算：预算耗尽算后端错误，调用方取消按取消处理。
-		const controller = new AbortController();
-		let timedOut = false;
-		const timer = setTimeout(() => {
-			timedOut = true;
-			controller.abort();
-		}, timeoutMs);
-		const onAbort = (): void => controller.abort(signal?.reason);
-		if (signal?.aborted === true) {
-			clearTimeout(timer);
-			throw new Error("web_search aborted");
+		if (line.startsWith("data:")) {
+			buffer.push(line.slice("data:".length).trimStart());
+			continue;
 		}
-		signal?.addEventListener("abort", onAbort, { once: true });
-
-		try {
-			const response = await fetch(backend === "exa" ? exaEndpoint() : PARALLEL_MCP_URL, {
-				method: "POST",
-				headers,
-				body: JSON.stringify(payload),
-				signal: controller.signal,
-			});
-			if (!response.ok) {
-				let detail = "";
-				try {
-					const parsed = (await response.json()) as { error?: { message?: string } | string; message?: string };
-					const raw = typeof parsed?.error === "object" ? parsed.error?.message : (parsed?.error ?? parsed?.message);
-					if (typeof raw === "string") detail = `: ${raw}`;
-				} catch {
-					// 状态码已经足够定位问题，非 JSON 响应体不覆盖它。
-				}
-				const retryable = response.status === 429 || response.status >= 500;
-				throw new BackendError(`${backend} HTTP ${response.status}${detail}`, retryable);
-			}
-			const text = parseMcpResponse(await response.text());
-			if (text === undefined) throw new BackendError(`${backend} returned no usable results`, false);
-			return { text, sources: extractSources(text) };
-		} catch (error) {
-			if (signal?.aborted === true) throw new Error("web_search aborted");
-			if (timedOut) throw new BackendError(`${backend} timed out after ${timeoutMs}ms`, false);
-			if (error instanceof BackendError) throw error;
-			// fetch 网络层错误（DNS、连接重置等）值得重试。
-			throw new BackendError(`${backend} request failed: ${String(error)}`, true);
-		} finally {
-			clearTimeout(timer);
-			signal?.removeEventListener("abort", onAbort);
-		}
-	};
-
-	for (let round = 0; ; round++) {
-		try {
-			return await attempt();
-		} catch (error) {
-			const retryable = error instanceof BackendError && error.retryable;
-			if (round >= retries || !retryable || signal?.aborted === true) throw error;
-			await new Promise((resolve) => setTimeout(resolve, RETRY_BASE_MS * 2 ** round));
-			if (signal?.aborted === true) throw new Error("web_search aborted");
+		// 空行表示一个 SSE 事件结束；未结束事件的尾部在循环后 flush。
+		if (line.trim().length === 0) {
+			const found = flush();
+			if (found !== undefined) return found;
 		}
 	}
-}
-
-/** 按 provider 参数决定尝试顺序。 */
-function backendOrder(provider: Provider): Backend[] {
-	if (provider === "exa" || provider === "parallel") return [provider];
-	return ["exa", "parallel"];
+	return flush();
 }
 
 /** 落盘目录仅保留最近 SPILL_KEEP_FILES 个文件；清理是尽力而为。 */
@@ -435,22 +476,10 @@ async function spillFullText(text: string): Promise<SpillResult> {
 	return { path: file, complete: buffer.byteLength <= SPILL_MAX_BYTES };
 }
 
-/** 渲染模型可见正文：Exa 已是大模型友好文本，Parallel 的 JSON 转成 Markdown。 */
-function renderOutcome(query: string, outcome: SearchOutcome, spill?: SpillResult): string {
-	const label = outcome.backend === "exa" ? "Exa" : "Parallel";
-	const heading = `[${label}] search: ${query}`;
-	if (outcome.backend === "exa") {
-		if (outcome.text.length <= MAX_TEXT_CHARS) return `${heading}\n\n${outcome.text}`;
-		const note =
-			spill === undefined
-				? ""
-				: spill.complete
-					? `; full text: ${spill.path}`
-					: `; full text (capped at ${SPILL_MAX_BYTES} bytes): ${spill.path}`;
-		return `${heading}\n\n${outcome.text.slice(0, MAX_TEXT_CHARS)}\n\n[content truncated to ${MAX_TEXT_CHARS} chars${note}]`;
-	}
-	if (outcome.sources.length === 0) return `${heading}\n\n${outcome.text.slice(0, MAX_TEXT_CHARS)}`;
-	const list = outcome.sources
+/** Parallel 的来源列表转 Markdown；没有可用来源时退回原始正文。 */
+function renderParallel(sources: WebSource[], text: string): string {
+	if (sources.length === 0) return text;
+	return sources
 		.map((source, index) => {
 			const title = source.title ?? source.url;
 			const meta = source.publishedAt !== undefined ? ` (${source.publishedAt})` : "";
@@ -458,7 +487,133 @@ function renderOutcome(query: string, outcome: SearchOutcome, spill?: SpillResul
 			return `${index + 1}. [${title}](${source.url})${meta}${snippet}`;
 		})
 		.join("\n");
-	return `${heading}\n\n${list}`;
+}
+
+/** 渲染模型可见正文；所有分支共用同一个字符上限。 */
+function renderOutcome(query: string, outcome: SearchOutcome, spill?: SpillResult): string {
+	const label = outcome.backend === "exa" ? "Exa" : "Parallel";
+	const heading = `[${label}] search: ${query}`;
+	const body = outcome.backend === "exa" ? outcome.text : renderParallel(outcome.sources, outcome.text);
+	if (body.length <= MAX_TEXT_CHARS) return `${heading}\n\n${body}`;
+	const note =
+		spill === undefined
+			? ""
+			: spill.complete
+				? `; full text: ${spill.path}`
+				: `; full text (capped at ${SPILL_MAX_BYTES} bytes): ${spill.path}`;
+	return `${heading}\n\n${body.slice(0, MAX_TEXT_CHARS)}\n\n[content truncated to ${MAX_TEXT_CHARS} chars${note}]`;
+}
+
+/**
+ * 在单个通道上执行搜索：限流 / 5xx / 网络抖动按指数退避重试，
+ * 其余错误立即抛出交给路由层决定换通道还是换后端。
+ */
+async function searchChannel(
+	step: RouteStep,
+	query: string,
+	numResults: number,
+	signal?: AbortSignal,
+): Promise<{ text: string; sources: WebSource[]; attempts: number }> {
+	// 每次调用时读取，便于测试注入（PI_WEB_SEARCH_TIMEOUT_MS / PI_WEB_SEARCH_RETRIES）。
+	const timeoutMs = readIntEnv("PI_WEB_SEARCH_TIMEOUT_MS", DEFAULT_TIMEOUT_MS, 100);
+	const retries = readIntEnv("PI_WEB_SEARCH_RETRIES", DEFAULT_RETRIES, 0);
+	const { backend, channel } = step;
+
+	const payload: McpRequest = {
+		jsonrpc: "2.0",
+		id: 1,
+		method: "tools/call",
+		params:
+			backend === "exa"
+				? {
+						name: "web_search_exa",
+						arguments: {
+							query,
+							type: "auto",
+							numResults,
+							livecrawl: "fallback",
+							contextMaxCharacters: 10_000,
+						},
+					}
+				: {
+						name: "web_search",
+						arguments: { objective: query, search_queries: [query] },
+					},
+	};
+
+	const headers: Record<string, string> = {
+		accept: "application/json, text/event-stream",
+		"content-type": "application/json",
+		"user-agent": USER_AGENT,
+	};
+	if (backend === "parallel" && channel === "key") {
+		const key = process.env.PARALLEL_API_KEY;
+		if (typeof key === "string" && key.length > 0) headers.authorization = `Bearer ${key}`;
+	}
+
+	/** 执行一次请求；失败一律以带分类的 BackendError 抛出。 */
+	const attempt = async (): Promise<{ text: string; sources: WebSource[] }> => {
+		// 一个控制器同时承担调用方取消与超时预算：预算耗尽算超时，调用方取消按取消处理。
+		const controller = new AbortController();
+		let timedOut = false;
+		const timer = setTimeout(() => {
+			timedOut = true;
+			controller.abort();
+		}, timeoutMs);
+		const onAbort = (): void => controller.abort(signal?.reason);
+		if (signal?.aborted === true) {
+			clearTimeout(timer);
+			throw new Error("web_search aborted");
+		}
+		signal?.addEventListener("abort", onAbort, { once: true });
+
+		try {
+			const response = await fetch(backend === "exa" ? exaEndpoint(channel) : PARALLEL_MCP_URL, {
+				method: "POST",
+				headers,
+				body: JSON.stringify(payload),
+				signal: controller.signal,
+			});
+			if (!response.ok) {
+				let detail = "";
+				try {
+					const parsed = (await response.json()) as { error?: { message?: string } | string; message?: string };
+					const raw = typeof parsed?.error === "object" ? parsed.error?.message : (parsed?.error ?? parsed?.message);
+					if (typeof raw === "string") detail = `: ${raw}`;
+				} catch {
+					// 状态码已经足够定位问题，非 JSON 响应体不覆盖它。
+				}
+				const kind = httpKind(response.status, detail);
+				const retryAfterMs = kind === "rate_limited" ? parseRetryAfter(response.headers.get("retry-after")) : undefined;
+				throw new BackendError(`${backend} HTTP ${response.status}${detail}`, kind, retryAfterMs);
+			}
+			const text = parseMcpResponse(await response.text());
+			if (text === undefined) throw new BackendError(`${backend} returned no usable results`, "protocol_error");
+			return { text, sources: extractSources(text) };
+		} catch (error) {
+			if (signal?.aborted === true) throw new Error("web_search aborted");
+			if (timedOut) throw new BackendError(`${backend} timed out after ${timeoutMs}ms`, "timeout");
+			if (error instanceof BackendError) throw error;
+			// fetch 网络层错误（DNS、连接重置等）值得重试。
+			throw new BackendError(`${backend} request failed: ${String(error)}`, "network_error");
+		} finally {
+			clearTimeout(timer);
+			signal?.removeEventListener("abort", onAbort);
+		}
+	};
+
+	for (let round = 0; ; round++) {
+		try {
+			const result = await attempt();
+			return { ...result, attempts: round + 1 };
+		} catch (error) {
+			if (signal?.aborted === true) throw new Error("web_search aborted");
+			if (error instanceof BackendError) error.attempts = round + 1;
+			if (!(error instanceof BackendError) || !error.retryable || round >= retries) throw error;
+			// 退避等待可被取消打断；上游给出的 Retry-After 不短于本地退避。
+			await sleep(Math.max(RETRY_BASE_MS * 2 ** round, error.retryAfterMs ?? 0), signal);
+		}
+	}
 }
 
 /** 注册 `web_search` 工具。 */
@@ -475,38 +630,61 @@ export default function piWebSearch(pi: ExtensionAPI): void {
 			if (query.length === 0) throw new Error("query must not be empty");
 
 			const numResults = params.maxResults ?? DEFAULT_NUM_RESULTS;
-			const failures: string[] = [];
-			for (const backend of backendOrder(params.provider ?? "auto")) {
+			const failures: { label: string; kind: SearchErrorKind | "unknown"; message: string }[] = [];
+			let attemptCount = 0;
+
+			// Key 通道失败会降级到同后端的免费通道，再进入下一个后端。
+			for (const step of routePlan(params.provider ?? "auto")) {
 				try {
-					const { text, sources: rawSources } = await searchBackend(backend, query, numResults, signal);
+					if (signal?.aborted === true) throw new Error("web_search aborted");
+					const { text, sources: rawSources, attempts } = await searchChannel(step, query, numResults, signal);
+					attemptCount += attempts;
 					// Exa 自身遵守 numResults；Parallel 不受该参数约束，这里统一截断到请求条数。
 					const sources = rawSources.slice(0, numResults);
 					const outcome: SearchOutcome = {
-						backend,
+						backend: step.backend,
 						text,
 						sources,
 						truncated: text.length > MAX_TEXT_CHARS,
 					};
+					// 取消贯穿整个生命周期：拿到结果后、落盘前再确认一次。
+					if (signal?.aborted === true) throw new Error("web_search aborted");
 					// 超限正文落盘，模型仍可按需 read 完整内容（沿用 Pi 对大结果的惯例）。
 					const spill = outcome.truncated ? await spillFullText(text) : undefined;
+					const fallbackReason =
+						failures.length > 0
+							? errorMessage(
+									failures.map((failure) => `${failure.label}[${failure.kind}]: ${failure.message}`).join(" | "),
+								)
+							: undefined;
 					return {
 						content: [{ type: "text" as const, text: renderOutcome(query, outcome, spill) }],
 						details: {
-							provider: backend,
+							provider: step.backend,
+							channel: step.channel,
 							query,
 							numResults,
 							sourceCount: sources.length,
 							sources,
 							truncated: outcome.truncated,
+							attemptCount,
+							...(fallbackReason !== undefined ? { fallbackReason } : {}),
 							...(spill !== undefined ? { fullTextPath: spill.path, fullTextComplete: spill.complete } : {}),
 						},
 					};
 				} catch (error) {
 					if (signal?.aborted === true) throw error;
-					failures.push(`${backend}: ${error instanceof Error ? error.message : String(error)}`);
+					attemptCount += error instanceof BackendError ? error.attempts : 1;
+					failures.push({
+						label: stepLabel(step),
+						kind: error instanceof BackendError ? error.kind : "unknown",
+						message: errorMessage(error),
+					});
 				}
 			}
-			throw new Error(`web_search failed — ${failures.join(" | ")}`);
+			throw new Error(
+				`web_search failed — ${failures.map((failure) => `${failure.label}: ${failure.message}`).join(" | ")}`,
+			);
 		},
 	});
 }

@@ -322,3 +322,217 @@ test("16. 真实 undici：HTTP 200 但响应体不结束时按预算中止", asy
 		await new Promise((resolve) => server.close(resolve));
 	}
 });
+
+// 17. MCP result.isError：HTTP 200 且 JSON-RPC 成功，但工具执行失败。
+test("17. MCP result.isError 被当成错误而非搜索结果", async () => {
+	await withEnv({ PI_WEB_SEARCH_RETRIES: "0" }, async () => {
+		await withFetch(
+			() =>
+				okResponse(
+					JSON.stringify({ result: { isError: true, content: [{ type: "text", text: "search tool failed hard" }] } }),
+				),
+			async () => {
+				await assert.rejects(
+					tool.execute("t17", { query: "x", provider: "exa" }, undefined, undefined, {}),
+					/search tool failed hard/,
+				);
+			},
+		);
+	});
+});
+
+// 18. 额度耗尽：Exa Key 通道失败后降级到同后端的免费通道。
+test("18. 额度耗尽：Exa Key 失败后降级免费通道，且不再重试 Key", async () => {
+	const seen = [];
+	await withEnv({ EXA_API_KEY: "test-key", PI_WEB_SEARCH_RETRIES: "1" }, async () => {
+		await withFetch(
+			(url) => {
+				seen.push(String(url));
+				if (String(url).includes("exaApiKey")) {
+					return okResponse(
+						JSON.stringify({
+							result: { isError: true, content: [{ type: "text", text: "quota exhausted for this api key" }] },
+						}),
+					);
+				}
+				return okResponse(exaSse(EXA_BODY));
+			},
+			async () => {
+				const result = await tool.execute("t18", { query: "x", provider: "exa" }, undefined, undefined, {});
+				assert.equal(result.details.channel, "free");
+				assert.equal(result.details.provider, "exa");
+				assert.equal(seen.length, 2, "额度错误不该被重试");
+				assert.ok(seen[0].includes("exaApiKey=test-key"));
+				assert.ok(!seen[1].includes("exaApiKey"));
+			},
+		);
+	});
+});
+
+// 19. 鉴权失败：401 同样是「换通道」而不是「重试」。
+test("19. 401 鉴权失败降级免费通道", async () => {
+	const seen = [];
+	await withEnv({ PARALLEL_API_KEY: "bad-key", PI_WEB_SEARCH_RETRIES: "1" }, async () => {
+		await withFetch(
+			(url, init) => {
+				seen.push({ url: String(url), auth: init?.headers?.authorization });
+				if (init?.headers?.authorization) return new Response("invalid api key", { status: 401 });
+				return okResponse(jsonEnvelope(PARALLEL_INNER));
+			},
+			async () => {
+				const result = await tool.execute("t19", { query: "x", provider: "parallel" }, undefined, undefined, {});
+				assert.equal(result.details.channel, "free");
+				assert.equal(seen.length, 2);
+				assert.equal(seen[0].auth, "Bearer bad-key");
+				assert.equal(seen[1].auth, undefined);
+			},
+		);
+	});
+});
+
+// 20. 完整四通道顺序：Exa Key → Exa Free → Parallel Key → Parallel Free。
+test("20. 四通道顺序：Exa Key → Exa Free → Parallel Key → Parallel Free", async () => {
+	const seen = [];
+	await withEnv(
+		{ EXA_API_KEY: "k1", PARALLEL_API_KEY: "k2", PI_WEB_SEARCH_RETRIES: "0" },
+		async () => {
+			await withFetch(
+				(url, init) => {
+					const isExaCall = String(url).includes("mcp.exa.ai");
+					const hasKey = isExaCall ? String(url).includes("exaApiKey") : Boolean(init?.headers?.authorization);
+					seen.push(hasKey ? `${isExaCall ? "exa" : "parallel"}(key)` : isExaCall ? "exa" : "parallel");
+					if (hasKey || isExaCall) return new Response("nope", { status: 500 });
+					return okResponse(jsonEnvelope(PARALLEL_INNER));
+				},
+				async () => {
+					const result = await tool.execute("t20", { query: "x" }, undefined, undefined, {});
+					assert.deepEqual(seen, ["exa(key)", "exa", "parallel(key)", "parallel"]);
+					assert.equal(result.details.provider, "parallel");
+					assert.equal(result.details.channel, "free");
+				},
+			);
+		},
+	);
+});
+
+// 21. 429 的 Retry-After 会被尊重。
+test("21. 429 的 Retry-After 体现在退避等待上", async () => {
+	const startedAt = Date.now();
+	await withEnv({ PI_WEB_SEARCH_RETRIES: "1", PI_WEB_SEARCH_TIMEOUT_MS: "5000" }, async () => {
+		await withFetch(
+			(_url, _init, calls) =>
+				calls === 1
+					? new Response("slow down", { status: 429, headers: { "retry-after": "1" } })
+					: okResponse(exaSse(EXA_BODY)),
+			async () => {
+				const result = await tool.execute("t21", { query: "x", provider: "exa" }, undefined, undefined, {});
+				assert.equal(result.details.provider, "exa");
+			},
+		);
+	});
+	assert.ok(Date.now() - startedAt >= 1000, "应至少等待 Retry-After 指定的 1 秒");
+});
+
+// 22. 退避等待必须可以被取消立即打断。
+test("22. 重试等待期间取消会立即终止", async () => {
+	const controller = new AbortController();
+	await withEnv({ PI_WEB_SEARCH_RETRIES: "3", PI_WEB_SEARCH_TIMEOUT_MS: "5000" }, async () => {
+		await withFetch(
+			() => new Response("boom", { status: 503 }),
+			async () => {
+				const startedAt = Date.now();
+				const pending = tool.execute("t22", { query: "x", provider: "exa" }, controller.signal, undefined, {});
+				setTimeout(() => controller.abort(), 120);
+				await assert.rejects(pending, /aborted/);
+				assert.ok(Date.now() - startedAt < 1200, "取消不应等完退避");
+			},
+		);
+	});
+});
+
+// 23. 回归：全局正则 URL_RE 的 lastIndex 不能污染行扫描结果。
+test("23. 来源行扫描：多行 URL 全部被识别（正则状态回归）", async () => {
+	// 连续三条 URL 行，不做任何分隔：旧实现里 isUrlLine() 的全局 test() 会把 lastIndex
+	// 推过下一行，导致第 2、3 条 URL 被 matchAll 漏掉，这个用例正是为了卡住它。
+	const body = ["https://example.com/1", "https://example.com/2", "https://example.com/3"].join("\n");
+	await withEnv({ PI_WEB_SEARCH_RETRIES: "0" }, async () => {
+		await withFetch(
+			() => okResponse(exaSse(body)),
+			async () => {
+				const result = await tool.execute("t23", { query: "x", provider: "exa" }, undefined, undefined, {});
+				assert.deepEqual(
+					result.details.sources.map((source) => source.url),
+					["https://example.com/1", "https://example.com/2", "https://example.com/3"],
+				);
+			},
+		);
+	});
+});
+
+// 24. maxResults 必须是整数。
+test("24. maxResults 使用整数 schema", () => {
+	assert.equal(tool.parameters?.properties?.maxResults?.type, "integer");
+});
+
+// 25. 未配置 key 时不应产生 key 通道请求。
+test("25. 未配置 key 时不发起带凭据的请求", async () => {
+	const seen = [];
+	await withEnv(
+		{ EXA_API_KEY: undefined, PARALLEL_API_KEY: undefined, PI_WEB_SEARCH_RETRIES: "0" },
+		async () => {
+			await withFetch(
+				(url) => {
+					seen.push(String(url));
+					return okResponse(exaSse(EXA_BODY));
+				},
+				async () => {
+					await tool.execute("t25", { query: "x", provider: "exa" }, undefined, undefined, {});
+					assert.equal(seen.length, 1);
+					assert.ok(!seen[0].includes("exaApiKey"));
+				},
+			);
+		},
+	);
+});
+
+// 26. details 必须能解释「这次搜索走的是哪条通道、为什么降级」。
+test("26. details 记录 provider/channel/attemptCount/fallbackReason", async () => {
+	await withEnv({ EXA_API_KEY: "test-key", PI_WEB_SEARCH_RETRIES: "0" }, async () => {
+		await withFetch(
+			(url) => {
+				if (String(url).includes("exaApiKey")) {
+					return okResponse(
+						JSON.stringify({
+							result: { isError: true, content: [{ type: "text", text: "quota exhausted for this key" }] },
+						}),
+					);
+				}
+				return okResponse(exaSse(EXA_BODY));
+			},
+			async () => {
+				const result = await tool.execute("t26", { query: "x", provider: "exa" }, undefined, undefined, {});
+				assert.equal(result.details.provider, "exa");
+				assert.equal(result.details.channel, "free");
+				assert.equal(result.details.attemptCount, 2);
+				assert.match(String(result.details.fallbackReason), /exa\(key\)\[quota_exhausted\]/);
+			},
+		);
+	});
+});
+
+// 27. 重试场景下 attemptCount 反映真实请求次数，且没有降级时不给 fallbackReason。
+test("27. attemptCount 统计重试次数，未降级时无 fallbackReason", async () => {
+	await withEnv({ PI_WEB_SEARCH_RETRIES: "1", PI_WEB_SEARCH_TIMEOUT_MS: "5000" }, async () => {
+		await withFetch(
+			(_url, _init, calls) =>
+				calls === 1
+					? new Response("slow down", { status: 429, headers: { "retry-after": "0" } })
+					: okResponse(exaSse(EXA_BODY)),
+			async () => {
+				const result = await tool.execute("t27", { query: "x", provider: "exa" }, undefined, undefined, {});
+				assert.equal(result.details.attemptCount, 2);
+				assert.equal(result.details.fallbackReason, undefined);
+			},
+		);
+	});
+});
