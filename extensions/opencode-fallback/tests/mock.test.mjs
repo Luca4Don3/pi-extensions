@@ -13,7 +13,7 @@ import { createJiti } from "jiti";
 
 const jiti = createJiti(import.meta.url);
 const module_ = await jiti.import(fileURLToPath(new URL("../index.ts", import.meta.url)));
-const { isOpencodeRequest, isConnectionFailure, createOpencodeFallbackFetch, resolveProxyUrl } = module_;
+const { isOpencodeRequest, isConnectionFailure, createOpencodeFallbackFetch, resolveProxyUrl, needsPinnedProxy } = module_;
 
 const errWithCode = (code) => Object.assign(new Error("boom"), { code });
 
@@ -137,4 +137,98 @@ test("9. 只追加 dispatcher，不改动原始 init 字段", async () => {
 	assert.equal(captured.body, "x");
 	assert.deepEqual(captured.headers, { a: "b" });
 	assert.equal(captured.dispatcher?.name, "direct");
+});
+
+// ---- GPT / Grok / Muse / Claude 的固定代理路由 ----
+
+const jsonInit = (model) => ({
+	method: "POST",
+	headers: { "content-type": "application/json" },
+	body: JSON.stringify({ model, input: "hi" }),
+});
+
+test("10. /responses（GPT/Grok/Muse）强制走代理，不先试探直连", async () => {
+	const seen = [];
+	const fetchLike = async (_input, init) => {
+		seen.push(init?.dispatcher?.name);
+		return new Response("ok");
+	};
+	const wrapped = createOpencodeFallbackFetch(fetchLike, { name: "direct" }, { name: "proxy" });
+	await wrapped("https://opencode.ai/zen/go/v1/responses", jsonInit("muse-spark-1.3-contributor"));
+	assert.deepEqual(seen, ["proxy"], "不应出现 direct 尝试");
+});
+
+test("11. /messages + claude 强制走代理", async () => {
+	const seen = [];
+	const fetchLike = async (_input, init) => {
+		seen.push(init?.dispatcher?.name);
+		return new Response("ok");
+	};
+	const wrapped = createOpencodeFallbackFetch(fetchLike, { name: "direct" }, { name: "proxy" });
+	await wrapped("https://opencode.ai/zen/go/v1/messages", jsonInit("claude-haiku-5-5"));
+	assert.deepEqual(seen, ["proxy"]);
+});
+
+test("12. /messages + minimax 不误伤，保持直连优先", async () => {
+	const seen = [];
+	const fetchLike = async (_input, init) => {
+		seen.push(init?.dispatcher?.name);
+		if (init?.dispatcher?.name === "direct") throw errWithCode("ECONNREFUSED");
+		return new Response("ok");
+	};
+	const wrapped = createOpencodeFallbackFetch(fetchLike, { name: "direct" }, { name: "proxy" });
+	await wrapped("https://opencode.ai/zen/go/v1/messages", jsonInit("minimax-m3"));
+	assert.deepEqual(seen, ["direct", "proxy"], "应先直连、失败后才回退");
+});
+
+test("13. /messages + qwen 不误伤，直连成功即结束", async () => {
+	const seen = [];
+	const fetchLike = async (_input, init) => {
+		seen.push(init?.dispatcher?.name);
+		return new Response("ok");
+	};
+	const wrapped = createOpencodeFallbackFetch(fetchLike, { name: "direct" }, { name: "proxy" });
+	await wrapped("https://opencode.ai/zen/go/v1/messages", jsonInit("qwen3.8-max"));
+	assert.deepEqual(seen, ["direct"]);
+});
+
+test("14. /chat/completions（deepseek 等）保持原行为", async () => {
+	const seen = [];
+	const fetchLike = async (_input, init) => {
+		seen.push(init?.dispatcher?.name);
+		return new Response("ok");
+	};
+	const wrapped = createOpencodeFallbackFetch(fetchLike, { name: "direct" }, { name: "proxy" });
+	await wrapped("https://opencode.ai/zen/go/v1/chat/completions", jsonInit("deepseek-v4.1-flash"));
+	assert.deepEqual(seen, ["direct"]);
+});
+
+test("15. /messages 的 body 不可解析时不误判为 Claude", async () => {
+	const seen = [];
+	const fetchLike = async (_input, init) => {
+		seen.push(init?.dispatcher?.name);
+		return new Response("ok");
+	};
+	const wrapped = createOpencodeFallbackFetch(fetchLike, { name: "direct" }, { name: "proxy" });
+	await wrapped("https://opencode.ai/zen/go/v1/messages", { body: new Uint8Array([1, 2, 3]) });
+	assert.deepEqual(seen, ["direct"]);
+});
+
+test("16. 强制代理失败时不回退直连（出口不漂移）", async () => {
+	const seen = [];
+	const fetchLike = async (_input, init) => {
+		seen.push(init?.dispatcher?.name);
+		throw errWithCode("ECONNREFUSED");
+	};
+	const wrapped = createOpencodeFallbackFetch(fetchLike, { name: "direct" }, { name: "proxy" });
+	await assert.rejects(wrapped("https://opencode.ai/zen/go/v1/responses", jsonInit("grok-4.7")), /boom/);
+	assert.deepEqual(seen, ["proxy"], "代理失败也必须硬失败，不能悄悄改用直连");
+});
+
+test("17. needsPinnedProxy 的端点与模型判定", () => {
+	assert.equal(needsPinnedProxy("https://opencode.ai/zen/go/v1/responses"), true);
+	assert.equal(needsPinnedProxy("https://opencode.ai/zen/go/v1/messages", jsonInit("claude-opus-4")), true);
+	assert.equal(needsPinnedProxy("https://opencode.ai/zen/go/v1/messages", jsonInit("minimax-m3")), false);
+	assert.equal(needsPinnedProxy("https://opencode.ai/zen/go/v1/chat/completions", jsonInit("deepseek-v4.1-flash")), false);
+	assert.equal(needsPinnedProxy("https://example.com/zen/go/v1/responses"), false);
 });

@@ -13,7 +13,7 @@
 | Web Search | `extensions/web-search/` | `pi install ~/pi-extensions/extensions/web-search` | 原生 `web_search` 工具：免 key 直连 Exa / Parallel MCP，Key → Free 自动降级 |
 | Subagent | `extensions/subagent/` | `pi install ~/pi-extensions/extensions/subagent` | 把任务委派给独立上下文的子 agent（single / parallel / chain） |
 | Chinese Prompt | `extensions/chinese-prompt/` | `pi install ~/pi-extensions/extensions/chinese-prompt` | 注入中文强约束 system prompt，推理与输出全程简体中文 |
-| OpenCode Fallback | `extensions/opencode-fallback/` | `pi install ~/pi-extensions/extensions/opencode-fallback` | 发往 opencode.ai 的请求先直连，连接失败再走代理 |
+| OpenCode Fallback | `extensions/opencode-fallback/` | `pi install ~/pi-extensions/extensions/opencode-fallback` | GPT/Grok/Muse/Claude 固定走代理，其余模型直连优先、失败回退 |
 
 ## 仓库结构
 
@@ -210,28 +210,44 @@ cp extensions/subagent/examples/agents/*.md ~/.pi/agent/agents/
 
 # OpenCode Fallback
 
-给发往 `opencode.ai` 的请求加一层网络兜底：**先直连，连接失败再走代理**。
+给发往 `opencode.ai` 的请求做两级路由：
 
-## 动机
+1. **固定代理**：GPT / Grok / Muse / Claude 四类模型**始终走代理**，不尝试直连
+2. **兜底回退**：其余模型（deepseek / glm / kimi / minimax 等）直连优先，仅连接类失败才回退代理
 
-部分网络环境下直连 `opencode.ai` 会被间歇性重置，而全局挂代理又会拖慢其它请求。这个扩展只处理 `opencode.ai` 的请求，直连成功就不碰代理。
+## 为什么这四类必须固定走代理
+
+它们在部分地区会被服务端直接拒绝（`403 RegionError`），直连拿不到结果；而混用直连与代理会让出口 IP 漂移，与 opencode 的会话路由相冲（`MissingSessionID`）。所以对它们不做「直连优先」——**要么代理成功，要么明确失败**。
+
+## 模型识别
+
+| 端点 | 处理 |
+| --- | --- |
+| `/v1/responses` | 一律固定代理（该端点下当前只有 GPT / Grok / Muse） |
+| `/v1/messages` | 读请求体的 `model`，仅 `claude-*` 固定代理（同一端点还混有 minimax / qwen，不能只看端点） |
+| 其它端点 | 直连优先，连接失败回退代理 |
+
+请求体不可解析时（非 JSON 字符串），`/v1/messages` 不会被强制代理，避免误伤。
 
 ## 配置
 
 | 环境变量 | 默认 | 说明 |
 | --- | --- | --- |
-| `PI_OPENCODE_PROXY` | `http://127.0.0.1:7897` | 直连失败时使用的 HTTP 代理地址 |
+| `PI_OPENCODE_PROXY` | `http://127.0.0.1:7897` | 代理地址 |
 
 ## 判定规则
 
 | 情况 | 行为 |
 | --- | --- |
 | 非 `opencode.ai` 请求 | 原样透传，不附加 dispatcher |
-| 直连成功 | 直接返回 |
-| 直连报连接类错误（`ECONNREFUSED` / `ECONNRESET` / `ENOTFOUND` / `ETIMEDOUT` / `UND_ERR_*` 等） | 改用代理重试一次 |
+| GPT / Grok / Muse / Claude | 直接走代理，**代理失败也不回退直连** |
+| 其他 `opencode.ai` 请求直连成功 | 直接返回 |
+| 其他请求直连报连接类错误（`ECONNREFUSED` / `ECONNRESET` / `ENOTFOUND` / `ETIMEDOUT` / `UND_ERR_*` 等） | 改用代理重试一次 |
 | 非连接类错误、请求已取消 | 直接抛出，不重试 |
 
 只对 `opencode.ai` 及其子域生效；`opencode.ai.example.com` 这类相似域名不会被误判。
+
+代价说明：代理不可用时，上述四类模型会直接失败。这是「出口不漂移」的必然代价。
 
 ---
 
@@ -372,7 +388,7 @@ Exa 返回的正文本身已是大模型友好的文本布局（`Title:` / `URL:
 以下测试覆盖仓库内**所有**插件：
 
 ```bash
-# 离线测试（43 例）：web-search 27 + opencode-fallback 9 + subagent 7
+# 离线测试（51 例）：web-search 27 + opencode-fallback 17 + subagent 7
 node --test extensions/*/tests/mock.test.mjs
 
 # 真实网络冒烟（会调用 Exa / Parallel，仅 web-search）

@@ -81,6 +81,36 @@ function withDispatcher(init: Record<string, unknown> | undefined, dispatcher: D
 	return { ...(init ?? {}), dispatcher };
 }
 
+/** 从请求体里读出 model 名（Pi 的请求体是 JSON 字符串）。 */
+function readModelFromBody(body: unknown): string | undefined {
+	if (typeof body !== "string") return undefined;
+	try {
+		const parsed = JSON.parse(body) as { model?: unknown };
+		return typeof parsed.model === "string" ? parsed.model : undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+/**
+ * 判断该请求是否属于「必须固定走代理」的模型：GPT / Grok / Muse / Claude。
+ *
+ * - `/responses`：opencode-go 下当前只有 GPT / Grok / Muse，端点即可判定。
+ * - `/messages`：同一端点下还混有 minimax / qwen，必须看请求体里的 model。
+ *
+ * 这些模型存在地区限制，且会话路由要求出口稳定，所以既不尝试直连、也不回退直连。
+ */
+export function needsPinnedProxy(input: unknown, init?: Record<string, unknown>): boolean {
+	const url = getUrl(input);
+	if (url === undefined || !isOpencodeRequest(input)) return false;
+	if (url.pathname.endsWith("/responses")) return true;
+	if (url.pathname.endsWith("/messages")) {
+		const model = readModelFromBody(init?.body);
+		return typeof model === "string" && /^claude-/iu.test(model);
+	}
+	return false;
+}
+
 export function createOpencodeFallbackFetch(
 	originalFetch: FetchLike,
 	directAgent: Dispatcher,
@@ -91,6 +121,12 @@ export function createOpencodeFallbackFetch(
 			return Reflect.apply(originalFetch, this, [input, init]);
 		}
 
+		// GPT / Grok / Muse / Claude：固定走代理，不尝试直连，避免出口漂移。
+		if (needsPinnedProxy(input, init)) {
+			return Reflect.apply(originalFetch, this, [input, withDispatcher(init, proxyAgent)]);
+		}
+
+		// 其余模型保持原行为：直连优先，仅连接类失败才回退代理。
 		try {
 			return await Reflect.apply(originalFetch, this, [input, withDispatcher(init, directAgent)]);
 		} catch (error) {
