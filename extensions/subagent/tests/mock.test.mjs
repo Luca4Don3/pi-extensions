@@ -154,3 +154,85 @@ test("11. description 必须包含成本与自包含要求", () => {
 	assert.match(subagentTool.description, /compressed summary/i);
 	assert.match(subagentTool.description, /self-contained/i);
 });
+
+// ---- usage.ts：token 用量统计（纯函数，抽取后可独立测试）----
+
+const usageModule = await jiti.import(fileURLToPath(new URL("../usage.ts", import.meta.url)));
+
+test("12. createUsageStats 返回全零", () => {
+	assert.deepEqual(usageModule.createUsageStats(), {
+		input: 0,
+		output: 0,
+		cacheRead: 0,
+		cacheWrite: 0,
+		cost: 0,
+		contextTokens: 0,
+		turns: 0,
+	});
+});
+
+test("13. accumulateUsage 累加计数，上下文占用为覆盖而非累加", () => {
+	const usage = usageModule.createUsageStats();
+	usageModule.accumulateUsage(usage, {
+		input: 100,
+		output: 20,
+		cacheRead: 5,
+		cacheWrite: 3,
+		cost: { total: 0.01 },
+		totalTokens: 500,
+	});
+	usageModule.accumulateUsage(usage, { input: 50, output: 10, totalTokens: 700 });
+	usageModule.accumulateUsage(usage, undefined); // 缺 usage 也要计一轮
+	assert.equal(usage.turns, 3);
+	assert.equal(usage.input, 150);
+	assert.equal(usage.output, 30);
+	assert.equal(usage.cacheRead, 5);
+	assert.equal(usage.cacheWrite, 3);
+	assert.equal(usage.cost, 0.01);
+	assert.equal(usage.contextTokens, 700, "上下文占用应取最后一条消息的值");
+});
+
+test("14. aggregateUsage 汇总多次运行，且不累加上下文占用", () => {
+	const a = usageModule.createUsageStats();
+	usageModule.accumulateUsage(a, { input: 10, output: 1, cost: { total: 0.001 }, totalTokens: 100 });
+	const b = usageModule.createUsageStats();
+	usageModule.accumulateUsage(b, { input: 20, output: 2, cost: { total: 0.002 }, totalTokens: 200 });
+	const total = usageModule.aggregateUsage([{ usage: a }, { usage: b }]);
+	assert.equal(total.input, 30);
+	assert.equal(total.output, 3);
+	assert.equal(total.turns, 2);
+	assert.ok(Math.abs(total.cost - 0.003) < 1e-9);
+	assert.equal(total.contextTokens, 0);
+});
+
+test("15. formatUsageStats 输出各项且不产生空段", () => {
+	const usage = usageModule.createUsageStats();
+	usageModule.accumulateUsage(usage, {
+		input: 3200,
+		output: 840,
+		cacheRead: 12000,
+		cost: { total: 0.0031 },
+		totalTokens: 16000,
+	});
+	const text = usageModule.formatUsageStats(usage, "test/model");
+	assert.match(text, /1 turn\b/);
+	assert.match(text, /↑3\.2k/);
+	assert.match(text, /↓840/);
+	assert.match(text, /R12k/);
+	assert.match(text, /\$0\.0031/);
+	assert.match(text, /ctx:16k/);
+	assert.match(text, /test\/model/);
+	assert.doesNotMatch(text, /\s{2,}/, "不应出现连续空格");
+	assert.equal(usageModule.formatUsageStats(usageModule.createUsageStats()), "", "全零时返回空串");
+});
+
+test("16. formatTokens 的进制边界", () => {
+	const f = usageModule.formatTokens;
+	assert.equal(f(0), "0");
+	assert.equal(f(999), "999");
+	assert.equal(f(1000), "1.0k");
+	assert.equal(f(9999), "10.0k");
+	assert.equal(f(10000), "10k");
+	assert.equal(f(999999), "1000k");
+	assert.equal(f(1000000), "1.0M");
+});
