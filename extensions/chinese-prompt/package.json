@@ -1,0 +1,15 @@
+{
+  "name": "@luca4don3/pi-extension-chinese-prompt",
+  "version": "0.4.0-beta.1",
+  "private": true,
+  "description": "Standalone entry for the chinese-prompt extension of the pi-extensions collection.",
+  "type": "module",
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  }
+}

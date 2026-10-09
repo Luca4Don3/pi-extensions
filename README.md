@@ -11,18 +11,33 @@
 | 插件 | 目录 | 安装 | 作用 |
 | --- | --- | --- | --- |
 | Web Search | `extensions/web-search/` | `pi install ~/pi-extensions/extensions/web-search` | 原生 `web_search` 工具：免 key 直连 Exa / Parallel MCP，Key → Free 自动降级 |
+| Subagent | `extensions/subagent/` | `pi install ~/pi-extensions/extensions/subagent` | 把任务委派给独立上下文的子 agent（single / parallel / chain） |
+| Chinese Prompt | `extensions/chinese-prompt/` | `pi install ~/pi-extensions/extensions/chinese-prompt` | 注入中文强约束 system prompt，推理与输出全程简体中文 |
+| OpenCode Fallback | `extensions/opencode-fallback/` | `pi install ~/pi-extensions/extensions/opencode-fallback` | 发往 opencode.ai 的请求先直连，连接失败再走代理 |
 
 ## 仓库结构
 
 ```text
 pi-extensions/
 ├── extensions/
-│   └── web-search/
-│       ├── index.ts              # 扩展入口
-│       ├── package.json          # 让该插件可被单独安装
-│       └── tests/
-│           ├── mock.test.mjs     # 离线测试（CI 跑这个）
-│           └── smoke.mjs         # 真实网络冒烟
+│   ├── web-search/
+│   │   ├── index.ts              # 扩展入口
+│   │   ├── package.json          # 让该插件可被单独安装
+│   │   └── tests/
+│   │       ├── mock.test.mjs     # 离线测试（CI 跑这个）
+│   │       └── smoke.mjs         # 真实网络冒烟
+│   ├── subagent/
+│   │   ├── index.ts              # 工具入口
+│   │   ├── agents.ts             # agent 发现逻辑
+│   │   ├── examples/agents/      # 示例 agent 定义
+│   │   └── tests/mock.test.mjs
+│   ├── chinese-prompt/
+│   │   ├── index.ts
+│   │   └── package.json
+│   └── opencode-fallback/
+│       ├── index.ts
+│       ├── package.json
+│       └── tests/mock.test.mjs
 ├── .github/workflows/ci.yml
 ├── package.json                  # 根 manifest：pi.extensions 声明所有插件入口
 └── README.md
@@ -122,6 +137,94 @@ pi -e ~/pi-extensions/extensions/web-search/index.ts
 
 ---
 
+# Subagent
+
+把任务委派给独立上下文的子 agent，避免主上下文被大量探索和试错污染。
+
+## 工作方式
+
+每次调用会 **spawn 一个独立的 `pi` 进程**（`--mode json -p --no-session --no-skills --no-prompt-templates`），解析其 JSON 事件流，把子 agent 的输出压缩后回传主上下文。子 agent 的中间过程不会进入你的上下文。
+
+三种模式：
+
+| 模式 | 参数 | 说明 |
+| --- | --- | --- |
+| single | `agent` + `task` | 单个子 agent |
+| parallel | `tasks[]` | 最多 8 个任务，并发 4 |
+| chain | `chain[]` | 顺序执行，用 `{previous}` 注入上一步的压缩输出 |
+
+```json
+{ "agent": "scout", "task": "定位 web-search 的来源解析函数" }
+```
+
+```json
+{ "chain": [
+  { "agent": "scout", "task": "定位相关代码" },
+  { "agent": "coder", "task": "按上一步结论修改：{previous}" }
+] }
+```
+
+其它参数：`agentScope`（`user` / `project` / `both`）、`confirmProjectAgents`、`maxOutputChars`、`maxPreviousChars`、`cwd`。
+
+## 配置 agent
+
+子 agent 由 `~/.pi/agent/agents/*.md`（用户级）和 `.pi/agents/*.md`（项目级）定义，frontmatter 支持：
+
+| 字段 | 说明 |
+| --- | --- |
+| `name` / `description` | 必填，供模型选择 |
+| `tools` | 逗号分隔的工具白名单 |
+| `model` | 省略则使用宿主默认模型 |
+| `maxOutputChars` / `maxPreviousChars` | 回传主上下文的压缩上限 |
+
+仓库自带一套示例定义（scout / planner / coder / reviewer）：
+
+```bash
+mkdir -p ~/.pi/agent/agents
+cp extensions/subagent/examples/agents/*.md ~/.pi/agent/agents/
+```
+
+示例中的 `model` 默认为注释状态（使用宿主默认模型）。要用自己的模型，取消注释并填入 `model: <provider>/<model>:<thinking>`。
+
+---
+
+# Chinese Prompt
+
+在每次对话前注入一段中文强约束 system prompt，要求推理与输出全程使用简体中文。
+
+## 用法
+
+装上即生效，无参数、无配置。它通过 `before_agent_start` 事件把规则追加到 system prompt 末尾，不改动其它上下文。不需要时 `pi remove` 即可。
+
+---
+
+# OpenCode Fallback
+
+给发往 `opencode.ai` 的请求加一层网络兜底：**先直连，连接失败再走代理**。
+
+## 动机
+
+部分网络环境下直连 `opencode.ai` 会被间歇性重置，而全局挂代理又会拖慢其它请求。这个扩展只处理 `opencode.ai` 的请求，直连成功就不碰代理。
+
+## 配置
+
+| 环境变量 | 默认 | 说明 |
+| --- | --- | --- |
+| `PI_OPENCODE_PROXY` | `http://127.0.0.1:7897` | 直连失败时使用的 HTTP 代理地址 |
+
+## 判定规则
+
+| 情况 | 行为 |
+| --- | --- |
+| 非 `opencode.ai` 请求 | 原样透传，不附加 dispatcher |
+| 直连成功 | 直接返回 |
+| 直连报连接类错误（`ECONNREFUSED` / `ECONNRESET` / `ENOTFOUND` / `ETIMEDOUT` / `UND_ERR_*` 等） | 改用代理重试一次 |
+| 非连接类错误、请求已取消 | 直接抛出，不重试 |
+
+只对 `opencode.ai` 及其子域生效；`opencode.ai.example.com` 这类相似域名不会被误判。
+
+---
+
 # Web Search
 
 给 Pi 补上原生 `web_search` 工具。
@@ -143,7 +246,7 @@ Pi 的内置工具只有 `read` / `bash` / `edit` / `write` / `grep` / `find` / 
 - 取消贯穿完整生命周期：请求、响应体读取、退避等待、故障切换、落盘
 - MCP `result.isError` 被识别为失败，不会把错误文本当成搜索结果
 
-**暂不承诺**：匿名端点的无限额度、所有模型（仅实测 `deepseek-v4.1-flash`）、长期运行稳定性。
+**暂不承诺**：匿名端点的无限额度、所有模型（仅在作者本地的一个模型上实测过）、长期运行稳定性。
 
 ## 特性
 
@@ -256,20 +359,27 @@ Exa 返回的正文本身已是大模型友好的文本布局（`Title:` / `URL:
 
 ## 开发与测试
 
+以下测试覆盖仓库内**所有**插件：
+
 ```bash
-# 离线测试（27 例：解析、四通道路由、额度/鉴权降级、取消、超时、重试、正则回归、截断、落盘清理）
+# 离线测试（43 例）：web-search 27 + opencode-fallback 9 + subagent 7
 node --test extensions/*/tests/mock.test.mjs
 
-# 真实网络冒烟（会调用 Exa / Parallel）
+# 真实网络冒烟（会调用 Exa / Parallel，仅 web-search）
 node extensions/web-search/tests/smoke.mjs
 ```
 
 本地依赖 `jiti` 与 `typebox`，Pi 自带这两个包，指向本机 Pi 安装即可：
 
 ```bash
-mkdir -p node_modules
-ln -sfn "$(npm root -g)/@earendil-works/pi-coding-agent/node_modules/jiti" node_modules/jiti
-ln -sfn "$(npm root -g)/@earendil-works/pi-coding-agent/node_modules/typebox" node_modules/typebox
+mkdir -p node_modules/@earendil-works
+PI_PKG="$(npm root -g)/@earendil-works/pi-coding-agent"
+ln -sfn "$PI_PKG/node_modules/jiti" node_modules/jiti
+ln -sfn "$PI_PKG/node_modules/typebox" node_modules/typebox
+ln -sfn "$PI_PKG" node_modules/@earendil-works/pi-coding-agent
+for p in pi-ai pi-agent-core pi-tui; do
+  ln -sfn "$PI_PKG/node_modules/@earendil-works/$p" "node_modules/@earendil-works/$p"
+done
 ```
 
 CI（`.github/workflows/ci.yml`）固定安装 `@earendil-works/pi-coding-agent@1.1.0` 后只跑离线用例，用来守住 Pi 兼容性。

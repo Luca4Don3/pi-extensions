@@ -23,10 +23,14 @@ jobs:
 
       - name: Link runtime dependencies from the global package
         run: |
-          GLOBAL_NODE_MODULES="$(npm root -g)/@earendil-works/pi-coding-agent/node_modules"
-          mkdir -p node_modules
-          ln -sfn "$GLOBAL_NODE_MODULES/jiti" node_modules/jiti
-          ln -sfn "$GLOBAL_NODE_MODULES/typebox" node_modules/typebox
+          PI_PKG="$(npm root -g)/@earendil-works/pi-coding-agent"
+          mkdir -p node_modules node_modules/@earendil-works
+          ln -sfn "$PI_PKG/node_modules/jiti" node_modules/jiti
+          ln -sfn "$PI_PKG/node_modules/typebox" node_modules/typebox
+          ln -sfn "$PI_PKG" node_modules/@earendil-works/pi-coding-agent
+          for p in pi-ai pi-agent-core pi-tui; do
+            ln -sfn "$PI_PKG/node_modules/@earendil-works/$p" "node_modules/@earendil-works/$p"
+          done
 
       - name: Run offline mock tests
         run: node --test extensions/*/tests/mock.test.mjs
