@@ -1,12 +1,13 @@
 {
-  "name": "@luca4don3/pi-web-search",
-  "version": "0.3.0-beta.1",
-  "description": "Native web_search tool for Pi. Keyless web search through the Exa / Parallel remote MCP endpoints, with no opencode or DSH dependency.",
+  "name": "@luca4don3/pi-extensions",
+  "version": "0.4.0-beta.1",
+  "description": "A collection of Pi extensions. Currently ships web-search: a native, keyless web_search tool backed by the Exa / Parallel MCP endpoints.",
   "type": "module",
   "keywords": [
     "pi-package",
     "pi",
     "pi-extension",
+    "pi-extensions",
     "web-search",
     "websearch",
     "exa",
@@ -16,20 +17,20 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/Luca4Don3/pi-web-search.git"
+    "url": "git+https://github.com/Luca4Don3/pi-extensions.git"
   },
-  "homepage": "https://github.com/Luca4Don3/pi-web-search#readme",
+  "homepage": "https://github.com/Luca4Don3/pi-extensions#readme",
   "bugs": {
-    "url": "https://github.com/Luca4Don3/pi-web-search/issues"
+    "url": "https://github.com/Luca4Don3/pi-extensions/issues"
   },
   "files": [
-    "index.ts",
+    "extensions",
     "README.md",
     "LICENSE"
   ],
   "pi": {
     "extensions": [
-      "./index.ts"
+      "extensions/*/index.ts"
     ]
   },
   "peerDependencies": {
@@ -37,7 +38,7 @@
     "typebox": "*"
   },
   "scripts": {
-    "test": "node --test tests/mock.test.mjs",
-    "test:live": "node tests/smoke.mjs"
+    "test": "node --test extensions/*/tests/mock.test.mjs",
+    "test:live": "node extensions/web-search/tests/smoke.mjs"
   }
 }

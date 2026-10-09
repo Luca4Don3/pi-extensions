@@ -1,16 +1,106 @@
-# Pi Web Search
+# Pi Extensions
 
-[![CI](https://github.com/Luca4Don3/pi-web-search/actions/workflows/ci.yml/badge.svg)](https://github.com/Luca4Don3/pi-web-search/actions/workflows/ci.yml)
+[![CI](https://github.com/Luca4Don3/pi-extensions/actions/workflows/ci.yml/badge.svg)](https://github.com/Luca4Don3/pi-extensions/actions/workflows/ci.yml)
 
-给 [Pi](https://pi.dev) 补上原生 `web_search` 工具。
+我自己的 [Pi](https://pi.dev) 扩展集合：一个仓库统一管理，一次安装、按需启用、统一更新。
+
+## 包含的扩展
+
+| 扩展 | 目录 | 作用 |
+| --- | --- | --- |
+| Web Search | `extensions/web-search/` | 原生 `web_search` 工具：免 key 直连 Exa / Parallel MCP 端点，Key → Free 自动降级 |
+
+## 仓库结构
+
+```text
+pi-extensions/
+├── extensions/
+│   └── web-search/
+│       ├── index.ts              # 扩展入口
+│       └── tests/
+│           ├── mock.test.mjs     # 离线测试（CI 跑这个）
+│           └── smoke.mjs         # 真实网络冒烟
+├── .github/workflows/ci.yml
+├── package.json                  # pi.extensions 声明所有插件入口
+└── README.md
+```
+
+`package.json` 用 glob 声明入口，新增插件通常不需要改它：
+
+```json
+{
+  "pi": {
+    "extensions": ["extensions/*/index.ts"]
+  }
+}
+```
+
+## 安装
+
+```bash
+pi install git:github.com/Luca4Don3/pi-extensions
+```
+
+默认会加载本仓库声明的**全部**扩展。只想启用其中一部分，就把 `settings.json` 里的条目改成对象形式，列出需要的入口：
+
+```json
+{
+  "packages": [
+    {
+      "source": "git:github.com/Luca4Don3/pi-extensions",
+      "extensions": ["extensions/web-search/index.ts"]
+    }
+  ]
+}
+```
+
+`extensions` 数组支持 glob 与排除，例如 `["extensions/*/index.ts", "!extensions/legacy/index.ts"]`；`[]` 表示一个都不加载，`+path` / `-path` 精确包含或排除。
+
+更新：
+
+```bash
+# 只更新本仓库
+pi update git:github.com/Luca4Don3/pi-extensions
+
+# 更新所有已安装包
+pi update --extensions
+```
+
+固定到某个版本：
+
+```bash
+pi install git:github.com/Luca4Don3/pi-extensions@v0.4.0-beta.1
+```
+
+固定 tag 后不会自动跟随新版本，需要手动更新引用。
+
+## 需要理解的两件事
+
+**查找插件**：直接在 GitHub 仓库里浏览，每个插件一个独立目录。
+
+**启用插件**：Pi **不会**自动阅读仓库并智能挑选插件。它只加载你通过 `settings.json` 启用的扩展。至于什么时候调用 `web_search` 这类工具，由模型根据工具描述和任务自行决定。
+
+## 新增一个插件
+
+1. 创建 `extensions/<name>/index.ts`，默认导出一个接收 `ExtensionAPI` 的工厂函数
+2. 在 `extensions/<name>/tests/` 下补离线测试
+3. 根 `package.json` 的 `pi.extensions` 已用 glob，通常无需改动
+4. 提交并推送，本地执行 `pi update` 拉取
+5. 需要按需启用时，调整自己 `settings.json` 中的 `extensions` 过滤列表
+
+---
+
+# Web Search
+
+给 Pi 补上原生 `web_search` 工具。
 
 Pi 的内置工具只有 `read` / `bash` / `edit` / `write` / `grep` / `find` / `ls`，联网只能手写 `curl`。这个扩展把搜索变成一个真正的工具调用：模型直接问，扩展负责请求、解析、截断，返回可引用的网页正文与来源链接。
 
 **不依赖 opencode、DSH 或任何额外服务端进程**，也不需要 DeepSeek 官方 API key。只要 Pi 能联网就能用。
 
-> **与 npm 上同名包 `pi-web-search` 的区别**：那个包（作者 ttttmr）走各家 provider 的**服务端原生搜索**能力，需要对应 provider 的 API key；本包直连 Exa / Parallel 的公开 MCP 端点，**无需任何 key，也不挑 provider**。本扩展不发布到 npm，只通过 GitHub 安装。
+> **与 npm 上同名包 `pi-web-search` 的区别**：那个包（作者 ttttmr）走各家 provider 的**服务端原生搜索**能力，需要对应 provider 的 API key；本扩展直连 Exa / Parallel 的公开 MCP 端点，**无需任何 key，也不挑 provider**。本扩展不发布到 npm，只通过上面的 GitHub 安装方式分发。
 
-## 状态：v0.3.0-beta.1
+## 状态：v0.4.0-beta.1
 
 已在 **Pi 1.1.0** 上验证，本版本明确承诺：
 
@@ -34,54 +124,6 @@ Pi 的内置工具只有 `read` / `bash` / `edit` / `write` / `grep` / `find` / 
 - 失败分类：额度、限流、鉴权、服务端、网络、超时、取消、协议错误各自决策
 - 模型可见正文截断到 24 000 字符，结构化来源与路由信息完整保留在 `details`
 
-## 安装
-
-### 方式一：Pi 内置 Git 安装（推荐）
-
-```bash
-pi install git:github.com/Luca4Don3/pi-web-search
-```
-
-Pi 的包管理器会克隆仓库，并按 `package.json` 中的 `pi.extensions` 声明加载扩展。
-
-更新：
-
-```bash
-# 只更新本扩展
-pi update git:github.com/Luca4Don3/pi-web-search
-
-# 更新所有已安装包
-pi update --extensions
-```
-
-固定到某个版本（仓库有对应 tag 时可用）：
-
-```bash
-pi install git:github.com/Luca4Don3/pi-web-search@v0.3.0-beta.1
-```
-
-固定 tag 后不会自动跟随新版本，需要手动更新引用。
-
-### 方式二：单次试跑
-
-```bash
-pi -e <path>/pi-web-search/index.ts
-```
-
-### 方式三：手动放入扩展目录
-
-全局（对所有项目生效）：
-
-```text
-~/.pi/agent/extensions/pi-web-search/index.ts
-```
-
-项目级（仅对当前项目生效）：
-
-```text
-.pi/extensions/pi-web-search/index.ts
-```
-
 ## 用法
 
 安装后模型会自行调用。参数由模型生成：
@@ -90,7 +132,7 @@ pi -e <path>/pi-web-search/index.ts
 | --- | --- | --- |
 | `query` | string，必填 | 搜索词。建议描述理想页面，而不是堆关键词 |
 | `maxResults` | integer，可选 | 结果条数，默认 `8`，上限 `20` |
-| `provider` | `auto` \| `exa` \| `parallel`，可选 | 默认 `auto`：先试 Exa，失败回退 Parallel |
+| `provider` | `auto` \| `exa` \| `parallel`，可选 | 默认 `auto`：依次尝试 Exa 与 Parallel 的可用通道 |
 
 调用示例：
 
@@ -184,10 +226,10 @@ Exa 返回的正文本身已是大模型友好的文本布局（`Title:` / `URL:
 
 ```bash
 # 离线测试（27 例：解析、四通道路由、额度/鉴权降级、取消、超时、重试、正则回归、截断、落盘清理）
-node --test tests/mock.test.mjs
+node --test extensions/*/tests/mock.test.mjs
 
 # 真实网络冒烟（会调用 Exa / Parallel）
-node tests/smoke.mjs
+node extensions/web-search/tests/smoke.mjs
 ```
 
 本地依赖 `jiti` 与 `typebox`，Pi 自带这两个包，指向本机 Pi 安装即可：
@@ -209,6 +251,7 @@ CI（`.github/workflows/ci.yml`）固定安装 `@earendil-works/pi-coding-agent@
 
 ## 路线图
 
+- Key 冷却与状态管理：避免重复请求已确认不可用的认证通道
 - `web_fetch`：读取指定 URL 的正文，进一步减少对 `curl` 的依赖
 - 结果缓存：减少重复查询
 - 更多后端的可插拔注册

@@ -29,4 +29,4 @@ jobs:
           ln -sfn "$GLOBAL_NODE_MODULES/typebox" node_modules/typebox
 
       - name: Run offline mock tests
-        run: node --test tests/mock.test.mjs
+        run: node --test extensions/*/tests/mock.test.mjs
