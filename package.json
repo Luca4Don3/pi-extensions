@@ -1,0 +1,29 @@
+{
+  "name": "pi-web-search",
+  "version": "0.1.0",
+  "description": "Native web_search tool for Pi. Keyless web search through the Exa / Parallel remote MCP endpoints, with no opencode or DSH dependency.",
+  "type": "module",
+  "keywords": [
+    "pi-package",
+    "pi",
+    "pi-extension",
+    "web-search",
+    "websearch",
+    "exa",
+    "parallel",
+    "mcp"
+  ],
+  "license": "MIT",
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "typebox": "*"
+  },
+  "scripts": {
+    "smoke": "node .temp/smoke.mjs"
+  }
+}
