@@ -17,6 +17,19 @@
     "mcp"
   ],
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Luca4Don3/pi-web-search.git"
+  },
+  "homepage": "https://github.com/Luca4Don3/pi-web-search#readme",
+  "bugs": {
+    "url": "https://github.com/Luca4Don3/pi-web-search/issues"
+  },
+  "files": [
+    "index.ts",
+    "README.md",
+    "LICENSE"
+  ],
   "pi": {
     "extensions": [
       "./index.ts"
@@ -25,8 +38,5 @@
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*",
     "typebox": "*"
-  },
-  "scripts": {
-    "smoke": "node .temp/smoke.mjs"
   }
 }
