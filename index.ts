@@ -14,7 +14,7 @@
  * @module pi-web-search
  */
 
-import { mkdtemp, writeFile } from "node:fs/promises";
+import { mkdir, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -24,14 +24,24 @@ import { Type } from "typebox";
 const EXA_MCP_URL = "https://mcp.exa.ai/mcp";
 /** Parallel 远程 MCP 端点（可选 key 以 Bearer 头附加）。 */
 const PARALLEL_MCP_URL = "https://search.parallel.ai/mcp";
-/** 单请求预算，与 opencode 的 websearch 工具一致。 */
-const TIMEOUT_MS = 25_000;
+/** 默认单请求预算（毫秒），可用 PI_WEB_SEARCH_TIMEOUT_MS 覆盖。 */
+const DEFAULT_TIMEOUT_MS = 25_000;
+/** 默认重试次数（仅限流 / 5xx / 网络抖动可重试），可用 PI_WEB_SEARCH_RETRIES 覆盖。 */
+const DEFAULT_RETRIES = 1;
+/** 重试退避基数：第 n 次重试等待 RETRY_BASE_MS * 2^n。 */
+const RETRY_BASE_MS = 400;
 /** 默认返回条数。 */
 const DEFAULT_NUM_RESULTS = 8;
 /** 模型可见正文上限，超出部分被截断并显式告知模型。 */
 const MAX_TEXT_CHARS = 24_000;
+/** 落盘完整正文的单文件硬上限，避免超大响应写满磁盘。 */
+const SPILL_MAX_BYTES = 2 * 1024 * 1024;
+/** 落盘目录保留的最大文件数，更旧的会被清理。 */
+const SPILL_KEEP_FILES = 20;
+/** 落盘目录名（位于系统临时目录下，不进入任何公开目录）。 */
+const SPILL_DIR_NAME = "pi-web-search";
 /** 归属标识，便于端点侧识别调用方。 */
-const USER_AGENT = "pi-web-search/0.1.0";
+const USER_AGENT = "pi-web-search/0.2.0";
 
 /** 后端选择：auto 表示按顺序尝试。 */
 type Provider = "auto" | "exa" | "parallel";
@@ -52,6 +62,31 @@ interface SearchOutcome {
 	text: string;
 	sources: WebSource[];
 	truncated: boolean;
+}
+
+/** 落盘结果：路径 + 正文是否完整写入（受 SPILL_MAX_BYTES 约束）。 */
+interface SpillResult {
+	path: string;
+	complete: boolean;
+}
+
+/** 带可重试标记的后端错误。 */
+class BackendError extends Error {
+	constructor(
+		message: string,
+		readonly retryable: boolean,
+	) {
+		super(message);
+		this.name = "BackendError";
+	}
+}
+
+/** 读取整数环境变量，非法或越界时回退默认值。 */
+function readIntEnv(name: string, fallback: number, min: number): number {
+	const raw = process.env[name];
+	if (raw === undefined || raw.trim().length === 0) return fallback;
+	const value = Number(raw);
+	return Number.isInteger(value) && value >= min ? value : fallback;
 }
 
 /** 工具参数表。 */
@@ -262,13 +297,17 @@ function exaEndpoint(): string {
 		: EXA_MCP_URL;
 }
 
-/** 构造一次后端调用，返回正文与结构化来源。 */
+/** 构造一次后端调用，返回正文与结构化来源；限流 / 5xx / 网络抖动会按指数退避重试。 */
 async function searchBackend(
 	backend: Backend,
 	query: string,
 	numResults: number,
 	signal?: AbortSignal,
 ): Promise<{ text: string; sources: WebSource[] }> {
+	// 每次调用时读取，便于测试注入（PI_WEB_SEARCH_TIMEOUT_MS / PI_WEB_SEARCH_RETRIES）。
+	const timeoutMs = readIntEnv("PI_WEB_SEARCH_TIMEOUT_MS", DEFAULT_TIMEOUT_MS, 100);
+	const retries = readIntEnv("PI_WEB_SEARCH_RETRIES", DEFAULT_RETRIES, 0);
+
 	const payload: McpRequest = {
 		jsonrpc: "2.0",
 		id: 1,
@@ -301,44 +340,65 @@ async function searchBackend(
 		if (typeof key === "string" && key.length > 0) headers.authorization = `Bearer ${key}`;
 	}
 
-	// 一个控制器同时承担调用方取消与超时预算：预算耗尽算后端错误，调用方取消按取消处理。
-	const controller = new AbortController();
-	let timedOut = false;
-	const timer = setTimeout(() => {
-		timedOut = true;
-		controller.abort();
-	}, TIMEOUT_MS);
-	const onAbort = (): void => controller.abort(signal?.reason);
-	signal?.addEventListener("abort", onAbort, { once: true });
-
-	try {
-		const response = await fetch(backend === "exa" ? exaEndpoint() : PARALLEL_MCP_URL, {
-			method: "POST",
-			headers,
-			body: JSON.stringify(payload),
-			signal: controller.signal,
-		});
-		if (!response.ok) {
-			let detail = "";
-			try {
-				const parsed = (await response.json()) as { error?: { message?: string } | string; message?: string };
-				const raw = typeof parsed?.error === "object" ? parsed.error?.message : (parsed?.error ?? parsed?.message);
-				if (typeof raw === "string") detail = `: ${raw}`;
-			} catch {
-				// 状态码已经足够定位问题，非 JSON 响应体不覆盖它。
-			}
-			throw new Error(`${backend} HTTP ${response.status}${detail}`);
+	/** 执行一次请求；可重试的失败以 BackendError(retryable: true) 抛出。 */
+	const attempt = async (): Promise<{ text: string; sources: WebSource[] }> => {
+		// 一个控制器同时承担调用方取消与超时预算：预算耗尽算后端错误，调用方取消按取消处理。
+		const controller = new AbortController();
+		let timedOut = false;
+		const timer = setTimeout(() => {
+			timedOut = true;
+			controller.abort();
+		}, timeoutMs);
+		const onAbort = (): void => controller.abort(signal?.reason);
+		if (signal?.aborted === true) {
+			clearTimeout(timer);
+			throw new Error("web_search aborted");
 		}
-		const text = parseMcpResponse(await response.text());
-		if (text === undefined) throw new Error(`${backend} returned no usable results`);
-		return { text, sources: extractSources(text) };
-	} catch (error) {
-		if (signal?.aborted === true) throw new Error("web_search aborted");
-		if (timedOut) throw new Error(`${backend} timed out after ${TIMEOUT_MS / 1000}s`);
-		throw error;
-	} finally {
-		clearTimeout(timer);
-		signal?.removeEventListener("abort", onAbort);
+		signal?.addEventListener("abort", onAbort, { once: true });
+
+		try {
+			const response = await fetch(backend === "exa" ? exaEndpoint() : PARALLEL_MCP_URL, {
+				method: "POST",
+				headers,
+				body: JSON.stringify(payload),
+				signal: controller.signal,
+			});
+			if (!response.ok) {
+				let detail = "";
+				try {
+					const parsed = (await response.json()) as { error?: { message?: string } | string; message?: string };
+					const raw = typeof parsed?.error === "object" ? parsed.error?.message : (parsed?.error ?? parsed?.message);
+					if (typeof raw === "string") detail = `: ${raw}`;
+				} catch {
+					// 状态码已经足够定位问题，非 JSON 响应体不覆盖它。
+				}
+				const retryable = response.status === 429 || response.status >= 500;
+				throw new BackendError(`${backend} HTTP ${response.status}${detail}`, retryable);
+			}
+			const text = parseMcpResponse(await response.text());
+			if (text === undefined) throw new BackendError(`${backend} returned no usable results`, false);
+			return { text, sources: extractSources(text) };
+		} catch (error) {
+			if (signal?.aborted === true) throw new Error("web_search aborted");
+			if (timedOut) throw new BackendError(`${backend} timed out after ${timeoutMs}ms`, false);
+			if (error instanceof BackendError) throw error;
+			// fetch 网络层错误（DNS、连接重置等）值得重试。
+			throw new BackendError(`${backend} request failed: ${String(error)}`, true);
+		} finally {
+			clearTimeout(timer);
+			signal?.removeEventListener("abort", onAbort);
+		}
+	};
+
+	for (let round = 0; ; round++) {
+		try {
+			return await attempt();
+		} catch (error) {
+			const retryable = error instanceof BackendError && error.retryable;
+			if (round >= retries || !retryable || signal?.aborted === true) throw error;
+			await new Promise((resolve) => setTimeout(resolve, RETRY_BASE_MS * 2 ** round));
+			if (signal?.aborted === true) throw new Error("web_search aborted");
+		}
 	}
 }
 
@@ -348,21 +408,45 @@ function backendOrder(provider: Provider): Backend[] {
 	return ["exa", "parallel"];
 }
 
-/** 正文超限时把完整内容落到临时文件，模型仍可按需 read。 */
-async function spillFullText(text: string): Promise<string> {
-	const directory = await mkdtemp(join(tmpdir(), "pi-web-search-"));
-	const file = join(directory, "results.txt");
-	await writeFile(file, text, "utf8");
-	return file;
+/** 落盘目录仅保留最近 SPILL_KEEP_FILES 个文件；清理是尽力而为。 */
+async function pruneSpillDirectory(directory: string): Promise<void> {
+	try {
+		const entries = (await readdir(directory))
+			.filter((name) => name.startsWith("results-") && name.endsWith(".txt"))
+			.sort();
+		const stale = entries.slice(0, Math.max(0, entries.length - SPILL_KEEP_FILES));
+		await Promise.all(stale.map((name) => rm(join(directory, name), { force: true })));
+	} catch {
+		// 任何清理失败都不应影响搜索结果返回。
+	}
+}
+
+/**
+ * 正文超限时把内容落到独立临时目录，供模型按需 read。
+ * 目录权限 0700、文件权限 0600，单文件受 SPILL_MAX_BYTES 限制。
+ */
+async function spillFullText(text: string): Promise<SpillResult> {
+	const directory = join(tmpdir(), SPILL_DIR_NAME);
+	await mkdir(directory, { recursive: true, mode: 0o700 });
+	const file = join(directory, `results-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.txt`);
+	const buffer = Buffer.from(text, "utf8");
+	await writeFile(file, buffer.subarray(0, SPILL_MAX_BYTES), { mode: 0o600 });
+	await pruneSpillDirectory(directory);
+	return { path: file, complete: buffer.byteLength <= SPILL_MAX_BYTES };
 }
 
 /** 渲染模型可见正文：Exa 已是大模型友好文本，Parallel 的 JSON 转成 Markdown。 */
-function renderOutcome(query: string, outcome: SearchOutcome, fullTextPath?: string): string {
+function renderOutcome(query: string, outcome: SearchOutcome, spill?: SpillResult): string {
 	const label = outcome.backend === "exa" ? "Exa" : "Parallel";
 	const heading = `[${label}] search: ${query}`;
 	if (outcome.backend === "exa") {
 		if (outcome.text.length <= MAX_TEXT_CHARS) return `${heading}\n\n${outcome.text}`;
-		const note = fullTextPath !== undefined ? `; full text: ${fullTextPath}` : "";
+		const note =
+			spill === undefined
+				? ""
+				: spill.complete
+					? `; full text: ${spill.path}`
+					: `; full text (capped at ${SPILL_MAX_BYTES} bytes): ${spill.path}`;
 		return `${heading}\n\n${outcome.text.slice(0, MAX_TEXT_CHARS)}\n\n[content truncated to ${MAX_TEXT_CHARS} chars${note}]`;
 	}
 	if (outcome.sources.length === 0) return `${heading}\n\n${outcome.text.slice(0, MAX_TEXT_CHARS)}`;
@@ -404,9 +488,9 @@ export default function piWebSearch(pi: ExtensionAPI): void {
 						truncated: text.length > MAX_TEXT_CHARS,
 					};
 					// 超限正文落盘，模型仍可按需 read 完整内容（沿用 Pi 对大结果的惯例）。
-					const fullTextPath = outcome.truncated ? await spillFullText(text) : undefined;
+					const spill = outcome.truncated ? await spillFullText(text) : undefined;
 					return {
-						content: [{ type: "text" as const, text: renderOutcome(query, outcome, fullTextPath) }],
+						content: [{ type: "text" as const, text: renderOutcome(query, outcome, spill) }],
 						details: {
 							provider: backend,
 							query,
@@ -414,7 +498,7 @@ export default function piWebSearch(pi: ExtensionAPI): void {
 							sourceCount: sources.length,
 							sources,
 							truncated: outcome.truncated,
-							...(fullTextPath !== undefined ? { fullTextPath } : {}),
+							...(spill !== undefined ? { fullTextPath: spill.path, fullTextComplete: spill.complete } : {}),
 						},
 					};
 				} catch (error) {

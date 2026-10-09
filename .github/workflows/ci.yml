@@ -1,0 +1,32 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    name: Offline mock tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: Install Pi coding agent (global)
+        run: npm install -g @earendil-works/pi-coding-agent@1.1.0
+
+      - name: Link runtime dependencies from the global package
+        run: |
+          GLOBAL_NODE_MODULES="$(npm root -g)/@earendil-works/pi-coding-agent/node_modules"
+          mkdir -p node_modules
+          ln -sfn "$GLOBAL_NODE_MODULES/jiti" node_modules/jiti
+          ln -sfn "$GLOBAL_NODE_MODULES/typebox" node_modules/typebox
+
+      - name: Run offline mock tests
+        run: node --test tests/mock.test.mjs
