@@ -14,6 +14,9 @@
  * @module pi-web-search
  */
 
+import { mkdtemp, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 
@@ -345,16 +348,22 @@ function backendOrder(provider: Provider): Backend[] {
 	return ["exa", "parallel"];
 }
 
+/** 正文超限时把完整内容落到临时文件，模型仍可按需 read。 */
+async function spillFullText(text: string): Promise<string> {
+	const directory = await mkdtemp(join(tmpdir(), "pi-web-search-"));
+	const file = join(directory, "results.txt");
+	await writeFile(file, text, "utf8");
+	return file;
+}
+
 /** 渲染模型可见正文：Exa 已是大模型友好文本，Parallel 的 JSON 转成 Markdown。 */
-function renderOutcome(query: string, outcome: SearchOutcome): string {
+function renderOutcome(query: string, outcome: SearchOutcome, fullTextPath?: string): string {
 	const label = outcome.backend === "exa" ? "Exa" : "Parallel";
 	const heading = `[${label}] search: ${query}`;
 	if (outcome.backend === "exa") {
-		const body =
-			outcome.text.length > MAX_TEXT_CHARS
-				? `${outcome.text.slice(0, MAX_TEXT_CHARS)}\n\n[content truncated]`
-				: outcome.text;
-		return `${heading}\n\n${body}`;
+		if (outcome.text.length <= MAX_TEXT_CHARS) return `${heading}\n\n${outcome.text}`;
+		const note = fullTextPath !== undefined ? `; full text: ${fullTextPath}` : "";
+		return `${heading}\n\n${outcome.text.slice(0, MAX_TEXT_CHARS)}\n\n[content truncated to ${MAX_TEXT_CHARS} chars${note}]`;
 	}
 	if (outcome.sources.length === 0) return `${heading}\n\n${outcome.text.slice(0, MAX_TEXT_CHARS)}`;
 	const list = outcome.sources
@@ -394,8 +403,10 @@ export default function piWebSearch(pi: ExtensionAPI): void {
 						sources,
 						truncated: text.length > MAX_TEXT_CHARS,
 					};
+					// 超限正文落盘，模型仍可按需 read 完整内容（沿用 Pi 对大结果的惯例）。
+					const fullTextPath = outcome.truncated ? await spillFullText(text) : undefined;
 					return {
-						content: [{ type: "text" as const, text: renderOutcome(query, outcome) }],
+						content: [{ type: "text" as const, text: renderOutcome(query, outcome, fullTextPath) }],
 						details: {
 							provider: backend,
 							query,
@@ -403,6 +414,7 @@ export default function piWebSearch(pi: ExtensionAPI): void {
 							sourceCount: sources.length,
 							sources,
 							truncated: outcome.truncated,
+							...(fullTextPath !== undefined ? { fullTextPath } : {}),
 						},
 					};
 				} catch (error) {
