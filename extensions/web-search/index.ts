@@ -1,9 +1,9 @@
 /**
  * Pi Web Search 扩展
  *
- * 通过 JSON-RPC 2.0 直连 Exa / Parallel 的远程 MCP 端点，为 Pi 提供原生
- * `web_search` 工具。两个端点默认免 key（与 opencode 客户端的直连方式一致），
- * 完全不依赖 opencode、DSH 或任何额外服务端进程：只要 Pi 能联网就能用。
+ * 通过 JSON-RPC 2.0 直连 Exa / Parallel 的远程 MCP 端点，并直连 Tavily /
+ * SerpApi 的原生 HTTP 接口，为 Pi 提供统一的 `web_search` 工具。
+ * Exa / Parallel 默认免 key；Tavily / SerpApi 只在配置密钥后参与路由。
  *
  * 设计要点：
  * - 单请求预算可注入（默认 25 秒），外部取消信号会被转发且立即生效。
@@ -24,8 +24,27 @@ import { join } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { createSecretStore, type SecretStore } from "./credentials.js";
-import { resolvePlanKeys, redactSecrets, safeDiagnostic } from "./auth.js";
+import {
+	BACKENDS,
+	envVarName,
+	resolvePlanKeys,
+	redactSecrets,
+	safeDiagnostic,
+	type Backend,
+	hasFreeChannel,
+} from "./auth.js";
 import { registerAuthCommand } from "./auth-ui.js";
+import {
+	BackendError,
+	errorDetailFrom,
+	isHttpUrl,
+	messageKind,
+	type SearchErrorKind,
+	type WebSource,
+} from "./search-core.js";
+import { apiHttpKind, buildApiRequest, parseApiResponse, type RequestSpec } from "./search-api.js";
+
+export type { WebSource };
 
 /** Exa 远程 MCP 端点（可选 key 以查询参数附加）。 */
 const EXA_MCP_URL = "https://mcp.exa.ai/mcp";
@@ -53,22 +72,9 @@ const SPILL_DIR_NAME = "pi-web-search";
 const USER_AGENT = "pi-web-search/0.4.0-beta.1";
 
 /** 后端选择：auto 表示按计划依次尝试。 */
-type Provider = "auto" | "exa" | "parallel";
-/** 具体后端。 */
-type Backend = "exa" | "parallel";
+type Provider = "auto" | Backend;
 /** 认证通道：key 使用配置的 API Key，free 不带任何凭据。 */
 type Channel = "key" | "free";
-
-/** 失败分类：决定重试、换通道还是立即终止。 */
-type SearchErrorKind =
-	| "quota_exhausted"
-	| "rate_limited"
-	| "invalid_key"
-	| "server_error"
-	| "network_error"
-	| "timeout"
-	| "aborted"
-	| "protocol_error";
 
 /** 一次尝试：某个后端的某个通道。 */
 interface RouteStep {
@@ -76,14 +82,6 @@ interface RouteStep {
 	channel: Channel;
 	/** key 通道使用的凭据；仅存在于内存，绝不写入日志、session 或落盘内容。 */
 	apiKey?: string;
-}
-
-/** 归一化后的来源条目。 */
-export interface WebSource {
-	url: string;
-	title?: string;
-	snippet?: string;
-	publishedAt?: string;
 }
 
 /** 一次搜索的完整结果。 */
@@ -100,26 +98,6 @@ interface SpillResult {
 	complete: boolean;
 }
 
-/** 带分类与可选 Retry-After 的后端错误。 */
-class BackendError extends Error {
-	/** 该通道实际发出的请求次数，由 searchChannel 在抛出前回填。 */
-	attempts = 0;
-
-	constructor(
-		message: string,
-		readonly kind: SearchErrorKind,
-		readonly retryAfterMs?: number,
-	) {
-		super(message);
-		this.name = "BackendError";
-	}
-
-	/** 限流、服务端错误与网络抖动值得重试；额度、鉴权与协议问题不值得。 */
-	get retryable(): boolean {
-		return this.kind === "rate_limited" || this.kind === "server_error" || this.kind === "network_error";
-	}
-}
-
 /** 工具参数表。 */
 const WebSearchParams = Type.Object({
 	query: Type.String({
@@ -134,8 +112,8 @@ const WebSearchParams = Type.Object({
 		}),
 	),
 	provider: Type.Optional(
-		Type.Union([Type.Literal("auto"), Type.Literal("exa"), Type.Literal("parallel")], {
-			description: "Search backend. auto (default) tries Exa first and falls back to Parallel.",
+		Type.Union([Type.Literal("auto"), Type.Literal("exa"), Type.Literal("parallel"), Type.Literal("tavily"), Type.Literal("serpapi")], {
+			description: "Search backend. auto (default) tries Exa, Parallel, then configured Tavily and SerpApi.",
 		}),
 	),
 });
@@ -175,29 +153,6 @@ function readIntEnv(name: string, fallback: number, min: number): number {
 	return Number.isInteger(value) && value >= min ? value : fallback;
 }
 
-/** 按 HTTP 状态码归类。 */
-function statusKind(status: number): SearchErrorKind {
-	if (status === 401 || status === 403) return "invalid_key";
-	if (status === 402) return "quota_exhausted";
-	if (status === 429) return "rate_limited";
-	if (status >= 500) return "server_error";
-	return "protocol_error";
-}
-
-/** 按错误文本归类；无明确信号时返回 undefined，让状态码决定。 */
-function messageKind(message: string): SearchErrorKind | undefined {
-	const text = message.toLowerCase();
-	if (/quota|credit|balance|insufficient|payment required|no remaining/.test(text)) return "quota_exhausted";
-	if (/rate limit|too many requests/.test(text)) return "rate_limited";
-	if (/unauthoriz|forbidden|invalid api key|authentication|api key/.test(text)) return "invalid_key";
-	return undefined;
-}
-
-/** HTTP 错误归类：文本信号优先于状态码。 */
-function httpKind(status: number, detail: string): SearchErrorKind {
-	return messageKind(detail) ?? statusKind(status);
-}
-
 /** 解析 Retry-After（秒数或 HTTP 日期），并夹到上限内。 */
 function parseRetryAfter(value: string | null): number | undefined {
 	if (value === null) return undefined;
@@ -216,15 +171,22 @@ function parseRetryAfter(value: string | null): number | undefined {
 function backendSteps(backend: Backend, key: string | undefined): RouteStep[] {
 	const steps: RouteStep[] = [];
 	if (key !== undefined && key.length > 0) steps.push({ backend, channel: "key", apiKey: key });
-	steps.push({ backend, channel: "free" });
+	if (hasFreeChannel(backend)) steps.push({ backend, channel: "free" });
 	return steps;
 }
 
-/** 完整尝试计划：Exa 的 key / free，再到 Parallel 的 key / free。 */
+/**
+ * 完整尝试计划：自动模式按 Exa → Parallel → Tavily → SerpApi 依次尝试；
+ * 显式指定的后端未配置密钥时立即报错，不发出任何请求。
+ */
 function routePlan(provider: Provider, keys: Record<Backend, string | undefined>): RouteStep[] {
-	if (provider === "exa") return backendSteps("exa", keys.exa);
-	if (provider === "parallel") return backendSteps("parallel", keys.parallel);
-	return [...backendSteps("exa", keys.exa), ...backendSteps("parallel", keys.parallel)];
+	const backends = provider === "auto" ? BACKENDS : [provider];
+	const steps = backends.flatMap((backend) => backendSteps(backend, keys[backend]));
+	if (steps.length === 0) {
+		// 只有显式指定的后端才可能为空，此时 provider 必然不是 auto。
+		throw new Error(`${provider} 未配置密钥：请设置环境变量 ${envVarName(provider as Backend)} 或使用 /web-search-auth 配置`);
+	}
+	return steps;
 }
 
 /** 失败信息里标识具体通道。 */
@@ -299,10 +261,10 @@ function parseExaBlock(block: string): WebSource | undefined {
 				.replace(/^(?:content|snippet|excerpt):\s*/iu, "")
 				.replace(/^###\s*/u, "")
 				.trim();
-			if (candidate.length > 0 && !ELLIPSIS_RE.test(candidate)) snippet = candidate.slice(0, 200);
+			if (candidate.length > 0 && !ELLIPSIS_RE.test(candidate)) snippet = candidate;
 		}
 	}
-	if (url === undefined || !URL.canParse(url)) return undefined;
+	if (url === undefined || !isHttpUrl(url)) return undefined;
 	return {
 		url,
 		...(title !== undefined && title.length > 0 ? { title } : {}),
@@ -323,12 +285,12 @@ function extractSourcesByLines(text: string): WebSource[] {
 	for (let i = 0; i < lines.length; i++) {
 		for (const match of lines[i].matchAll(URL_RE)) {
 			const url = match[0].replace(/[.,;:!?)\]]+$/u, "");
-			if (seen.has(url) || !URL.canParse(url)) continue;
+			if (seen.has(url) || !isHttpUrl(url)) continue;
 			seen.add(url);
 			const prev = i > 0 ? lines[i - 1] : undefined;
 			const next = i + 1 < lines.length ? lines[i + 1] : undefined;
 			const title = isUrlLine(prev) ? undefined : prev?.replace(ZWSP_RE, "").trim();
-			const snippet = isUrlLine(next) ? undefined : next?.slice(0, 200);
+			const snippet = isUrlLine(next) ? undefined : next;
 			sources.push({
 				url,
 				...(title !== undefined && title.length > 0 ? { title } : {}),
@@ -354,7 +316,7 @@ function parseParallelJson(text: string): WebSource[] | undefined {
 	for (const item of envelope.results as Record<string, unknown>[]) {
 		if (item === null || typeof item !== "object") continue;
 		const url = typeof item.url === "string" ? item.url : undefined;
-		if (url === undefined || url.length === 0 || seen.has(url) || !URL.canParse(url)) continue;
+		if (url === undefined || url.length === 0 || seen.has(url) || !isHttpUrl(url)) continue;
 		seen.add(url);
 		const title = typeof item.title === "string" ? item.title.replace(ZWSP_RE, "").trim() : undefined;
 		const excerpt = Array.isArray(item.excerpts)
@@ -367,7 +329,7 @@ function parseParallelJson(text: string): WebSource[] | undefined {
 		sources.push({
 			url,
 			...(title !== undefined && title.length > 0 ? { title } : {}),
-			...(excerpt !== undefined ? { snippet: excerpt.trim().slice(0, 200) } : {}),
+			...(excerpt !== undefined ? { snippet: excerpt.trim() } : {}),
 			...(publishedAt !== undefined ? { publishedAt } : {}),
 		});
 	}
@@ -485,7 +447,7 @@ function redactSource(source: WebSource, secrets: readonly (string | undefined)[
 	return {
 		url: redactSecrets(source.url, secrets),
 		...(source.title !== undefined ? { title: redactSecrets(source.title, secrets) } : {}),
-		...(source.snippet !== undefined ? { snippet: redactSecrets(source.snippet, secrets) } : {}),
+		...(source.snippet !== undefined ? { snippet: redactSecrets(source.snippet, secrets).slice(0, 200) } : {}),
 		...(source.publishedAt !== undefined ? { publishedAt: redactSecrets(source.publishedAt, secrets) } : {}),
 	};
 }
@@ -505,7 +467,7 @@ function renderParallel(sources: WebSource[], text: string): string {
 
 /** 渲染模型可见正文；所有分支共用同一个字符上限。 */
 function renderOutcome(query: string, outcome: SearchOutcome, spill?: SpillResult): string {
-	const label = outcome.backend === "exa" ? "Exa" : "Parallel";
+	const label = { exa: "Exa", parallel: "Parallel", tavily: "Tavily", serpapi: "SerpApi" }[outcome.backend];
 	const heading = `[${label}] search: ${query}`;
 	const body = outcome.backend === "exa" ? outcome.text : renderParallel(outcome.sources, outcome.text);
 	if (body.length <= MAX_TEXT_CHARS) return `${heading}\n\n${body}`;
@@ -581,26 +543,43 @@ async function searchChannel(
 		signal?.addEventListener("abort", onAbort, { once: true });
 
 		try {
-			const response = await fetch(backend === "exa" ? exaEndpoint(step) : PARALLEL_MCP_URL, {
-				method: "POST",
-				headers,
-				body: JSON.stringify(payload),
+			if ((backend === "tavily" || backend === "serpapi") && (step.apiKey === undefined || step.apiKey.length === 0)) {
+				throw new BackendError(`${backend} 未配置密钥`, "invalid_key");
+			}
+			// Tavily / SerpApi 使用原生接口，Exa / Parallel 继续使用 MCP 信封。
+			const request: RequestSpec =
+				backend === "tavily" || backend === "serpapi"
+					? buildApiRequest(backend, query, numResults, step.apiKey ?? "")
+					: {
+							url: backend === "exa" ? exaEndpoint(step) : PARALLEL_MCP_URL,
+							method: "POST",
+							headers,
+							body: JSON.stringify(payload),
+						};
+			const response = await fetch(request.url, {
+				method: request.method,
+				headers: request.headers,
+				body: request.body,
 				signal: controller.signal,
 			});
 			if (!response.ok) {
 				let detail = "";
 				try {
-					const parsed = (await response.json()) as { error?: { message?: string } | string; message?: string };
-					const raw = typeof parsed?.error === "object" ? parsed.error?.message : (parsed?.error ?? parsed?.message);
-					if (typeof raw === "string") detail = `: ${raw}`;
+					const raw = errorDetailFrom(await response.json());
+					if (raw !== undefined) detail = `: ${raw}`;
 				} catch {
 					// 状态码已经足够定位问题，非 JSON 响应体不覆盖它。
 				}
-				const kind = httpKind(response.status, detail);
+				const kind = apiHttpKind(backend, response.status, detail);
 				const retryAfterMs = kind === "rate_limited" ? parseRetryAfter(response.headers.get("retry-after")) : undefined;
 				throw new BackendError(`${backend} HTTP ${response.status}${detail}`, kind, retryAfterMs);
 			}
-			const text = parseMcpResponse(await response.text());
+			const body = await response.text();
+			if (backend === "tavily" || backend === "serpapi") {
+				const sources = parseApiResponse(backend, body, numResults);
+				return { text: renderParallel(sources, ""), sources };
+			}
+			const text = parseMcpResponse(body);
 			if (text === undefined) throw new BackendError(`${backend} returned no usable results`, "protocol_error");
 			return { text, sources: extractSources(text) };
 		} catch (error) {
@@ -644,7 +623,7 @@ export default function piWebSearch(pi: ExtensionAPI, options: WebSearchOptions 
 		name: "web_search",
 		label: "Web Search",
 		description:
-			"Search the web via the Exa / Parallel remote MCP endpoints. Returns citable page content and source URLs for current events, documentation, and facts beyond the training data.",
+			"Search the web via Exa, Parallel, Tavily, or SerpApi. Exa and Parallel work without keys; Tavily and SerpApi require configured keys. Returns citable page content and source URLs for current events, documentation, and facts beyond the training data.",
 		parameters: WebSearchParams,
 		annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
 		async execute(_toolCallId, params, signal) {
@@ -656,7 +635,7 @@ export default function piWebSearch(pi: ExtensionAPI, options: WebSearchOptions 
 			// 每次搜索只为可能用到的后端解析一次 key（环境变量优先，其次系统密钥库）。
 			const keys = await resolvePlanKeys(provider, store);
 			// 本次请求涉及的全部 key，用于把所有对外错误文本中的凭据抹掉。
-			const secrets = [keys.exa, keys.parallel];
+			const secrets = BACKENDS.map((backend) => keys[backend]);
 			const failures: { label: string; kind: SearchErrorKind | "unknown"; message: string }[] = [];
 			let attemptCount = 0;
 

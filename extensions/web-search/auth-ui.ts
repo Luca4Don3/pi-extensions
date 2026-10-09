@@ -2,7 +2,7 @@
  * `/web-search-auth` 命令的交互菜单
  *
  * 只使用 Pi 自带的 select / confirm / notify：
- * - 状态：分别报告 exa / parallel 是否已配置、凭据来源，区分「未配置」与「密钥库不可用」。
+ * - 状态：分别报告四个后端的配置与凭据来源，区分「未配置」与「密钥库不可用」。
  * - 配置说明：输出安全的终端命令（key 只从交互提示读取，绝不放命令参数）。
  * - 删除：二次确认后只删除系统密钥库中的条目，并给出成功 / 未找到 / 失败诊断。
  *
@@ -17,6 +17,8 @@ import {
 	BACKENDS,
 	configGuide,
 	envVarName,
+	hasFreeChannel,
+	isBackend,
 	type Backend,
 	type BackendStatus,
 	probeBackendStatus,
@@ -35,7 +37,7 @@ const OPTION_DELETE = "删除系统密钥库中的密钥";
 /** 注册 `/web-search-auth` 命令。 */
 export function registerAuthCommand(pi: ExtensionAPI, store: SecretStore): void {
 	pi.registerCommand(AUTH_COMMAND, {
-		description: "查看 / 配置 Exa 与 Parallel 的 API key（环境变量或系统密钥库）",
+		description: "查看 / 配置 Exa、Parallel、Tavily、SerpApi 的密钥（环境变量或系统密钥库）",
 		handler: async (_args, ctx) => {
 			await runAuthMenu(ctx, store);
 		},
@@ -55,7 +57,11 @@ function statusLine(status: BackendStatus, store: SecretStore): string {
 		const label = store.kind === "secret-tool" ? "Linux Secret Service" : "macOS Keychain";
 		return `${name}：已配置（${label}）`;
 	}
-	if (status.state === "not_configured") return `${name}：未配置（免 key 通道仍可用）`;
+	if (status.state === "not_configured") {
+		return hasFreeChannel(status.backend)
+			? `${name}：未配置（免 key 通道仍可用）`
+			: `${name}：未配置（需要密钥，没有免 key 通道）`;
+	}
 	return `${name}：系统密钥库不可用（${status.reason ?? "未知原因"}）`;
 }
 
@@ -70,7 +76,7 @@ function summarize(statuses: BackendStatus[]): string {
 		.join(" · ");
 }
 
-/** 报告两个后端的当前状态（合并为单条通知，避免连续 notify 互相覆盖）。 */
+/** 报告所有后端的当前状态（合并通知，避免连续通知互相覆盖）。 */
 async function reportStatus(
 	ctx: ExtensionCommandContext,
 	store: SecretStore,
@@ -78,7 +84,7 @@ async function reportStatus(
 ): Promise<void> {
 	const statuses = probed ?? (await Promise.all(BACKENDS.map((backend) => probeBackendStatus(backend, store))));
 	const lines = statuses.map((status) => statusLine(status, store));
-	lines.push("系统密钥库读取失败不会阻断 web_search：仍会使用免 key 通道。");
+	lines.push("Exa / Parallel 的免 key 通道仍可用；Tavily / SerpApi 必须通过环境变量或系统密钥库配置密钥。");
 	const hasUnavailable = statuses.some((status) => status.state === "unavailable");
 	notify(ctx, lines.join("\n"), hasUnavailable ? "warning" : "info");
 }
@@ -86,7 +92,8 @@ async function reportStatus(
 /** 展示安全配置说明（合并为单条通知）。 */
 async function showGuides(ctx: ExtensionCommandContext, store: SecretStore): Promise<void> {
 	const sections = BACKENDS.map((backend) => configGuide(backend, store.kind).lines.join("\n"));
-	sections.push("环境变量同样有效且优先：EXA_API_KEY / PARALLEL_API_KEY。");
+	sections.push(`环境变量同样有效且优先：${BACKENDS.map(envVarName).join(" / ")}。`);
+	sections.push("Tavily / SerpApi 必须配置密钥，没有免 key 通道。");
 	notify(ctx, sections.join("\n\n"));
 }
 
@@ -98,7 +105,7 @@ async function deleteStoredKey(ctx: ExtensionCommandContext, store: SecretStore)
 	}
 	const selected = await ctx.ui.select("选择要删除的后端", [...BACKENDS]);
 	// 运行时验证选择值：非白名单（取消、自定义输入等）一律视为取消，绝不误删。
-	if (selected !== "exa" && selected !== "parallel") {
+	if (!isBackend(selected)) {
 		notify(ctx, "已取消，未删除任何凭据。");
 		return;
 	}

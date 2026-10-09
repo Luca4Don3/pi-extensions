@@ -10,7 +10,7 @@
 
 | 插件 | 目录 | 安装 | 作用 |
 | --- | --- | --- | --- |
-| Web Search | `extensions/web-search/` | `pi install ~/pi-extensions/extensions/web-search` | 原生 `web_search` 工具：免 key 直连 Exa / Parallel MCP，Key → Free 自动降级 |
+| Web Search | `extensions/web-search/` | `pi install ~/pi-extensions/extensions/web-search` | 原生 `web_search` 工具：Exa / Parallel 免 key 直连，Tavily / SerpApi 配置密钥后参与路由 |
 | Subagent | `extensions/subagent/` | `pi install ~/pi-extensions/extensions/subagent` | 把任务委派给独立上下文的子 agent（single / parallel / chain） |
 | Chinese Prompt | `extensions/chinese-prompt/` | `pi install ~/pi-extensions/extensions/chinese-prompt` | 注入中文强约束 system prompt，推理与输出全程简体中文 |
 | OpenCode Fallback | `extensions/opencode-fallback/` | `pi install ~/pi-extensions/extensions/opencode-fallback` | GPT/Grok/Muse/Claude 固定走代理，其余模型直连优先、失败回退 |
@@ -285,7 +285,7 @@ Pi 的内置工具只有 `read` / `bash` / `edit` / `write` / `grep` / `find` / 
 已在 **Pi 1.1.0** 上验证，本版本明确承诺：
 
 - Pi 1.1.0 真实会话兼容，模型可自主调用 `web_search`，工具名与参数保持稳定
-- 四通道路由：Exa Key → Exa Free → Parallel Key → Parallel Free
+- 路由：Exa Key → Exa Free → Parallel Key → Parallel Free → Tavily Key → SerpApi Key（未配置密钥的后端自动跳过）
 - 额度耗尽（402 / quota 文本）与鉴权失败（401/403）不重试，直接降级到免费通道
 - 限流（429）尊重上游 `Retry-After`，5xx 与网络抖动按指数退避重试
 - 取消贯穿完整生命周期：请求、响应体读取、退避等待、故障切换、落盘
@@ -336,6 +336,8 @@ Pi 的内置工具只有 `read` / `bash` / `edit` / `write` / `grep` / `find` / 
 | --- | --- | --- |
 | `EXA_API_KEY` | 空 | 以 `?exaApiKey=` 查询参数附加到 Exa 端点；优先于系统密钥库 |
 | `PARALLEL_API_KEY` | 空 | 以 `Authorization: Bearer` 头附加到 Parallel 端点；优先于系统密钥库 |
+| `TAVILY_API_KEY` | 空 | Tavily 没有免 key 通道；以 `Authorization: Bearer` 头调用 `https://api.tavily.com/search`，固定使用 basic 搜索（1 积分） |
+| `SERPAPI_API_KEY` | 空 | SerpApi 没有免 key 通道；以 `api_key` 查询参数调用 `https://serpapi.com/search.json`，结果来自 Google organic_results |
 | `PI_WEB_SEARCH_TIMEOUT_MS` | `25000` | 单请求预算，最小 `100` |
 | `PI_WEB_SEARCH_RETRIES` | `1` | 可重试错误的最大重试次数，`0` 表示不重试 |
 
@@ -374,7 +376,7 @@ Pi 的内置工具只有 `read` / `bash` / `edit` / `write` / `grep` / `find` / 
 一次 `web_search` 会按下面的顺序尝试，成功即停止：
 
 ```text
-Exa Key  →  Exa Free  →  Parallel Key  →  Parallel Free
+Exa Key  →  Exa Free  →  Parallel Key  →  Parallel Free  →  Tavily Key  →  SerpApi Key
 ```
 
 没配 key 的后端会跳过对应的 Key 通道。每一步的失败原因决定下一步：

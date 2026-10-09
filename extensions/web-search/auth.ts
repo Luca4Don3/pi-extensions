@@ -36,12 +36,28 @@ export interface BackendStatus {
 	reason?: string;
 }
 
-/** 两个后端，固定顺序。 */
-export const BACKENDS: readonly Backend[] = ["exa", "parallel"];
+/** 后端顺序同时用于自动路由与认证菜单。 */
+export const BACKENDS: readonly Backend[] = ["exa", "parallel", "tavily", "serpapi"];
+
+/** 运行时白名单，避免非法选择进入凭据操作。 */
+export function isBackend(value: unknown): value is Backend {
+	return typeof value === "string" && BACKENDS.includes(value as Backend);
+}
+
+/** 只有公开 MCP 后端支持免密钥通道。 */
+export function hasFreeChannel(backend: Backend): boolean {
+	return backend === "exa" || backend === "parallel";
+}
 
 /** 后端对应的环境变量名。 */
 export function envVarName(backend: Backend): string {
-	return backend === "exa" ? "EXA_API_KEY" : "PARALLEL_API_KEY";
+	const names: Record<Backend, string> = {
+		exa: "EXA_API_KEY",
+		parallel: "PARALLEL_API_KEY",
+		tavily: "TAVILY_API_KEY",
+		serpapi: "SERPAPI_API_KEY",
+	};
+	return names[backend];
 }
 
 /** 读取环境变量中的 key；空白视为未配置。 */
@@ -69,7 +85,7 @@ export async function resolveBackendKey(backend: Backend, store: SecretStore): P
 
 /**
  * 为一次搜索解析路由所需的全部 key：每个可能用到的后端只读一次密钥库。
- * provider=exa 只解 exa，provider=parallel 只解 parallel，auto 两个都解。
+ * 显式指定后端时只解析该后端，auto 解析全部后端。
  */
 export async function resolvePlanKeys(
 	provider: "auto" | Backend,
@@ -82,7 +98,9 @@ export async function resolvePlanKeys(
 			await resolveBackendKey(backend, store),
 		]),
 	);
-	const keys = { exa: undefined, parallel: undefined } as Record<Backend, string | undefined>;
+	const keys: Record<Backend, string | undefined> = {
+		exa: undefined, parallel: undefined, tavily: undefined, serpapi: undefined,
+	};
 	for (const [backend, key] of entries) keys[backend] = key;
 	return keys;
 }
@@ -195,9 +213,11 @@ export function configGuide(backend: Backend, kind: SecretStore["kind"]): Config
 		backend,
 		kind,
 		lines: [
-			"当前平台没有系统密钥库，web_search 未提供 key 时会自动走免 key 通道。",
+			hasFreeChannel(backend)
+				? "当前平台没有系统密钥库，此后端未提供密钥时仍可使用免 key 通道。"
+				: "当前平台没有系统密钥库，此后端必须配置密钥，没有免 key 通道。", 
 			`如需使用自有 key，请通过外部 secret manager 在启动 Pi 时安全注入 ${variable}；不要把 key 放进 shell 命令或启动文件。`,
-			"例如可使用 1Password CLI、Vault 等外部密钥管理工具；也可继续使用免 key 通道。",
+			"例如可使用 1Password CLI、Vault 等外部密钥管理工具；Exa / Parallel 另有免 key 通道。",
 		],
 	};
 }

@@ -22,7 +22,7 @@ import { spawn } from "node:child_process";
 import { userInfo } from "node:os";
 
 /** 支持凭据配置的后端标识。 */
-export type SecretBackend = "exa" | "parallel";
+export type SecretBackend = "exa" | "parallel" | "tavily" | "serpapi";
 
 /** 系统密钥库的 service 前缀；条目名为 `${SECRET_SERVICE_PREFIX}-${backend}`。 */
 export const SECRET_SERVICE_PREFIX = "pi-web-search";

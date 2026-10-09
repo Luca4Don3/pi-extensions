@@ -53,6 +53,15 @@ await run("exa", { query: "Pi coding agent extension registerTool API", maxResul
 await run("parallel", { query: "Pi coding agent extension registerTool API", provider: "parallel" });
 await run("auto", { query: "TypeScript 5.7 新特性", maxResults: 2 });
 
+// Tavily / SerpApi 必须显式提供环境变量才会真实调用，避免误用密钥库或产生额度消耗。
+for (const [provider, variable] of [["tavily", "TAVILY_API_KEY"], ["serpapi", "SERPAPI_API_KEY"]]) {
+	if (!process.env[variable]) {
+		console.log(`\n[${provider}] SKIP 未设置 ${variable}`);
+		continue;
+	}
+	await run(provider, { query: "Pi coding agent extension registerTool API", maxResults: 2, provider });
+}
+
 // 参数校验路径：空 query 必须显式失败。
 try {
 	await tool.execute("smoke-2", { query: "   " }, undefined, undefined, {});

@@ -535,7 +535,7 @@ test("auth-ui: 状态与说明各合并为单条通知并复用已 probe 状态"
 		const statusCtx = fakeCtx({ selections: ["查看状态"] });
 		await authCommand.handler("", statusCtx);
 		assert.equal(statusCtx.notes.length, 1, "状态应合并为单条通知");
-		assert.equal(reads, 2, "选择「查看状态」不应重复 probe 密钥库");
+		assert.equal(reads, 4, "四个后端各 probe 一次，选择「查看状态」不应重复 probe 密钥库");
 		const guideCtx = fakeCtx({ selections: ["查看配置说明"] });
 		await authCommand.handler("", guideCtx);
 		assert.equal(guideCtx.notes.length, 1, "说明应合并为单条通知");
