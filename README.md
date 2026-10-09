@@ -6,6 +6,8 @@ Pi 的内置工具只有 `read` / `bash` / `edit` / `write` / `grep` / `find` / 
 
 **不依赖 opencode、DSH 或任何额外服务端进程**，也不需要 DeepSeek 官方 API key。只要 Pi 能联网就能用。
 
+> **与 npm 上已有的 `pi-web-search` 的区别**：那个包（作者 ttttmr）走各家 provider 的**服务端原生搜索**能力，需要对应 provider 的 API key；本包直连 Exa / Parallel 的公开 MCP 端点，**无需任何 key，也不挑 provider**。为避开 npm 命名冲突，本包发布为 scoped 名 `@luca4don3/pi-web-search`。
+
 ## 特性
 
 - 原生 `web_search` 工具，模型可直接调用，无需再拼 `curl` 命令
@@ -36,7 +38,9 @@ pi -e <path>/pi-web-search/index.ts
 ### 方式三：作为 Pi 包安装
 
 ```bash
-pi install git:github.com/<user>/pi-web-search
+pi install npm:@luca4don3/pi-web-search
+# 或直接从源码
+pi install git:github.com/Luca4Don3/pi-web-search
 ```
 
 ## 用法
