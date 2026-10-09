@@ -8,7 +8,7 @@ Pi 的内置工具只有 `read` / `bash` / `edit` / `write` / `grep` / `find` / 
 
 **不依赖 opencode、DSH 或任何额外服务端进程**，也不需要 DeepSeek 官方 API key。只要 Pi 能联网就能用。
 
-> **与 npm 上已有的 `pi-web-search` 的区别**：那个包（作者 ttttmr）走各家 provider 的**服务端原生搜索**能力，需要对应 provider 的 API key；本包直连 Exa / Parallel 的公开 MCP 端点，**无需任何 key，也不挑 provider**。为避开 npm 命名冲突，本包发布为 scoped 名 `@luca4don3/pi-web-search`。
+> **与 npm 上同名包 `pi-web-search` 的区别**：那个包（作者 ttttmr）走各家 provider 的**服务端原生搜索**能力，需要对应 provider 的 API key；本包直连 Exa / Parallel 的公开 MCP 端点，**无需任何 key，也不挑 provider**。本扩展不发布到 npm，只通过 GitHub 安装。
 
 ## 状态：v0.3.0-beta.1
 
@@ -36,28 +36,50 @@ Pi 的内置工具只有 `read` / `bash` / `edit` / `write` / `grep` / `find` / 
 
 ## 安装
 
-### 方式一：单次试跑
+### 方式一：Pi 内置 Git 安装（推荐）
+
+```bash
+pi install git:github.com/Luca4Don3/pi-web-search
+```
+
+Pi 的包管理器会克隆仓库，并按 `package.json` 中的 `pi.extensions` 声明加载扩展。
+
+更新：
+
+```bash
+# 只更新本扩展
+pi update git:github.com/Luca4Don3/pi-web-search
+
+# 更新所有已安装包
+pi update --extensions
+```
+
+固定到某个版本（仓库有对应 tag 时可用）：
+
+```bash
+pi install git:github.com/Luca4Don3/pi-web-search@v0.3.0-beta.1
+```
+
+固定 tag 后不会自动跟随新版本，需要手动更新引用。
+
+### 方式二：单次试跑
 
 ```bash
 pi -e <path>/pi-web-search/index.ts
 ```
 
-### 方式二：写进配置（推荐）
+### 方式三：手动放入扩展目录
 
-在 `~/.pi/agent/settings.json` 的 `extensions` 数组里加上扩展路径：
+全局（对所有项目生效）：
 
-```json
-{
-  "extensions": ["<path>/pi-web-search/index.ts"]
-}
+```text
+~/.pi/agent/extensions/pi-web-search/index.ts
 ```
 
-### 方式三：作为 Pi 包安装
+项目级（仅对当前项目生效）：
 
-```bash
-pi install npm:@luca4don3/pi-web-search
-# 或直接从源码
-pi install git:github.com/Luca4Don3/pi-web-search
+```text
+.pi/extensions/pi-web-search/index.ts
 ```
 
 ## 用法
