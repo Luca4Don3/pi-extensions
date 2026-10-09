@@ -119,3 +119,38 @@ test("7. formatAgentList 的列表与剩余计数", () => {
 
 	assert.deepEqual(formatAgentList([], 5), { text: "none", remaining: 0 });
 });
+
+// ---- 注册契约：调用决策指南必须保持双向（既有「何时用」也有「何时不用」）----
+
+const indexModule = await jiti.import(fileURLToPath(new URL("../index.ts", import.meta.url)));
+const registeredTools = [];
+indexModule.default({ registerTool: (tool) => registeredTools.push(tool) });
+const subagentTool = registeredTools[0];
+
+test("8. 注册 subagent 工具并暴露决策指南", () => {
+	assert.equal(subagentTool.name, "subagent");
+	assert.equal(typeof subagentTool.promptSnippet, "string");
+	assert.ok(Array.isArray(subagentTool.promptGuidelines));
+	assert.ok(subagentTool.promptGuidelines.length >= 6, "指南条目过少，判断标准不完整");
+});
+
+test("9. 指南必须同时给出「该用」与「不该用」的判据", () => {
+	const text = [subagentTool.promptSnippet, subagentTool.description, ...subagentTool.promptGuidelines].join("\n");
+	assert.match(text, /do the work directly|Do it yourself/i, "缺少「直接自己做」的判据");
+	assert.match(text, /already in your context/i, "缺少「答案已在上下文」的判据");
+	assert.match(text, /cannot see your conversation/i, "缺少「子 agent 看不到主对话」的提示");
+	assert.match(text, /Do not delegate|Do not run a chain/i, "缺少反向约束");
+});
+
+test("10. 指南不得再出现过强鼓励委派的措辞", () => {
+	const text = [subagentTool.promptSnippet, subagentTool.description, ...subagentTool.promptGuidelines].join("\n");
+	assert.doesNotMatch(text, /use subagents freely/i, "不应鼓励无条件使用");
+	assert.doesNotMatch(text, /default flow for any feature work/i, "不应把 chain 当成默认流程");
+	assert.doesNotMatch(text, /before making changes/i, "不应要求改动前一律委派");
+});
+
+test("11. description 必须包含成本与自包含要求", () => {
+	assert.match(subagentTool.description, /cannot see your conversation/i);
+	assert.match(subagentTool.description, /compressed summary/i);
+	assert.match(subagentTool.description, /self-contained/i);
+});

@@ -196,6 +196,21 @@ cp extensions/subagent/examples/agents/*.md ~/.pi/agent/agents/
 
 示例中的 `model` 默认为注释状态（使用宿主默认模型）。要用自己的模型，取消注释并填入 `model: <provider>/<model>:<thinking>`。
 
+## 调用决策
+
+工具的 `description` 与 `promptGuidelines` 会进入系统提示，所以扩展对「何时该委派」给出的是**双向判据**，而不是一味鼓励：
+
+| 该委派 | 自己做 |
+| --- | --- |
+| 原始输出会淹没上下文、且以后不需要细节（大范围侦查、长命令输出、多文件搜索） | 已知位置的单文件小改 |
+| 多个真正独立的调查可以并行 | 答案已在当前上下文里 |
+| 需要独立视角的审查 / 规划 | 需要与用户来回确认的步骤 |
+| 任务自包含、边界清晰 | 一句话命令 |
+
+成本也写进了描述：每次调用会起一个独立的 `pi` 进程、看不到主对话、返回的是压缩摘要、有启动延迟。指南还明确写了两条反模式——**先理解问题再委派**，以及**不要把 chain 当例行改动的仪式**；摘要不够清楚时要用更窄的任务重跑，而不是猜。
+
+这些判据由测试锁定（`extensions/subagent/tests/mock.test.mjs` 用例 8-11），防止将来退化成单向鼓励。
+
 ---
 
 # Chinese Prompt
@@ -388,7 +403,7 @@ Exa 返回的正文本身已是大模型友好的文本布局（`Title:` / `URL:
 以下测试覆盖仓库内**所有**插件：
 
 ```bash
-# 离线测试（51 例）：web-search 27 + opencode-fallback 17 + subagent 7
+# 离线测试（55 例）：web-search 27 + opencode-fallback 17 + subagent 11
 node --test extensions/*/tests/mock.test.mjs
 
 # 真实网络冒烟（会调用 Exa / Parallel，仅 web-search）
