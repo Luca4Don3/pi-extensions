@@ -54,9 +54,9 @@ test("默认禁用计费；auto 免费优先顺序及指定 provider 限制", ()
 	const config = routing.readRoutingConfig({});
 	assert.deepEqual(config, { strategy: "free-first", allowBillable: false, freeCooldownMs: 1_800_000 });
 	assert.deepEqual(routing.buildRoutePlan("auto", allKeys, config), [
-		{ backend: "parallel", channel: "free" },
 		{ backend: "exa", channel: "free" },
 		{ backend: "tavily", channel: "free" },
+		{ backend: "parallel", channel: "free" },
 		{ backend: "firecrawl", channel: "free" },
 	]);
 	assert.deepEqual(
@@ -66,13 +66,13 @@ test("默认禁用计费；auto 免费优先顺序及指定 provider 限制", ()
 
 	const authorized = routing.readRoutingConfig({ PI_WEB_SEARCH_ALLOW_BILLABLE: "true" });
 	assert.deepEqual(routing.buildRoutePlan("auto", allKeys, authorized), [
-		{ backend: "parallel", channel: "free" },
 		{ backend: "exa", channel: "free" },
 		{ backend: "tavily", channel: "free" },
+		{ backend: "parallel", channel: "free" },
 		{ backend: "firecrawl", channel: "free" },
 		{ backend: "exa", channel: "key" },
-		{ backend: "parallel", channel: "key" },
 		{ backend: "tavily", channel: "key" },
+		{ backend: "parallel", channel: "key" },
 		{ backend: "firecrawl", channel: "key" },
 		{ backend: "serpapi", channel: "key" },
 	]);
@@ -102,28 +102,20 @@ test("新旧计费授权变量严格校验，旧变量仅作为显式别名", ()
 	assert.throws(() => routing.readRoutingConfig({ PI_WEB_SEARCH_ALLOW_PAID: "yes" }), /PI_WEB_SEARCH_ALLOW_PAID/);
 });
 
-test("key-first 不授予计费；显式 SerpApi 仅在授权且有密钥时可路由", () => {
+test("未授权 key-first 保持匿名兼容；授权 key-first 明确要求迁移 free-first", () => {
+	// 未授权时 key-first 只保留匿名兼容；授权后 key-first 会与“免费通道全部优先”冲突，必须在读取配置时报错。
 	const keyFirst = routing.readRoutingConfig({ PI_WEB_SEARCH_ROUTING: "key-first" });
 	assert.deepEqual(routing.buildRoutePlan("auto", allKeys, keyFirst), [
-		{ backend: "parallel", channel: "free" },
 		{ backend: "exa", channel: "free" },
 		{ backend: "tavily", channel: "free" },
+		{ backend: "parallel", channel: "free" },
 		{ backend: "firecrawl", channel: "free" },
 	]);
 	assert.throws(() => routing.buildRoutePlan("serpapi", allKeys, keyFirst), /已被 PI_WEB_SEARCH_ALLOW_BILLABLE=false 禁用/);
-
-	const authorized = routing.readRoutingConfig({
-		PI_WEB_SEARCH_ROUTING: "key-first",
-		PI_WEB_SEARCH_ALLOW_BILLABLE: "true",
-	});
-	assert.deepEqual(routing.buildRoutePlan("auto", allKeys, authorized), [
-		{ backend: "exa", channel: "key" }, { backend: "exa", channel: "free" },
-		{ backend: "parallel", channel: "key" }, { backend: "parallel", channel: "free" },
-		{ backend: "tavily", channel: "key" }, { backend: "tavily", channel: "free" },
-		{ backend: "firecrawl", channel: "key" }, { backend: "firecrawl", channel: "free" },
-		{ backend: "serpapi", channel: "key" },
-	]);
-	assert.deepEqual(routing.buildRoutePlan("serpapi", allKeys, authorized), [{ backend: "serpapi", channel: "key" }]);
+	assert.throws(
+		() => routing.readRoutingConfig({ PI_WEB_SEARCH_ROUTING: "key-first", PI_WEB_SEARCH_ALLOW_BILLABLE: "true" }),
+		/free-first|冲突/u,
+	);
 });
 
 test("显式非法策略报错并限制冷却上限", () => {
@@ -135,6 +127,10 @@ test("显式非法策略报错并限制冷却上限", () => {
 	for (const value of ["-1", "1.5", "9007199254740992", "86400001", ""]) {
 		assert.throws(() => routing.readRoutingConfig({ PI_WEB_SEARCH_FREE_COOLDOWN_MS: value }), /PI_WEB_SEARCH_FREE_COOLDOWN_MS/);
 	}
-	assert.equal(routing.readRoutingConfig({ PI_WEB_SEARCH_FREE_COOLDOWN_MS: "0" }).freeCooldownMs, 0);
-	assert.equal(routing.readRoutingConfig({ PI_WEB_SEARCH_FREE_COOLDOWN_MS: "86400000" }).freeCooldownMs, 86_400_000);
+	const zeroOverride = routing.readRoutingConfig({ PI_WEB_SEARCH_FREE_COOLDOWN_MS: "0" });
+	assert.equal(zeroOverride.freeCooldownMs, 0);
+	assert.equal(zeroOverride.cooldownOverrideMs, 0);
+	const maxOverride = routing.readRoutingConfig({ PI_WEB_SEARCH_FREE_COOLDOWN_MS: "86400000" });
+	assert.equal(maxOverride.freeCooldownMs, 86_400_000);
+	assert.equal(maxOverride.cooldownOverrideMs, 86_400_000);
 });

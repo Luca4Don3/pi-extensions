@@ -48,6 +48,8 @@ async function withEnv(vars, fn) {
 	const saved = {};
 	const merged = {
 		PI_WEB_SEARCH_RETRIES: "0",
+		PI_WEB_SEARCH_TIMEOUT_MS: "25000",
+		PI_WEB_SEARCH_MAX_RESPONSE_BYTES: undefined,
 		PI_WEB_SEARCH_ROUTING: "free-first",
 		PI_WEB_SEARCH_ALLOW_BILLABLE: undefined,
 		PI_WEB_SEARCH_ALLOW_PAID: undefined,
@@ -70,13 +72,23 @@ async function withEnv(vars, fn) {
 	}
 }
 
-/** 替换 fetch 并记录请求。 */
+/** 替换 fetch；calls 仅记录搜索请求，额度 GET 单独存入 calls.usageCalls。 */
 async function withFetch(impl, fn) {
 	const original = globalThis.fetch;
 	const calls = [];
+	const usageCalls = [];
+	calls.usageCalls = usageCalls;
 	globalThis.fetch = (url, init) => {
-		calls.push({ url: String(url), init });
-		return impl(String(url), init, calls.length);
+		const address = String(url);
+		if (init?.method === "GET" && (address === "https://api.tavily.com/usage" || address === "https://api.firecrawl.dev/v2/team/credit-usage")) {
+			usageCalls.push({ url: address, init });
+			const body = address === "https://api.tavily.com/usage"
+				? { key: { usage: 0, limit: 1000 }, account: { plan_usage: 0, plan_limit: 1000, paygo_usage: 0, paygo_limit: 0 } }
+				: { success: true, data: { remainingCredits: 1000 } };
+			return Promise.resolve(json(body));
+		}
+		calls.push({ url: address, init });
+		return impl(address, init, calls.length);
 	};
 	try {
 		return await fn(calls);
@@ -93,15 +105,18 @@ const serpOk = (organic_results) => json({ search_metadata: { status: "Success" 
 test("tavily: POST + Bearer 头 + basic 固定 1 积分", async () => {
 	const { store } = fakeStore({ tavily: TAVILY_KEY });
 	const tool = setup(store);
-	await withEnv({ PI_WEB_SEARCH_ALLOW_BILLABLE: "true", PI_WEB_SEARCH_ROUTING: "key-first" }, () =>
+	await withEnv({ PI_WEB_SEARCH_ALLOW_BILLABLE: "true", PI_WEB_SEARCH_ROUTING: "free-first" }, () =>
 		withFetch(
-			() => tavilyOk([{ url: "https://example.com/a", title: "A", content: "内容", published_date: "2026-01-01" }]),
+			(_url, init) => init.headers.authorization
+				? tavilyOk([{ url: "https://example.com/a", title: "A", content: "内容", published_date: "2026-01-01" }])
+				: new Response("anonymous unavailable", { status: 503 }),
 			async (calls) => {
 				await tool.execute("b1", { query: "hello", provider: "tavily", maxResults: 3 }, undefined, undefined, {});
-				assert.equal(calls[0].url, "https://api.tavily.com/search");
-				assert.equal(calls[0].init.method, "POST");
-				assert.equal(calls[0].init.headers.authorization, `Bearer ${TAVILY_KEY}`);
-				const body = JSON.parse(calls[0].init.body);
+				assert.equal(calls.length, 2);
+				assert.equal(calls[1].url, "https://api.tavily.com/search");
+				assert.equal(calls[1].init.method, "POST");
+				assert.equal(calls[1].init.headers.authorization, `Bearer ${TAVILY_KEY}`);
+				const body = JSON.parse(calls[1].init.body);
 				assert.equal(body.search_depth, "basic");
 				assert.equal(body.auto_parameters, false);
 				assert.equal(body.max_results, 3);
@@ -115,7 +130,7 @@ test("tavily: POST + Bearer 头 + basic 固定 1 积分", async () => {
 test("serpapi: GET + key 仅作为查询参数并正确编码", async () => {
 	const { store } = fakeStore({ serpapi: SERP_KEY });
 	const tool = setup(store);
-	await withEnv({ PI_WEB_SEARCH_ALLOW_BILLABLE: "true", PI_WEB_SEARCH_ROUTING: "key-first" }, () =>
+	await withEnv({ PI_WEB_SEARCH_ALLOW_BILLABLE: "true", PI_WEB_SEARCH_ROUTING: "free-first" }, () =>
 		withFetch(
 			() => serpOk([{ link: "https://example.com/s", title: "S", snippet: "摘要" }]),
 			async (calls) => {
@@ -192,14 +207,16 @@ test("解析：SerpApi HTTP 200 错误与空结果均失败", () => {
 test("额度：Tavily 432 不重试并判为 quota_exhausted", async () => {
 	const { store } = fakeStore({ tavily: TAVILY_KEY });
 	const tool = setup(store);
-	await withEnv({ PI_WEB_SEARCH_RETRIES: "2", PI_WEB_SEARCH_ROUTING: "key-first", PI_WEB_SEARCH_ALLOW_BILLABLE: "true" }, () =>
+	await withEnv({ PI_WEB_SEARCH_RETRIES: "2", PI_WEB_SEARCH_ROUTING: "free-first", PI_WEB_SEARCH_ALLOW_BILLABLE: "true" }, () =>
 		withFetch(
-			() => json({ detail: { error: "This request exceeds your plan's set usage limit. Please upgrade your plan." } }, 432),
+			(_url, init) => init.headers.authorization
+				? json({ detail: { error: "This request exceeds your plan's set usage limit. Please upgrade your plan." } }, 432)
+				: new Response("anonymous rate limited", { status: 429 }),
 			async (calls) => {
 				await assert.rejects(tool.execute("b6", { query: "q", provider: "tavily" }, undefined, undefined, {}), /432/);
-				assert.equal(calls.length, 2, "额度失败后应切换匿名通道，但不能重试同一密钥通道");
-				assert.equal(calls[0].init.headers.authorization, `Bearer ${TAVILY_KEY}`);
-				assert.equal(calls[1].init.headers.authorization, undefined);
+				assert.equal(calls.length, 2, "匿名失败后只尝试一次授权通道，额度错误不重试");
+				assert.equal(calls[0].init.headers.authorization, undefined);
+				assert.equal(calls[1].init.headers.authorization, `Bearer ${TAVILY_KEY}`);
 			},
 		),
 	);
@@ -209,10 +226,10 @@ test("额度：Tavily 433 同样判为额度耗尽", () => {
 	assert.equal(apiModule.apiHttpKind("tavily", 433, "pay-as-you-go limit"), "quota_exhausted");
 });
 
-test("额度：SerpApi 429 额度耗尽不重试；普通限流重试", async () => {
+test("额度：SerpApi 429 额度耗尽和普通限流均不重试同一通道", async () => {
 	const { store } = fakeStore({ serpapi: SERP_KEY });
 	const tool = setup(store);
-	await withEnv({ PI_WEB_SEARCH_RETRIES: "1", PI_WEB_SEARCH_TIMEOUT_MS: "5000", PI_WEB_SEARCH_ROUTING: "key-first", PI_WEB_SEARCH_ALLOW_BILLABLE: "true" }, () =>
+	await withEnv({ PI_WEB_SEARCH_RETRIES: "1", PI_WEB_SEARCH_TIMEOUT_MS: "5000", PI_WEB_SEARCH_ROUTING: "free-first", PI_WEB_SEARCH_ALLOW_BILLABLE: "true" }, () =>
 		withFetch(
 			() => json({ error: "Your account has run out of searches." }, 429),
 			async (calls) => {
@@ -221,16 +238,12 @@ test("额度：SerpApi 429 额度耗尽不重试；普通限流重试", async ()
 			},
 		),
 	);
-	await withEnv({ PI_WEB_SEARCH_RETRIES: "1", PI_WEB_SEARCH_TIMEOUT_MS: "5000", PI_WEB_SEARCH_ROUTING: "key-first", PI_WEB_SEARCH_ALLOW_BILLABLE: "true" }, () =>
+	await withEnv({ PI_WEB_SEARCH_RETRIES: "1", PI_WEB_SEARCH_TIMEOUT_MS: "5000", PI_WEB_SEARCH_ROUTING: "free-first", PI_WEB_SEARCH_ALLOW_BILLABLE: "true" }, () =>
 		withFetch(
-			(_url, _init, count) =>
-				count === 1
-					? new Response("slow down", { status: 429, headers: { "retry-after": "0" } })
-					: serpOk([{ link: "https://c.example/", title: "C" }]),
+			() => new Response("slow down", { status: 429, headers: { "retry-after": "0" } }),
 			async (calls) => {
-				const result = await tool.execute("b6c", { query: "q", provider: "serpapi" }, undefined, undefined, {});
-				assert.equal(result.details.provider, "serpapi");
-				assert.equal(calls.length, 2, "普通限流应重试一次");
+				await assert.rejects(tool.execute("b6c", { query: "q", provider: "serpapi" }, undefined, undefined, {}), /429/u);
+				assert.equal(calls.length, 1, "429 立即冷却，不得对同一通道重试");
 			},
 		),
 	);
@@ -240,7 +253,7 @@ test("额度：SerpApi 429 额度耗尽不重试；普通限流重试", async ()
 test("显式未配置：Tavily 匿名可用，SerpApi 无匿名时失败", async () => {
 	const { store } = fakeStore({});
 	const tool = setup(store);
-	await withEnv({ PI_WEB_SEARCH_ROUTING: "key-first", PI_WEB_SEARCH_ALLOW_BILLABLE: "true" }, () =>
+	await withEnv({ PI_WEB_SEARCH_ROUTING: "free-first", PI_WEB_SEARCH_ALLOW_BILLABLE: "true" }, () =>
 		withFetch(
 			() => tavilyOk([{ url: "https://example.com/free", title: "Free", content: "匿名结果" }]),
 			async (calls) => {
@@ -256,11 +269,11 @@ test("显式未配置：Tavily 匿名可用，SerpApi 无匿名时失败", async
 	);
 });
 
-// 8. key-first 覆盖五家 provider 的可用通道，且五家都失败时保留拒绝。
-test("auto key-first：按五家注册顺序尝试密钥与匿名通道", async () => {
+// 8. 授权后仍先尝试全部匿名通道，再按独立计费顺序逐个尝试密钥。
+test("auto free-first：按匿名顺序失败后再按计费顺序尝试五家密钥", async () => {
 	const { store } = fakeStore({ exa: "e", parallel: "p", tavily: TAVILY_KEY, firecrawl: "f", serpapi: SERP_KEY });
 	const tool = setup(store);
-	await withEnv({ PI_WEB_SEARCH_ROUTING: "key-first", PI_WEB_SEARCH_ALLOW_BILLABLE: "true" }, () =>
+	await withEnv({ PI_WEB_SEARCH_ROUTING: "free-first", PI_WEB_SEARCH_ALLOW_BILLABLE: "true" }, () =>
 		withFetch(
 			() => json({ error: "boom" }, 500),
 			async (calls) => {
@@ -273,7 +286,7 @@ test("auto key-first：按五家注册顺序尝试密钥与匿名通道", async 
 					if (call.url.includes("firecrawl.dev")) return call.init.headers.authorization ? "firecrawl(key)" : "firecrawl";
 					return "serpapi(key)";
 				});
-				assert.deepEqual(order, ["exa(key)", "exa", "parallel(key)", "parallel", "tavily(key)", "tavily", "firecrawl(key)", "firecrawl", "serpapi(key)"]);
+				assert.deepEqual(order, ["exa", "tavily", "parallel", "firecrawl", "exa(key)", "tavily(key)", "parallel(key)", "firecrawl(key)", "serpapi(key)"]);
 			},
 		),
 	);
@@ -288,13 +301,13 @@ test("auto 默认禁止计费：未配置密钥时仍尝试四家匿名通道", 
 			async (calls) => {
 				await assert.rejects(tool.execute("b8b", { query: "q" }, undefined, undefined, {}));
 				const order = calls.map((call) => {
-					if (call.url.includes("search.parallel.ai")) return "parallel";
 					if (call.url.includes("mcp.exa.ai")) return "exa";
 					if (call.url.includes("api.tavily.com")) return "tavily";
+					if (call.url.includes("search.parallel.ai")) return "parallel";
 					if (call.url.includes("firecrawl.dev")) return "firecrawl";
 					return "serpapi";
 				});
-				assert.deepEqual(order, ["parallel", "exa", "tavily", "firecrawl"]);
+				assert.deepEqual(order, ["exa", "tavily", "parallel", "firecrawl"]);
 			},
 		),
 	);
@@ -304,19 +317,23 @@ test("auto 默认禁止计费：未配置密钥时仍尝试四家匿名通道", 
 test("密钥：环境变量优先，且每个后端只读取一次", async () => {
 	const { store, reads } = fakeStore({ tavily: "from-store" });
 	const tool = setup(store);
-	await withEnv({ TAVILY_API_KEY: TAVILY_KEY, PI_WEB_SEARCH_ROUTING: "key-first", PI_WEB_SEARCH_ALLOW_BILLABLE: "true" }, () =>
+	await withEnv({ TAVILY_API_KEY: TAVILY_KEY, PI_WEB_SEARCH_ROUTING: "free-first", PI_WEB_SEARCH_ALLOW_BILLABLE: "true" }, () =>
 		withFetch(
-			() => tavilyOk([{ url: "https://d.example/", title: "D", content: "d" }]),
+			(_url, init) => init.headers.authorization
+				? tavilyOk([{ url: "https://d.example/", title: "D", content: "d" }])
+				: new Response("anonymous unavailable", { status: 503 }),
 			async (calls) => {
 				await tool.execute("b9", { query: "q", provider: "tavily" }, undefined, undefined, {});
-				assert.equal(calls[0].init.headers.authorization, `Bearer ${TAVILY_KEY}`);
+				assert.equal(calls[1].init.headers.authorization, `Bearer ${TAVILY_KEY}`);
 				assert.equal(reads.tavily, 0, "环境变量存在时不应访问密钥库");
 			},
 		),
 	);
-	await withEnv({ PI_WEB_SEARCH_ROUTING: "key-first", PI_WEB_SEARCH_ALLOW_BILLABLE: "true" }, () =>
+	await withEnv({ PI_WEB_SEARCH_ROUTING: "free-first", PI_WEB_SEARCH_ALLOW_BILLABLE: "true" }, () =>
 		withFetch(
-			() => tavilyOk([{ url: "https://d.example/", title: "D", content: "d" }]),
+			(_url, init) => init.headers.authorization
+				? tavilyOk([{ url: "https://d.example/", title: "D", content: "d" }])
+				: new Response("anonymous unavailable", { status: 503 }),
 			async () => {
 				await tool.execute("b9b", { query: "q", provider: "tavily" }, undefined, undefined, {});
 				assert.equal(reads.tavily, 1);
@@ -330,9 +347,11 @@ test("脱敏：摘要跨 200 字符边界的 key 被完整替换", async () => {
 	const { store } = fakeStore({ tavily: TAVILY_KEY });
 	const tool = setup(store);
 	const content = `${"x".repeat(190)}${TAVILY_KEY}tail`;
-	await withEnv({ PI_WEB_SEARCH_ROUTING: "key-first", PI_WEB_SEARCH_ALLOW_BILLABLE: "true" }, () =>
+	await withEnv({ PI_WEB_SEARCH_ROUTING: "free-first", PI_WEB_SEARCH_ALLOW_BILLABLE: "true" }, () =>
 		withFetch(
-			() => tavilyOk([{ url: "https://e.example/", title: "E", content }]),
+			(_url, init) => init.headers.authorization
+				? tavilyOk([{ url: "https://e.example/", title: "E", content }])
+				: new Response("anonymous unavailable", { status: 503 }),
 			async () => {
 				const result = await tool.execute("b10", { query: "q", provider: "tavily" }, undefined, undefined, {});
 				const serialized = JSON.stringify(result);
@@ -365,7 +384,7 @@ test("脱敏：SerpApi 错误回显 key 时最终错误不含原文与编码形�
 test("原生接口：超时按预算中止", async () => {
 	const { store } = fakeStore({ tavily: TAVILY_KEY });
 	const tool = setup(store);
-	await withEnv({ PI_WEB_SEARCH_TIMEOUT_MS: "100", PI_WEB_SEARCH_ROUTING: "key-first", PI_WEB_SEARCH_ALLOW_BILLABLE: "true" }, () =>
+	await withEnv({ PI_WEB_SEARCH_TIMEOUT_MS: "100", PI_WEB_SEARCH_ROUTING: "free-first", PI_WEB_SEARCH_ALLOW_BILLABLE: "true" }, () =>
 		withFetch(
 			(_url, init) =>
 				new Promise((_resolve, reject) => {
@@ -426,7 +445,7 @@ test("allowBillable=false 不读 SecretStore：四匿名可用，SerpApi 被禁�
 				: json({ result: { content: [{ type: "text", text: JSON.stringify({ results: [{ url: "https://example.com/p", title: "P", excerpts: ["匿名"] }] }) }] } }),
 			async (calls) => {
 				const result = await tool.execute("b13", { query: "q", provider: "auto" });
-				assert.equal(result.details.provider, "parallel");
+				assert.equal(result.details.provider, "exa");
 				assert.equal(result.details.channel, "free");
 				const tavily = await tool.execute("b13t", { query: "q", provider: "tavily" });
 				assert.equal(tavily.details.channel, "free");

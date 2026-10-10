@@ -8,7 +8,6 @@
 
 import assert from "node:assert/strict";
 import { mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
@@ -46,6 +45,7 @@ function setup(options = {}) {
 		{
 			credentialStore: options.credentialStore ?? createFakeStore(),
 			...(options.channelHealth ? { channelHealth: options.channelHealth } : {}),
+			...(options.quotaClock ? { quotaClock: options.quotaClock } : {}),
 		},
 	);
 	if (tools.length === 0) throw new Error("扩展没有注册任何工具");
@@ -55,12 +55,13 @@ function setup(options = {}) {
 /** 默认实例：供既有用例使用。 */
 const { tool, commands } = setup();
 
-/** 落盘目录，与 index.ts 中 join(tmpdir(), "pi-web-search") 保持一致。 */
-const SPILL_DIR = join(tmpdir(), "pi-web-search");
+/** 隔离正文落盘测试目录，避免触碰系统临时目录中的其他结果。 */
+const TEST_TMPDIR = fileURLToPath(new URL("../.temp/mock-test-tmp/", import.meta.url));
+const SPILL_DIR = join(TEST_TMPDIR, "pi-web-search");
 /** 需要按用例注入并在结束后恢复的环境变量。 */
 const ENV_KEYS = [
 	"PI_WEB_SEARCH_TIMEOUT_MS", "PI_WEB_SEARCH_RETRIES", "PI_WEB_SEARCH_ROUTING",
-	"PI_WEB_SEARCH_ALLOW_BILLABLE", "PI_WEB_SEARCH_ALLOW_PAID", "PI_WEB_SEARCH_FREE_COOLDOWN_MS",
+	"PI_WEB_SEARCH_ALLOW_BILLABLE", "PI_WEB_SEARCH_ALLOW_PAID", "PI_WEB_SEARCH_FREE_COOLDOWN_MS", "PI_WEB_SEARCH_MAX_RESPONSE_BYTES",
 	"EXA_API_KEY", "PARALLEL_API_KEY", "TAVILY_API_KEY", "FIRECRAWL_API_KEY", "SERPAPI_API_KEY",
 ];
 const ENV_BASELINE = Object.fromEntries(ENV_KEYS.map((key) => [key, process.env[key]]));
@@ -87,12 +88,23 @@ function okResponse(body) {
 async function withFetch(impl, fn) {
 	const original = globalThis.fetch;
 	let calls = 0;
+	const usageCalls = [];
 	globalThis.fetch = (url, init) => {
+		const address = String(url);
+		if (init?.method === "GET" && (address === "https://api.tavily.com/usage" || address === "https://api.firecrawl.dev/v2/team/credit-usage")) {
+			usageCalls.push({ url: address, init });
+			const body = address === "https://api.tavily.com/usage"
+				? { key: { usage: 0, limit: 1000 }, account: { plan_usage: 0, plan_limit: 1000, paygo_usage: 0, paygo_limit: 0 } }
+				: { success: true, data: { remainingCredits: 1000 } };
+			return Promise.resolve(new Response(JSON.stringify(body), { headers: { "content-type": "application/json" } }));
+		}
 		calls += 1;
 		return impl(url, init, calls);
 	};
+	const getCalls = () => calls; // 返回值仅统计搜索请求；额度 GET 另存在 usageCalls。
+	getCalls.usageCalls = usageCalls;
 	try {
-		return await fn(() => calls);
+		return await fn(getCalls);
 	} finally {
 		globalThis.fetch = original;
 	}
@@ -107,6 +119,8 @@ async function withEnv(vars, fn) {
 		PI_WEB_SEARCH_ALLOW_BILLABLE: undefined,
 		PI_WEB_SEARCH_ALLOW_PAID: undefined,
 		PI_WEB_SEARCH_FREE_COOLDOWN_MS: "0",
+		PI_WEB_SEARCH_MAX_RESPONSE_BYTES: undefined,
+		TMPDIR: TEST_TMPDIR,
 		EXA_API_KEY: undefined,
 		PARALLEL_API_KEY: undefined,
 		TAVILY_API_KEY: undefined,
@@ -243,17 +257,13 @@ test("7. 超时：HTTP 200 但响应体不结束", async () => {
 	});
 });
 
-test("8. 可重试：Exa 429 后第二次成功", async () => {
+test("8. 429 立即冷却：Exa 同通道不得重试", async () => {
 	await withEnv({ PI_WEB_SEARCH_TIMEOUT_MS: "2000", PI_WEB_SEARCH_RETRIES: "1" }, async () => {
 		await withFetch(
-			(_url, _init, count) =>
-				count === 1
-					? Promise.resolve(new Response(JSON.stringify({ error: { message: "rate limited" } }), { status: 429 }))
-					: Promise.resolve(okResponse(exaSse(EXA_BODY))),
+			() => Promise.resolve(new Response(JSON.stringify({ error: { message: "rate limited" } }), { status: 429 })),
 			async (getCalls) => {
-				const result = await tool.execute("t8", { query: "retry", provider: "exa" });
-				assert.equal(result.details.provider, "exa");
-				assert.equal(getCalls(), 2, "429 应触发一次重试");
+				await assert.rejects(tool.execute("t8", { query: "retry", provider: "exa" }), /429|rate limited/u);
+				assert.equal(getCalls(), 1, "429 应仅请求一次并切换通道");
 			},
 		);
 	});
@@ -381,96 +391,90 @@ test("17. MCP result.isError 被当成错误而非搜索结果", async () => {
 	});
 });
 
-// 18. 额度耗尽：Exa Key 通道失败后降级到同后端的免费通道。
-test("18. 额度耗尽：Exa Key 失败后降级免费通道，且不再重试 Key", async () => {
+// 18. 授权也先走匿名；匿名失败后才读取并尝试 Exa Key。
+test("18. 匿名 Exa 失败后切换已授权密钥通道", async () => {
 	const seen = [];
-	await withEnv({ EXA_API_KEY: "test-key", PI_WEB_SEARCH_RETRIES: "1", PI_WEB_SEARCH_ROUTING: "key-first", PI_WEB_SEARCH_ALLOW_BILLABLE: "true" }, async () => {
+	await withEnv({ EXA_API_KEY: "test-key", PI_WEB_SEARCH_RETRIES: "0", PI_WEB_SEARCH_ROUTING: "free-first", PI_WEB_SEARCH_ALLOW_BILLABLE: "true" }, async () => {
 		await withFetch(
 			(url) => {
 				seen.push(String(url));
-				if (String(url).includes("exaApiKey")) {
-					return okResponse(
-						JSON.stringify({
-							result: { isError: true, content: [{ type: "text", text: "quota exhausted for this api key" }] },
-						}),
-					);
-				}
-				return okResponse(exaSse(EXA_BODY));
+				return String(url).includes("exaApiKey") ? okResponse(exaSse(EXA_BODY)) : new Response("anonymous unavailable", { status: 503 });
 			},
 			async () => {
 				const result = await tool.execute("t18", { query: "x", provider: "exa" }, undefined, undefined, {});
-				assert.equal(result.details.channel, "free");
+				assert.equal(result.details.channel, "key");
 				assert.equal(result.details.provider, "exa");
-				assert.equal(seen.length, 2, "额度错误不该被重试");
-				assert.ok(seen[0].includes("exaApiKey=test-key"));
-				assert.ok(!seen[1].includes("exaApiKey"));
+				assert.equal(seen.length, 2);
+				assert.ok(!seen[0].includes("exaApiKey"));
+				assert.ok(seen[1].includes("exaApiKey=test-key"));
 			},
 		);
 	});
 });
 
-// 19. 鉴权失败：401 同样是「换通道」而不是「重试」。
-test("19. 401 鉴权失败降级免费通道", async () => {
+// 19. 授权 Key 在匿名失败后使用；401 不重试，也不倒回已尝试匿名通道。
+test("19. 匿名失败后 Key 401 不重试且不重复匿名", async () => {
 	const seen = [];
-	await withEnv({ PARALLEL_API_KEY: "bad-key", PI_WEB_SEARCH_RETRIES: "1", PI_WEB_SEARCH_ROUTING: "key-first", PI_WEB_SEARCH_ALLOW_BILLABLE: "true" }, async () => {
+	await withEnv({ PARALLEL_API_KEY: "bad-key", PI_WEB_SEARCH_RETRIES: "1", PI_WEB_SEARCH_ROUTING: "free-first", PI_WEB_SEARCH_ALLOW_BILLABLE: "true" }, async () => {
 		await withFetch(
 			(url, init) => {
 				seen.push({ url: String(url), auth: init?.headers?.authorization });
 				if (init?.headers?.authorization) return new Response("invalid api key", { status: 401 });
-				return okResponse(jsonEnvelope(PARALLEL_INNER));
+				return new Response("anonymous rate limited", { status: 429 });
 			},
 			async () => {
-				const result = await tool.execute("t19", { query: "x", provider: "parallel" }, undefined, undefined, {});
-				assert.equal(result.details.channel, "free");
+				await assert.rejects(tool.execute("t19", { query: "x", provider: "parallel" }, undefined, undefined, {}), /401/u);
 				assert.equal(seen.length, 2);
-				assert.equal(seen[0].auth, "Bearer bad-key");
-				assert.equal(seen[1].auth, undefined);
+				assert.equal(seen[0].auth, undefined);
+				assert.equal(seen[1].auth, "Bearer bad-key");
 			},
 		);
 	});
 });
 
-// 20. 完整四通道顺序：Exa Key → Exa Free → Parallel Key → Parallel Free。
-test("20. 四通道顺序：Exa Key → Exa Free → Parallel Key → Parallel Free", async () => {
+// 20. auto 必须跑完匿名数组，之后才按 Exa、Parallel 的付费顺序尝试已配置 Key。
+test("20. 全部匿名优先，随后按计费顺序尝试已配置 Key", async () => {
 	const seen = [];
 	await withEnv(
-		{ EXA_API_KEY: "k1", PARALLEL_API_KEY: "k2", PI_WEB_SEARCH_RETRIES: "0", PI_WEB_SEARCH_ROUTING: "key-first", PI_WEB_SEARCH_ALLOW_BILLABLE: "true" },
+		{ EXA_API_KEY: "k1", PARALLEL_API_KEY: "k2", PI_WEB_SEARCH_RETRIES: "0", PI_WEB_SEARCH_ROUTING: "free-first", PI_WEB_SEARCH_ALLOW_BILLABLE: "true" },
 		async () => {
 			await withFetch(
 				(url, init) => {
-					const isExaCall = String(url).includes("mcp.exa.ai");
-					const hasKey = isExaCall ? String(url).includes("exaApiKey") : Boolean(init?.headers?.authorization);
-					seen.push(hasKey ? `${isExaCall ? "exa" : "parallel"}(key)` : isExaCall ? "exa" : "parallel");
-					if (hasKey || isExaCall) return new Response("nope", { status: 500 });
-					return okResponse(jsonEnvelope(PARALLEL_INNER));
+					const address = String(url);
+					const isExaCall = address.includes("mcp.exa.ai");
+					const hasKey = isExaCall ? address.includes("exaApiKey") : Boolean(init?.headers?.authorization);
+					const backend = isExaCall ? "exa" : address.includes("api.tavily.com") ? "tavily" : address.includes("firecrawl.dev") ? "firecrawl" : "parallel";
+					seen.push(hasKey ? `${backend}(key)` : backend);
+					if (hasKey && backend === "parallel") return okResponse(jsonEnvelope(PARALLEL_INNER));
+					return new Response("anonymous/key unavailable", { status: 503 });
 				},
 				async () => {
 					const result = await tool.execute("t20", { query: "x" }, undefined, undefined, {});
-					assert.deepEqual(seen, ["exa(key)", "exa", "parallel(key)", "parallel"]);
+					assert.deepEqual(seen, ["exa", "tavily", "parallel", "firecrawl", "exa(key)", "parallel(key)"]);
 					assert.equal(result.details.provider, "parallel");
-					assert.equal(result.details.channel, "free");
+					assert.equal(result.details.channel, "key");
 				},
 			);
 		},
 	);
 });
 
-// 21. 429 的 Retry-After 会被尊重。
-test("21. 429 的 Retry-After 体现在退避等待上", async () => {
+// 21. 5xx 保留一次有界重试；429 的即时冷却由其他断言覆盖。
+test("21. 5xx 退避后最多重试一次", async () => {
 	const startedAt = Date.now();
 	await withEnv({ PI_WEB_SEARCH_RETRIES: "1", PI_WEB_SEARCH_TIMEOUT_MS: "5000" }, async () => {
 		await withFetch(
-			(_url, _init, calls) =>
-				calls === 1
-					? new Response("slow down", { status: 429, headers: { "retry-after": "1" } })
-					: okResponse(exaSse(EXA_BODY)),
-			async () => {
+			(_url, _init, calls) => calls === 1
+				? new Response("upstream unavailable", { status: 503 })
+				: okResponse(exaSse(EXA_BODY)),
+			async (getCalls) => {
 				const result = await tool.execute("t21", { query: "x", provider: "exa" }, undefined, undefined, {});
 				assert.equal(result.details.provider, "exa");
+				assert.equal(getCalls(), 2);
 			},
 		);
 	});
-	assert.ok(Date.now() - startedAt >= 1000, "应至少等待 Retry-After 指定的 1 秒");
+	assert.ok(Date.now() - startedAt >= 350, "5xx 重试应使用有界退避");
 });
 
 // 22. 退避等待必须可以被取消立即打断。
@@ -535,26 +539,19 @@ test("25. 未配置 key 时不发起带凭据的请求", async () => {
 	);
 });
 
-// 26. details 必须能解释「这次搜索走的是哪条通道、为什么降级」。
-test("26. details 记录 provider/channel/attemptCount/fallbackReason", async () => {
-	await withEnv({ EXA_API_KEY: "test-key", PI_WEB_SEARCH_RETRIES: "0", PI_WEB_SEARCH_ROUTING: "key-first", PI_WEB_SEARCH_ALLOW_BILLABLE: "true" }, async () => {
+// 26. details 必须能解释匿名失败后转入获授权密钥通道的原因。
+test("26. details 记录匿名失败转入 Key 的 provider/channel/attemptCount/fallbackReason", async () => {
+	await withEnv({ EXA_API_KEY: "test-key", PI_WEB_SEARCH_RETRIES: "0", PI_WEB_SEARCH_ROUTING: "free-first", PI_WEB_SEARCH_ALLOW_BILLABLE: "true" }, async () => {
 		await withFetch(
-			(url) => {
-				if (String(url).includes("exaApiKey")) {
-					return okResponse(
-						JSON.stringify({
-							result: { isError: true, content: [{ type: "text", text: "quota exhausted for this key" }] },
-						}),
-					);
-				}
-				return okResponse(exaSse(EXA_BODY));
-			},
+			(url) => String(url).includes("exaApiKey")
+				? okResponse(exaSse(EXA_BODY))
+				: new Response("anonymous unavailable", { status: 503 }),
 			async () => {
 				const result = await tool.execute("t26", { query: "x", provider: "exa" }, undefined, undefined, {});
 				assert.equal(result.details.provider, "exa");
-				assert.equal(result.details.channel, "free");
+				assert.equal(result.details.channel, "key");
 				assert.equal(result.details.attemptCount, 2);
-				assert.match(String(result.details.fallbackReason), /exa\(key\)\[quota_exhausted\]/);
+				assert.match(String(result.details.fallbackReason), /exa\[server_error\]/);
 			},
 		);
 	});
@@ -566,7 +563,7 @@ test("27. attemptCount 统计重试次数，未降级时无 fallbackReason", asy
 		await withFetch(
 			(_url, _init, calls) =>
 				calls === 1
-					? new Response("slow down", { status: 429, headers: { "retry-after": "0" } })
+					? new Response("upstream unavailable", { status: 503 })
 					: okResponse(exaSse(EXA_BODY)),
 			async () => {
 				const result = await tool.execute("t27", { query: "x", provider: "exa" }, undefined, undefined, {});
@@ -577,8 +574,8 @@ test("27. attemptCount 统计重试次数，未降级时无 fallbackReason", asy
 	});
 });
 
-// 28. auto free-first 在显式授权后先尝试四个匿名通道，再尝试五家已配置密钥。
-test("28. auto free-first：四匿名优先，再按注册顺序尝试密钥", async () => {
+// 28. auto free-first 在显式授权后先尝试四个匿名通道，再按独立计费顺序尝试密钥。
+test("28. auto free-first：四匿名优先，再按计费顺序尝试密钥", async () => {
 	const order = [];
 	await withEnv({
 		EXA_API_KEY: "exa-key", PARALLEL_API_KEY: "parallel-key",
@@ -597,13 +594,13 @@ test("28. auto free-first：四匿名优先，再按注册顺序尝试密钥", a
 			},
 			async () => {
 				await assert.rejects(tool.execute("t28", { query: "x" }));
-				assert.deepEqual(order, ["parallel", "exa", "tavily", "firecrawl", "exa(key)", "parallel(key)", "tavily(key)", "firecrawl(key)", "serpapi(key)"]);
+				assert.deepEqual(order, ["exa", "tavily", "parallel", "firecrawl", "exa(key)", "tavily(key)", "parallel(key)", "firecrawl(key)", "serpapi(key)"]);
 			},
 		);
 	});
 });
 
-test("29. 显式 provider 免费优先，key-first 时密钥通道优先", async () => {
+test("29. 显式 provider 始终匿名优先，授权 key-first 明确拒绝", async () => {
 	await withEnv({ EXA_API_KEY: "exa-key", PI_WEB_SEARCH_RETRIES: "0", PI_WEB_SEARCH_ALLOW_BILLABLE: "true" }, () =>
 		withFetch(
 			(url) => {
@@ -619,11 +616,10 @@ test("29. 显式 provider 免费优先，key-first 时密钥通道优先", async
 	);
 	await withEnv({ EXA_API_KEY: "exa-key", PI_WEB_SEARCH_RETRIES: "0", PI_WEB_SEARCH_ROUTING: "key-first", PI_WEB_SEARCH_ALLOW_BILLABLE: "true" }, () =>
 		withFetch(
-			(url) => String(url).includes("exaApiKey") ? okResponse(exaSse(EXA_BODY)) : new Response("offline", { status: 500 }),
+			() => { throw new Error("冲突配置不得发送请求"); },
 			async (getCalls) => {
-				const result = await tool.execute("t29b", { query: "x", provider: "exa" });
-				assert.equal(result.details.channel, "key");
-				assert.equal(getCalls(), 1);
+				await assert.rejects(tool.execute("t29b", { query: "x", provider: "exa" }), /free-first/u);
+				assert.equal(getCalls(), 0);
 			},
 		),
 	);
@@ -653,7 +649,7 @@ test("30. Exa 免费额度提示归类为 quota_exhausted，近似普通文本�
 test("31. 通道冷却跳过网络请求，到期后成功清除状态", async () => {
 	let now = 1_000;
 	const health = createChannelHealth({ clock: () => now });
-	const isolatedTool = setup({ channelHealth: health }).tool;
+	const isolatedTool = setup({ channelHealth: health, quotaClock: () => now }).tool;
 	await withEnv({ PI_WEB_SEARCH_RETRIES: "0", PI_WEB_SEARCH_FREE_COOLDOWN_MS: "1000" }, async () => {
 		await withFetch(
 			() => okResponse(exaSse("You've hit Exa's free MCP rate limit.")),
@@ -679,18 +675,14 @@ test("31. 通道冷却跳过网络请求，到期后成功清除状态", async (
 	});
 });
 
-test("32. 429 重试等待最多 5 秒，但冷却使用未截短的 Retry-After", async () => {
+test("32. 429 只发一次搜索请求并按 Retry-After 立即冷却", async () => {
 	let now = 0;
 	const health = createChannelHealth({ clock: () => now });
 	const isolatedTool = setup({ channelHealth: health }).tool;
-	const originalSetTimeout = globalThis.setTimeout;
 	const waits = [];
+	const originalSetTimeout = globalThis.setTimeout;
 	globalThis.setTimeout = (callback, ms, ...args) => {
-		if (ms >= 400 && ms <= 5000) {
-			waits.push(ms);
-			queueMicrotask(() => callback(...args));
-			return originalSetTimeout(() => {}, 0);
-		}
+		if (ms >= 400 && ms <= 5000) waits.push(ms);
 		return originalSetTimeout(callback, ms, ...args);
 	};
 	try {
@@ -699,14 +691,14 @@ test("32. 429 重试等待最多 5 秒，但冷却使用未截短的 Retry-After
 				() => new Response("slow down", { status: 429, headers: { "retry-after": "60" } }),
 				async (getCalls) => {
 					await assert.rejects(isolatedTool.execute("t32", { query: "x", provider: "exa" }));
-					assert.equal(getCalls(), 2);
+					assert.equal(getCalls(), 1);
 				},
 			);
 		});
 	} finally {
 		globalThis.setTimeout = originalSetTimeout;
 	}
-	assert.deepEqual(waits, [5000]);
+	assert.deepEqual(waits, [], "429 不应等待同通道重试");
 	assert.equal(health.snapshot().channels[0].remainingMs, 60_000);
 });
 

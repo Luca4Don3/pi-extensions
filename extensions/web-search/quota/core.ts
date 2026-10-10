@@ -47,6 +47,7 @@ export interface QuotaFailureOptions {
 
 export interface QuotaSnapshot {
 	persistence: "not_initialized" | "persistent" | "memory_only" | "degraded";
+	persistenceReason?: string;
 	cooldowns: QuotaCooldown[];
 }
 
@@ -71,6 +72,10 @@ export interface QuotaScope {
 export interface QuotaBalanceInput extends QuotaScope {
 	allowBillable: boolean;
 	signal?: AbortSignal;
+	/** 每次执行实际配置的解压后响应体上限。 */
+	maxResponseBytes?: number;
+	/** 显式固定冷却覆盖；undefined 使用分原因退避阶梯，0 表示禁用冷却。 */
+	cooldownOverrideMs?: number;
 }
 
 export type QuotaBalance = QuotaLookupResult & { cached?: boolean };
@@ -82,6 +87,8 @@ export interface QuotaReservationInput {
 	allowBillable: boolean;
 	operation: QuotaOperation;
 	maxResults: number;
+	/** 显式固定冷却覆盖；与 {@link QuotaBalanceInput} 使用同一约定。 */
+	cooldownOverrideMs?: number;
 }
 
 export interface QuotaReservation {
@@ -199,6 +206,11 @@ export function createQuotaManager(options: QuotaManagerOptions = {}) {
 	let initialized: Promise<void> | undefined;
 	let initializationComplete = false;
 	let persistence: QuotaSnapshot["persistence"] = "not_initialized";
+	let persistenceReason: string | undefined;
+	const safePersistenceReasons = new Set([
+		"QUOTA_STATE_IO_UNAVAILABLE", "QUOTA_STATE_CORRUPT", "QUOTA_STATE_UNKNOWN_VERSION",
+		"QUOTA_STATE_LOCK_TIMEOUT", "QUOTA_STATE_LOCK_UNAVAILABLE",
+	]);
 	const quotaEpochs = new Map<string, number>();
 	let flushTail: Promise<unknown> = Promise.resolve();
 
@@ -211,11 +223,14 @@ export function createQuotaManager(options: QuotaManagerOptions = {}) {
 				salt = Buffer.from(loaded.state.salt, "base64");
 				for (const entry of loaded.state.entries) records.set(statusKey(entry.scopeId, entry.reason), { ...entry });
 				persistence = stateStore.kind === "private" ? "persistent" : "memory_only";
+				persistenceReason = undefined;
 				pruneHistory();
 			} else if (loaded.status === "missing") {
 				persistence = stateStore.kind === "private" ? "persistent" : "memory_only";
+				persistenceReason = undefined;
 			} else {
 				persistence = "degraded";
+				persistenceReason = safePersistenceReasons.has(loaded.reason) ? loaded.reason : "QUOTA_STATE_IO_UNAVAILABLE";
 			}
 			initializationComplete = true;
 		})();
@@ -303,7 +318,9 @@ export function createQuotaManager(options: QuotaManagerOptions = {}) {
 		assertInitialized();
 		const override = typeof credentialOrCooldown === "number" ? credentialOrCooldown : cooldownMs;
 		validateDuration(override, "cooldownMs");
-		if (override === 0 || defaultCooldownMs === 0) return undefined;
+		// 调用级显式覆盖优先；未提供覆盖时才回落到实例默认值。
+		if (override === 0) return undefined;
+		if (override === undefined && defaultCooldownMs === 0) return undefined;
 		const credential = typeof credentialOrCooldown === "string" ? credentialOrCooldown : undefined;
 		const scopeId = scopeIdFor({ backend, channel, ...(credential === undefined ? {} : { credential }) });
 		const now = clock();
@@ -350,10 +367,16 @@ export function createQuotaManager(options: QuotaManagerOptions = {}) {
 			return { state: "unknown", reason: "authorization_required" };
 		}
 		if (input.signal?.aborted) throw abortError();
+		const responseLimit = input.maxResponseBytes ?? maxResponseBytes;
+		if (!Number.isSafeInteger(responseLimit) || responseLimit < 1 || responseLimit > 20 * 1024 * 1024) {
+			throw new Error("maxResponseBytes is outside the supported range");
+		}
+		validateDuration(input.cooldownOverrideMs, "cooldownOverrideMs");
+		const cooldownOptions = input.cooldownOverrideMs === undefined ? {} : { cooldownMs: input.cooldownOverrideMs };
 		const credential = input.credential;
 		const scopeId = scopeIdFor({ backend: input.backend, channel: "key", credential });
 		const now = clock();
-		const currentCooldown = getCooldown(input.backend, "key", credential);
+		const currentCooldown = getCooldown(input.backend, "key", credential, input.cooldownOverrideMs);
 		if (currentCooldown !== undefined) {
 			return { state: "unknown", reason: currentCooldown.reason === "rate_limited" ? "rate_limited" : "lookup_failed", ...(currentCooldown.reason === "rate_limited" ? { retryAfterMs: currentCooldown.remainingMs } : {}) };
 		}
@@ -368,7 +391,7 @@ export function createQuotaManager(options: QuotaManagerOptions = {}) {
 				credential,
 				allowBillable: true,
 				signal: created.controller.signal,
-			}, { deadlineMs, maxResponseBytes, clock })).then((result) => {
+			}, { deadlineMs, maxResponseBytes: responseLimit, clock })).then((result) => {
 				const safe = safeLookupResult(result);
 				if (created.controller.signal.aborted || lookupIsAborted(safe)) return { state: "unknown", reason: "aborted" } as QuotaLookupResult;
 				if (created.quotaEpoch !== (quotaEpochs.get(scopeId) ?? 0)) return { state: "unknown", reason: "lookup_failed" } as QuotaLookupResult;
@@ -382,10 +405,11 @@ export function createQuotaManager(options: QuotaManagerOptions = {}) {
 					} else {
 						ledgers.set(scopeId, { observedRemaining: safe.remaining, debited: 0, reservations: oldLedger?.reservations ?? new Map() });
 					}
-					if (safe.remaining === 0) recordFailure(input.backend, "key", "quota_exhausted", { credential });
+					if (safe.remaining === 0) recordFailure(input.backend, "key", "quota_exhausted", { credential, ...cooldownOptions });
 				} else if (safe.reason === "rate_limited") {
 					recordFailure(input.backend, "key", "rate_limited", {
 						credential,
+						...cooldownOptions,
 						...(safe.retryAfterMs === undefined ? {} : { retryAfterMs: safe.retryAfterMs }),
 					});
 				}
@@ -438,7 +462,8 @@ export function createQuotaManager(options: QuotaManagerOptions = {}) {
 		const cost = estimateSearchCost(input.backend, input.maxResults, input.operation);
 		if (cost === undefined) return { status: "denied", reason: "unsupported_operation" };
 		const scopeId = scopeIdFor({ backend: input.backend, channel: "key", credential: input.credential });
-		if (getCooldown(input.backend, "key", input.credential) !== undefined) return { status: "denied", reason: "unknown_balance" };
+		validateDuration(input.cooldownOverrideMs, "cooldownOverrideMs");
+		if (getCooldown(input.backend, "key", input.credential, input.cooldownOverrideMs) !== undefined) return { status: "denied", reason: "unknown_balance" };
 		const cached = balances.get(scopeId);
 		if (cached === undefined || cached.expiresAt <= clock() || cached.value.state !== "known") return { status: "denied", reason: "unknown_balance" };
 		let ledger = ledgers.get(scopeId);
@@ -459,7 +484,7 @@ export function createQuotaManager(options: QuotaManagerOptions = {}) {
 			dispatch() {
 				if (held.settled || held.dispatched) return false;
 				const freshBalance = balances.get(scopeId);
-				if (held.quotaEpoch !== (quotaEpochs.get(scopeId) ?? 0) || getCooldown(input.backend, "key", input.credential) !== undefined || freshBalance === undefined ||
+				if (held.quotaEpoch !== (quotaEpochs.get(scopeId) ?? 0) || getCooldown(input.backend, "key", input.credential, input.cooldownOverrideMs) !== undefined || freshBalance === undefined ||
 					freshBalance.expiresAt <= clock() || freshBalance.value.state !== "known") return false;
 				held.dispatched = true;
 				ledger!.debited = safeAdd(ledger!.debited, cost);
@@ -505,17 +530,21 @@ export function createQuotaManager(options: QuotaManagerOptions = {}) {
 				const result = await stateStore.save(state);
 				if (result.status === "unavailable") {
 					persistence = "degraded";
-					return { status: "degraded" as const, reason: result.reason };
+					persistenceReason = safePersistenceReasons.has(result.reason) ? result.reason : "QUOTA_STATE_IO_UNAVAILABLE";
+					return { status: "degraded" as const, reason: persistenceReason };
 				}
 				if (result.status === "memory_only") {
 					persistence = "memory_only";
+					persistenceReason = undefined;
 					return { status: "memory_only" as const };
 				}
 				persistence = "persistent";
+				persistenceReason = undefined;
 				return { status: "persisted" as const };
 			} catch {
 				persistence = "degraded";
-				return { status: "degraded" as const, reason: "QUOTA_STATE_IO_UNAVAILABLE" };
+				persistenceReason = "QUOTA_STATE_IO_UNAVAILABLE";
+				return { status: "degraded" as const, reason: persistenceReason };
 			}
 		};
 		const next = flushTail.then(run, run);
@@ -530,7 +559,11 @@ export function createQuotaManager(options: QuotaManagerOptions = {}) {
 			if (record.cleared || record.until <= now) continue;
 			cooldowns.push(cooldownFrom(record, now));
 		}
-		return { persistence, cooldowns: cooldowns.map((entry) => ({ ...entry })) };
+		return {
+			persistence,
+			...(persistenceReason === undefined ? {} : { persistenceReason }),
+			cooldowns: cooldowns.map((entry) => ({ ...entry })),
+		};
 	};
 
 	return {

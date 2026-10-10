@@ -2,11 +2,12 @@
 
 import {
 	ANONYMOUS_PROVIDER_ORDER,
+	BILLABLE_PROVIDER_ORDER,
 	getProviderMetadata,
 	hasAnonymousChannel,
-	PROVIDER_IDS,
 	type ProviderId,
 } from "./search/registry.js";
+import type { QuotaSnapshot } from "./quota/core.js";
 
 export type RoutingStrategy = "free-first" | "key-first";
 export type SearchChannel = "free" | "key";
@@ -16,6 +17,8 @@ export interface RoutingConfig {
 	strategy: RoutingStrategy;
 	allowBillable: boolean;
 	freeCooldownMs: number;
+	/** 仅显式设置环境变量时存在；undefined 使用额度管理器的分原因退避阶梯。 */
+	cooldownOverrideMs?: number;
 }
 
 export interface RoutingStep {
@@ -31,6 +34,7 @@ export interface RoutingChannelStatus {
 	until: number;
 	remainingMs: number;
 	reason: string;
+	nextProbeAt?: number;
 }
 
 /** 可供认证界面展示的路由状态，刻意不包含任何密钥字段。 */
@@ -39,6 +43,11 @@ export interface RoutingStatus {
 	allowBillable: boolean;
 	freeCooldownMs: number;
 	channels: RoutingChannelStatus[];
+	quota?: {
+		persistence: QuotaSnapshot["persistence"];
+		persistenceReason?: string;
+		cooldowns: RoutingChannelStatus[];
+	};
 }
 
 const MAX_COOLDOWN_MS = 24 * 60 * 60 * 1000;
@@ -69,6 +78,9 @@ export function readRoutingConfig(env: Readonly<Record<string, string | undefine
 		throw new Error("PI_WEB_SEARCH_ALLOW_BILLABLE 与 PI_WEB_SEARCH_ALLOW_PAID 配置冲突");
 	}
 	const allowBillable = newBillable ?? legacyPaid ?? false;
+	if (allowBillable && strategy === "key-first") {
+		throw new Error("PI_WEB_SEARCH_ROUTING=key-first 与 PI_WEB_SEARCH_ALLOW_BILLABLE=true 冲突；请改用 free-first");
+	}
 
 	const cooldownValue = env.PI_WEB_SEARCH_FREE_COOLDOWN_MS;
 	let freeCooldownMs = 1_800_000;
@@ -86,52 +98,48 @@ export function readRoutingConfig(env: Readonly<Record<string, string | undefine
 		freeCooldownMs = parsed;
 	}
 
-	return { strategy, allowBillable, freeCooldownMs };
+	return {
+		strategy,
+		allowBillable,
+		freeCooldownMs,
+		...(cooldownValue === undefined ? {} : { cooldownOverrideMs: freeCooldownMs }),
+	};
 }
 
-/** 按配置生成纯路由步骤；`keys` 仅用于判断是否配置，不进入返回状态。 */
+/** 构造无需读取凭据的候选顺序；所有匿名后端先尝试，再按独立付费顺序延迟解析 Key。 */
+export function buildRouteCandidates(provider: Provider, config: RoutingConfig): RoutingStep[] {
+	if (config.strategy !== "free-first" && config.strategy !== "key-first") {
+		throw new Error("strategy 必须为 free-first 或 key-first");
+	}
+	if (provider !== "auto") getProviderMetadata(provider);
+	if (config.allowBillable && config.strategy === "key-first") {
+		throw new Error("PI_WEB_SEARCH_ROUTING=key-first 与 PI_WEB_SEARCH_ALLOW_BILLABLE=true 冲突；请改用 free-first");
+	}
+
+	const anonymous = provider === "auto"
+		? ANONYMOUS_PROVIDER_ORDER
+		: hasAnonymousChannel(provider) ? [provider] : [];
+	if (!config.allowBillable && provider !== "auto" && anonymous.length === 0) {
+		throw new Error(`${provider} 已被 PI_WEB_SEARCH_ALLOW_BILLABLE=false 禁用；当前仅允许匿名通道`);
+	}
+	const billable = config.allowBillable
+		? provider === "auto" ? BILLABLE_PROVIDER_ORDER : [provider]
+		: [];
+	return [
+		...anonymous.map((backend) => ({ backend, channel: "free" as const })),
+		...billable.map((backend) => ({ backend, channel: "key" as const })),
+	];
+}
+
+/** 按配置生成纯路由步骤；旧 `keys` 参数只作筛选，不读取或返回凭据。 */
 export function buildRoutePlan(
 	provider: Provider,
 	keys: Readonly<Record<ProviderId, string | undefined>>,
 	config: RoutingConfig,
 ): RoutingStep[] {
-	if (config.strategy !== "free-first" && config.strategy !== "key-first") {
-		throw new Error("strategy 必须为 free-first 或 key-first");
-	}
-	if (provider !== "auto") getProviderMetadata(provider);
-
-	const selectedAnonymous = provider === "auto"
-		? ANONYMOUS_PROVIDER_ORDER
-		: hasAnonymousChannel(provider) ? [provider] : [];
-	if (!config.allowBillable) {
-		if (provider !== "auto" && selectedAnonymous.length === 0) {
-			throw new Error(`${provider} 已被 PI_WEB_SEARCH_ALLOW_BILLABLE=false 禁用；当前仅允许匿名通道`);
-		}
-		return selectedAnonymous.map((backend) => ({ backend, channel: "free" }));
-	}
-
-	const hasKey = (backend: ProviderId): boolean => typeof keys[backend] === "string" && keys[backend]!.length > 0;
-	const freeStep = (backend: ProviderId): RoutingStep | undefined =>
-		hasAnonymousChannel(backend) ? { backend, channel: "free" } : undefined;
-	const keyStep = (backend: ProviderId): RoutingStep | undefined =>
-		hasKey(backend) ? { backend, channel: "key" } : undefined;
-
-	let steps: RoutingStep[];
-	if (provider === "auto" && config.strategy === "free-first") {
-		steps = [
-			...ANONYMOUS_PROVIDER_ORDER.map(freeStep).filter((step): step is RoutingStep => step !== undefined),
-			...PROVIDER_IDS.map(keyStep).filter((step): step is RoutingStep => step !== undefined),
-		];
-	} else {
-		const selected = provider === "auto" ? PROVIDER_IDS : [provider];
-		steps = selected.flatMap((backend) => {
-			const ordered = config.strategy === "free-first"
-				? [freeStep(backend), keyStep(backend)]
-				: [keyStep(backend), freeStep(backend)];
-			return ordered.filter((step): step is RoutingStep => step !== undefined);
-		});
-	}
-
+	const candidates = buildRouteCandidates(provider, config);
+	const steps = candidates.filter((step) => step.channel === "free" ||
+		(typeof keys[step.backend] === "string" && keys[step.backend]!.length > 0));
 	if (steps.length === 0) {
 		if (provider === "auto") throw new Error("未配置可用的搜索通道");
 		throw new Error(`${provider} 未配置密钥：请设置环境变量 ${getProviderMetadata(provider).envVar} 或使用 /web-search-auth 配置`);
@@ -143,11 +151,27 @@ export function buildRoutePlan(
 export function getRoutingStatus(
 	config: RoutingConfig = readRoutingConfig(),
 	channels: readonly RoutingChannelStatus[] = [],
+	quotaSnapshot?: QuotaSnapshot,
 ): RoutingStatus {
 	return {
 		strategy: config.strategy,
 		allowBillable: config.allowBillable,
 		freeCooldownMs: config.freeCooldownMs,
 		channels: channels.map((channel) => ({ ...channel })),
+		...(quotaSnapshot === undefined ? {} : {
+			quota: {
+				persistence: quotaSnapshot.persistence,
+				...(quotaSnapshot.persistenceReason === undefined ? {} : { persistenceReason: quotaSnapshot.persistenceReason }),
+				cooldowns: quotaSnapshot.cooldowns.map((cooldown) => ({
+					backend: cooldown.backend,
+					channel: cooldown.channel === "anonymous" ? "free" : "key",
+					coolingDown: true,
+					until: cooldown.until,
+					remainingMs: cooldown.remainingMs,
+					reason: cooldown.reason,
+					...(cooldown.nextProbeAt === undefined ? {} : { nextProbeAt: cooldown.nextProbeAt }),
+				})),
+			},
+		}),
 	};
 }

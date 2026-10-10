@@ -74,12 +74,23 @@ async function withIsolatedEnv(vars, fn) {
 	}
 }
 
+/** calls 只计搜索请求；真实额度 GET 单独记录在 calls.usageCalls 并由本地 fixture 响应。 */
 async function withFetch(implementation, fn) {
 	const original = globalThis.fetch;
 	const calls = [];
+	const usageCalls = [];
+	calls.usageCalls = usageCalls;
 	globalThis.fetch = (url, init) => {
-		calls.push({ url: String(url), init });
-		return implementation(String(url), init, calls.length);
+		const address = String(url);
+		if (init?.method === "GET" && (address === "https://api.tavily.com/usage" || address === "https://api.firecrawl.dev/v2/team/credit-usage")) {
+			usageCalls.push({ url: address, init });
+			const body = address === "https://api.tavily.com/usage"
+				? { key: { usage: 0, limit: 1000 }, account: { plan_usage: 0, plan_limit: 1000, paygo_usage: 0, paygo_limit: 0 } }
+				: { success: true, data: { remainingCredits: 1000 } };
+			return Promise.resolve(new Response(JSON.stringify(body), { headers: { "content-type": "application/json" } }));
+		}
+		calls.push({ url: address, init });
+		return implementation(address, init, calls.length);
 	};
 	try {
 		return await fn(calls);
@@ -260,7 +271,7 @@ test("默认上限会限制五个后端的成功与 HTTP 错误响应，超限�
 		for (const status of [200, 429, 500]) {
 			const health = createChannelHealth();
 			const tool = setup(health);
-				await withIsolatedEnv({
+			await withIsolatedEnv({
 				PI_WEB_SEARCH_MAX_RESPONSE_BYTES: "32",
 				PI_WEB_SEARCH_RETRIES: "1",
 				PI_WEB_SEARCH_FREE_COOLDOWN_MS: "60000",
@@ -359,7 +370,7 @@ test("真实 Node fetch 流式成功及超大 429/500 正文都只请求一次�
 	});
 });
 
-test("auto 遇 Parallel 超限后按匿名顺序回退 Exa，不读取 Keys 或密钥库", async () => {
+test("auto 遇 Exa 超限后按新匿名顺序回退 Tavily，不读取 Keys 或密钥库", async () => {
 	const health = createChannelHealth();
 	const store = fakeStore();
 	let tool;
@@ -367,14 +378,14 @@ test("auto 遇 Parallel 超限后按匿名顺序回退 Exa，不读取 Keys 或�
 	plugin({ registerTool: (entry) => tools.push(entry), registerCommand: () => undefined }, { credentialStore: store.store, channelHealth: health });
 	tool = tools[0];
 	await withIsolatedEnv({ PI_WEB_SEARCH_MAX_RESPONSE_BYTES: "512", PI_WEB_SEARCH_FREE_COOLDOWN_MS: "60000" }, async (keyReads) => {
-		await withFetch((url) => url.includes("search.parallel.ai")
+		await withFetch((url) => url.includes("mcp.exa.ai")
 			? new Response("p".repeat(513))
-			: new Response(JSON.stringify({ result: { content: [{ type: "text", text: "Title: 合法来源\nURL: https://example.com/hit\nHighlights:\n正文" }] } })), async (calls) => {
+			: new Response(JSON.stringify({ results: [{ url: "https://example.com/hit", title: "合法来源", content: "正文" }] })), async (calls) => {
 			const result = await tool.execute("auto-size-fallback", { query: "匿名回退" });
-			assert.equal(result.details.provider, "exa");
+			assert.equal(result.details.provider, "tavily");
 			assert.equal(result.details.channel, "free");
 			assert.equal(result.details.accessTier, "anonymous");
-			assert.deepEqual(calls.map(({ url }) => url.includes("search.parallel.ai") ? "parallel" : "exa"), ["parallel", "exa"]);
+			assert.deepEqual(calls.map(({ url }) => new URL(url).hostname), ["mcp.exa.ai", "api.tavily.com"]);
 			assert.equal(keyReads.count, 0);
 			assert.deepEqual(Object.values(store.reads), [0, 0, 0, 0, 0]);
 		});
@@ -397,11 +408,11 @@ test("读取响应期间预算超时保留超时诊断与原有匿名回退", as
 		});
 		await withFetch((_url, _init, count) => count === 1
 			? new Response(new ReadableStream({ pull: () => new Promise(() => undefined) }))
-			: new Response(JSON.stringify({ result: { content: [{ type: "text", text: "Title: 超时后的有效来源\nURL: https://example.com/timeout-fallback" }] } })), async (calls) => {
+			: new Response(JSON.stringify({ results: [{ url: "https://example.com/timeout-fallback", title: "超时后的有效来源", content: "正文" }] })), async (calls) => {
 			const result = await tool.execute("read-timeout-fallback", { query: "预算", provider: "auto" });
-			assert.equal(result.details.provider, "exa");
+			assert.equal(result.details.provider, "tavily");
 			assert.equal(result.details.attemptCount, 2);
-			assert.deepEqual(calls.map(({ url }) => new URL(url).hostname), ["search.parallel.ai", "mcp.exa.ai"]);
+			assert.deepEqual(calls.map(({ url }) => new URL(url).hostname), ["mcp.exa.ai", "api.tavily.com"]);
 		});
 		assert.equal(keyReads.count, 0);
 	});
@@ -431,7 +442,7 @@ test("非法上限配置在读 Keys 或发送请求之前失败，且不泄漏�
 		PI_WEB_SEARCH_MAX_RESPONSE_BYTES: "0",
 		PI_WEB_SEARCH_ALLOW_BILLABLE: "true",
 		PI_WEB_SEARCH_ALLOW_PAID: "true",
-		PI_WEB_SEARCH_ROUTING: "key-first",
+		PI_WEB_SEARCH_ROUTING: "free-first",
 	}, async (keyReads) => {
 		await withFetch(() => { throw new Error("不应发送请求"); }, async (calls) => {
 			await assert.rejects(tool.execute("invalid-limit", { query: "非法配置", provider: "exa" }), (error) => {

@@ -12,7 +12,14 @@ const plugin = loaded.default ?? loaded;
 const KEY_NAMES = PROVIDER_IDS.map((provider) => PROVIDERS[provider].envVar);
 const keyFor = (provider) => `FAKE_ROUTING_TEST_KEY_${provider}`;
 
-function setup(health) {
+function usageFixture(url) {
+	if (url === "https://api.tavily.com/usage") {
+		return { key: { usage: 0, limit: 1000 }, account: { plan_usage: 0, plan_limit: 1000, paygo_usage: 0, paygo_limit: 0 } };
+	}
+	return { success: true, data: { remainingCredits: 1000 } };
+}
+
+function setup(health, quotaClock) {
 	let tool;
 	let reads = 0;
 	plugin({ registerTool: (definition) => { tool = definition; }, registerCommand: () => {} }, {
@@ -23,6 +30,7 @@ function setup(health) {
 			clear: async () => ({ status: "missing" }),
 		},
 		...(health ? { channelHealth: health } : {}),
+		...(quotaClock ? { quotaClock } : {}),
 	});
 	return { tool, reads: () => reads };
 }
@@ -33,6 +41,8 @@ async function controlled(vars, fetcher, fn) {
 	const originalFetch = globalThis.fetch;
 	let keyReads = 0;
 	const calls = [];
+	const usageCalls = [];
+	calls.usageCalls = usageCalls;
 	process.env = new Proxy({
 		PI_WEB_SEARCH_RETRIES: "0",
 		PI_WEB_SEARCH_FREE_COOLDOWN_MS: "1000",
@@ -45,8 +55,13 @@ async function controlled(vars, fetcher, fn) {
 		},
 	});
 	globalThis.fetch = async (url, init) => {
-		calls.push({ url: String(url), init });
-		return fetcher(String(url), init, calls.length);
+		const address = String(url);
+		if (init?.method === "GET" && (address === "https://api.tavily.com/usage" || address === "https://api.firecrawl.dev/v2/team/credit-usage")) {
+			usageCalls.push({ url: address, init });
+			return new Response(JSON.stringify(usageFixture(address)), { headers: { "content-type": "application/json" } });
+		}
+		calls.push({ url: address, init });
+		return fetcher(address, init, calls.length);
 	};
 	try {
 		return await fn({ calls, keyReads: () => keyReads });
@@ -100,20 +115,22 @@ test("状态码成功但没有有效搜索来源时继续匿名回退，不返�
 	});
 });
 
-test("默认四匿名路由：有密钥也不读取环境密钥或密钥库，成功即停止", async () => {
+test("授权也先尝试匿名：匿名成功后不进入密钥通道，也不查询额度", async () => {
 	const { tool, reads } = setup();
-	await controlled({}, (url) => url.includes("firecrawl.dev") ? fireResponse() : failed(), async ({ calls, keyReads }) => {
+	await controlled({ PI_WEB_SEARCH_ALLOW_BILLABLE: "true" }, (url) => url.includes("firecrawl.dev") ? fireResponse() : failed(), async ({ calls, keyReads }) => {
 		const result = await tool.execute("default", { query: "官方技术文档", maxResults: 3 });
-		assert.deepEqual(calls.map(({ url }) => new URL(url).hostname), ["search.parallel.ai", "mcp.exa.ai", "api.tavily.com", "api.firecrawl.dev"]);
+		assert.deepEqual(calls.map(({ url }) => new URL(url).hostname), ["mcp.exa.ai", "api.tavily.com", "search.parallel.ai", "api.firecrawl.dev"]);
 		assertAnonymous(calls);
-		assert.equal(calls[2].init.headers["X-Tavily-Access-Mode"], "keyless");
+		assert.equal(calls[1].init.headers["X-Tavily-Access-Mode"], "keyless");
 		assert.deepEqual(JSON.parse(calls[3].init.body), { query: "官方技术文档", limit: 3, sources: ["web"] });
 		assert.equal(result.details.provider, "firecrawl");
 		assert.equal(result.details.channel, "free");
 		assert.equal(result.details.accessTier, "anonymous");
 		assert.equal(result.details.attemptCount, 4);
-		assert.equal(keyReads(), 0);
+		// 授权时为统一脱敏会解析全部密钥，但匿名成功前不得读取密钥库，也不得请求任何额度接口。
+		assert.equal(keyReads(), 5);
 		assert.equal(reads(), 0);
+		assert.equal(calls.usageCalls.length, 0);
 	});
 });
 
@@ -125,6 +142,7 @@ test("全部匿名失败时明确拒绝计费，不因五家已配置密钥而�
 		assertAnonymous(calls);
 		assert.equal(reads(), 0);
 		assert.equal(keyReads(), 0);
+		assert.equal(calls.usageCalls.length, 0, "未授权请求不得探测额度接口");
 	});
 });
 
@@ -152,11 +170,11 @@ test("只有明确授权后，才在四匿名失败之后尝试已配置密钥",
 		assert.equal(new URL(calls[4].url).searchParams.get("exaApiKey"), keyFor("exa"));
 		assert.equal(result.details.channel, "key");
 		assert.equal(result.details.accessTier, "billable");
-		assert.equal(keyReads(), 5);
+		assert.equal(keyReads(), 5, "授权时每个后端只解析一次密钥；匿名成功后不进入密钥通道");
 	});
 });
 
-test("Tavily 匿名限流不影响其获授权的密钥通道，两个认证头互斥", async () => {
+test("Tavily 匿名限流后可切换已授权密钥通道，两个认证头互斥", async () => {
 	const health = createChannelHealth();
 	const { tool } = setup(health);
 	await controlled({ PI_WEB_SEARCH_ALLOW_BILLABLE: "true" }, (_url, init) => init.headers.authorization ? tavilyResponse() : new Response("limit", { status: 429 }), async ({ calls }) => {
@@ -174,7 +192,7 @@ test("Tavily 匿名限流不影响其获授权的密钥通道，两个认证头�
 test("Firecrawl 429 遵守恢复时间，冷却中不发请求，到期成功后清状态", async () => {
 	let now = 1000;
 	const health = createChannelHealth({ clock: () => now });
-	const { tool } = setup(health);
+	const { tool } = setup(health, () => now);
 	await controlled({}, (_url, _init, count) => count === 1 ? new Response("limit", { status: 429, headers: { "retry-after": "60" } }) : fireResponse(), async ({ calls }) => {
 		await assert.rejects(tool.execute("first", { query: "技术查询", provider: "firecrawl" }));
 		assert.equal(health.getCooldown("firecrawl", "free").remainingMs, 60000);
