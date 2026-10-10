@@ -12,22 +12,29 @@ import { type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { type WebFetchDetails, WebFetchParams } from "./params.js";
 import { readWebFetchConfig, type WebFetchConfig } from "./config.js";
 import { FetchError, type FetchErrorKind } from "./errors.js";
+import { resolveFetchTarget } from "./transport/url-policy.js";
+import { httpFetch } from "./transport/http-client.js";
+import { extractContent } from "./extract/index.js";
 
 export { WebFetchParams };
 export type { WebFetchDetails, WebFetchConfig, FetchErrorKind };
 
-/** 未实现阶段的固定诊断；分类稳定，不含调用方输入。 */
-const NOT_IMPLEMENTED_KIND: FetchErrorKind = "extraction_failed";
+/** 抓取与提取的依赖；默认走真实实现，测试可整体注入。 */
+export interface WebFetchDependencies {
+	resolveTarget?: (url: string) => ReturnType<typeof resolveFetchTarget>;
+	fetchPage?: (request: {
+		url: URL;
+		target: { address: string; family: 4 | 6 };
+		signal?: AbortSignal;
+		timeoutMs: number;
+		maxResponseBytes: number;
+	}) => Promise<{ body: string; contentType: string; finalUrl: URL; redirectCount: number; statusCode: number }>;
+	extract?: typeof extractContent;
+}
 
-/** 供测试注入的依赖；默认全部未实现。 */
-export interface WebFetchOptions {
+/** 可注入配置与依赖；测试只替换需要替换的部分。 */
+export interface WebFetchOptions extends WebFetchDependencies {
 	config?: () => WebFetchConfig;
-	/** 抓取入口；脚手架阶段返回未实现诊断。 */
-	fetchPage?: (url: string, mode: "auto" | "article" | "text", maxChars: number) => Promise<{
-		title?: string;
-		markdown: string;
-		details: Omit<WebFetchDetails, "requestedUrl">;
-	}>;
 }
 
 /** 把配置读取收敛为一次调用，便于测试注入。 */
@@ -59,21 +66,43 @@ export default function piWebFetch(pi: ExtensionAPI, options: WebFetchOptions = 
 			if (!Number.isSafeInteger(maxChars) || (maxChars as number) < 1) {
 				throw new FetchError("maxChars 必须是正整数", "invalid_url", {});
 			}
-			const fetcher = options.fetchPage;
-			if (fetcher === undefined) {
-				throw new FetchError(
-					"web_fetch 的抓取流程尚未实现：当前阶段只提供工具契约与安全校验",
-					NOT_IMPLEMENTED_KIND,
-					{},
-				);
-			}
-			const outcome = await fetcher(url, mode, maxChars);
-			const text = outcome.markdown;
+			// 先做完整的目标校验，再决定是否发起任何连接。
+			const resolveTarget = options.resolveTarget ?? resolveFetchTarget;
+			const target = await resolveTarget(url);
+			if (signal?.aborted) throw new FetchError("操作已取消", "aborted");
+
+			const fetchPage = options.fetchPage ?? ((request) => httpFetch({
+				url: request.url,
+				target: { url: request.url, address: request.target.address, family: request.target.family },
+				signal: request.signal,
+				timeoutMs: request.timeoutMs,
+				maxResponseBytes: request.maxResponseBytes,
+				resolveTarget: async () => target,
+			}).then((result) => ({
+				body: result.body,
+				contentType: result.headers["content-type"] ?? "",
+				finalUrl: result.finalUrl,
+				redirectCount: result.redirectCount,
+				statusCode: result.status,
+			})));
+			const fetched = await fetchPage({ url: target.url, target, signal, timeoutMs: config.timeoutMs, maxResponseBytes: config.maxResponseBytes });
+			if (signal?.aborted) throw new FetchError("操作已取消", "aborted");
+
+			const extract = options.extract ?? extractContent;
+			const extracted = extract(fetched.body, fetched.contentType, mode, maxChars);
+			const text = extracted.markdown;
 			return {
 				content: [{ type: "text", text: text.length > 0 ? text : "（未提取到正文）" }],
 				details: {
 					requestedUrl: url,
-					...outcome.details,
+					finalUrl: fetched.finalUrl.toString(),
+					contentType: fetched.contentType,
+					statusCode: fetched.statusCode,
+					redirectCount: fetched.redirectCount,
+					...(extracted.title === undefined ? {} : { title: extracted.title }),
+					provider: "direct",
+					extractedChars: text.length,
+					truncated: text.length >= maxChars,
 					durationMs: Date.now() - startedAt,
 				} satisfies WebFetchDetails,
 			};

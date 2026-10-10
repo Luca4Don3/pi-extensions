@@ -59,37 +59,40 @@ test("注册契约：名称 / 标签 / 参数 / 注解", () => {
 	assert.deepEqual(tool.annotations, { readOnlyHint: true, idempotentHint: true, openWorldHint: true });
 });
 
-test("缺少抓取实现时报固定诊断，且分类稳定", async () => {
+test("未授权访问私有与内网地址时报固定诊断，且不回显 URL", async () => {
 	const { tool } = setup();
 	await withEnv({}, async () => {
-		await assert.rejects(tool.execute("fetch-1", { url: "https://example.com/doc" }), (error) => {
-			assert.equal(error.name, "FetchError");
-			assert.equal(error.kind, "extraction_failed");
-			assert.ok(!/example\.com/.test(error.message), "诊断不得回显调用方 URL");
-			return true;
-		});
+		for (const url of ["http://127.0.0.1/", "http://169.254.169.254/latest/meta-data/", "http://10.0.0.5/", "ftp://example.com/"]) {
+			await assert.rejects(tool.execute("fetch-blocked", { url }), (error) => {
+				assert.equal(error.name, "FetchError");
+				assert.equal(error.kind, "blocked_url");
+				assert.ok(!error.message.includes(url), "诊断不得回显调用方 URL");
+				return true;
+			});
+		}
 	});
 });
 
 test("注入抓取实现后返回正文与结构化 details", async () => {
 	const { tool } = setup({
-		fetchPage: async (url, mode, maxChars) => ({
-			title: "标题",
-			markdown: "# 标题\n\n正文",
-			details: { finalUrl: url, title: "标题", provider: "direct", statusCode: 200, extractedChars: 6, truncated: false, redirectCount: 0 },
-		}),
+		config: () => ({ timeoutMs: 1000, maxResponseBytes: 1024, maxChars: 500, maxRedirects: 0, remoteFallback: "off" }),
+		resolveTarget: async (rawUrl) => ({ url: new URL(rawUrl), address: "93.184.216.34", family: 4 }),
+		fetchPage: async () => ({ body: "<h1>标题</h1><p>正文</p>", contentType: "text/html; charset=utf-8", finalUrl: new URL("https://example.com/doc"), redirectCount: 0, statusCode: 200 }),
 	});
 	await withEnv({}, async () => {
 		const result = await tool.execute("fetch-2", { url: "https://example.com/doc" });
-		assert.equal(result.content[0].type, "text");
 		assert.match(result.content[0].text, /标题/u);
+		assert.match(result.content[0].text, /正文/u);
 		assert.equal(result.details.requestedUrl, "https://example.com/doc");
+		assert.equal(result.details.finalUrl, "https://example.com/doc");
 		assert.equal(result.details.provider, "direct");
 		assert.equal(result.details.statusCode, 200);
 		assert.equal(result.details.truncated, false);
 		assert.ok(Number.isFinite(result.details.durationMs));
 	});
 });
+
+
 
 test("空 URL、空白 URL 与非法 maxChars 被拒绝", async () => {
 	const { tool } = setup();
