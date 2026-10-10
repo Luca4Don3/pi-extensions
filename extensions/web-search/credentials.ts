@@ -1,14 +1,13 @@
 /**
  * Web Search 系统密钥库访问层
  *
- * 只负责「读 / 删」系统密钥库中的 API key，不做任何写入（写入由用户在终端
- * 通过平台自带命令安全完成，见 auth.ts 的配置说明）。支持的平台：
- * - macOS：`/usr/bin/security`（Keychain）
+ * 负责系统密钥库中 API key 的读、写、删。支持的平台：
+ * - macOS：`/usr/bin/security` 读取/删除，静态 Swift Security 适配器写入
  * - Linux：`secret-tool`（Secret Service）
  * - 其他平台：不支持，只能使用环境变量
  *
  * 安全约束（务必保持）：
- * - 只通过子进程参数与 stdin 传递 key；key 绝不进入 argv、日志、会话或错误信息。
+ * - key 只通过 stdin 传递；绝不进入 argv、日志、会话或错误信息。
  * - 错误信息只含退出码，不含 stdout / stderr 内容。
  * - 读取失败（命令缺失、密钥库锁定、权限不足）与「没有条目」必须区分：
  *   前者返回 unavailable，后者返回 missing。
@@ -20,9 +19,23 @@
 
 import { spawn } from "node:child_process";
 import { userInfo } from "node:os";
+import { fileURLToPath } from "node:url";
 
 /** 支持凭据配置的后端标识。 */
 export type SecretBackend = "exa" | "parallel" | "tavily" | "serpapi";
+
+/** 凭据最长长度；仅接受非空、无空白的 ASCII 可打印 token。 */
+export const MAX_SECRET_CHARS = 4096;
+
+/** 校验凭据，不截断、不规范化，也不包含凭据内容的错误信息。 */
+export function isValidSecretValue(value: unknown): value is string {
+	return (
+		typeof value === "string" &&
+		value.length > 0 &&
+		value.length <= MAX_SECRET_CHARS &&
+		/^[\x21-\x7E]+$/u.test(value)
+	);
+}
 
 /** 系统密钥库的 service 前缀；条目名为 `${SECRET_SERVICE_PREFIX}-${backend}`。 */
 export const SECRET_SERVICE_PREFIX = "pi-web-search";
@@ -40,7 +53,13 @@ export interface ExecResult {
 }
 
 /** 可注入的子进程执行器，便于测试。 */
-export type ExecRunner = (bin: string, args: string[], stdin?: string) => Promise<ExecResult>;
+export type ExecRunner = (
+	bin: string,
+	args: string[],
+	stdin?: string,
+	timeoutMs?: number,
+	signal?: AbortSignal,
+) => Promise<ExecResult>;
 
 /** 读取结果三态：找到 / 无条目 / 不可用（含诊断原因）。 */
 export type SecretReadResult =
@@ -54,12 +73,21 @@ export type SecretClearResult =
 	| { status: "missing" }
 	| { status: "unavailable"; reason: string };
 
+/** 写入结果；验证失败或密钥库不可用时绝不报告成功。 */
+export type SecretWriteResult = { status: "written" } | { status: "unavailable"; reason: string };
+
+function invalidSecretResult(): SecretWriteResult {
+	return { status: "unavailable", reason: "凭据无效（须为 1–4096 个非空白 ASCII 可打印字符）" };
+}
+
 /** 凭据存储抽象；测试注入 fake，生产按平台选择实现。 */
 export interface SecretStore {
 	/** 实际使用的密钥库类型；none 表示该平台没有系统密钥库。 */
 	readonly kind: "keychain" | "secret-tool" | "none";
 	/** 读取某个后端的 key；不可用或失败时返回 unavailable，绝不抛错。 */
-	read(backend: SecretBackend): Promise<SecretReadResult>;
+	read(backend: SecretBackend, signal?: AbortSignal): Promise<SecretReadResult>;
+	/** 写入某个后端的 key，并从密钥库重读验证；失败时返回 unavailable，绝不抛错。 */
+	write(backend: SecretBackend, value: string): Promise<SecretWriteResult>;
 	/** 删除某个后端的 key；失败时返回 unavailable，绝不抛错。 */
 	clear(backend: SecretBackend): Promise<SecretClearResult>;
 }
@@ -69,6 +97,9 @@ const SECURITY_BIN = "/usr/bin/security";
 /** macOS security 的读取子命令。 */
 const SECURITY_LOOKUP = "find-generic-password";
 const SECURITY_DELETE = "delete-generic-password";
+/** macOS Swift 解释器与静态 Security Framework 适配器。 */
+const SWIFT_BIN = "/usr/bin/swift";
+const MACOS_KEYCHAIN_HELPER = fileURLToPath(new URL("./macos-keychain.swift", import.meta.url));
 /** Linux Secret Service 的命令行工具。 */
 const SECRET_TOOL_BIN = "secret-tool";
 /** macOS security 找不到条目时的退出码（errSecItemNotFound）。 */
@@ -77,6 +108,8 @@ const MAC_NOT_FOUND_EXIT = 44;
 const SECRET_TOOL_NOT_FOUND_EXIT = 1;
 /** 单次密钥库命令的最长执行时间，超时即杀掉子进程并按不可用处理。 */
 export const EXEC_TIMEOUT_MS = 5_000;
+/** Swift 首次解释/编译适配器可能较慢，写入单独给予更长超时。 */
+export const WRITE_EXEC_TIMEOUT_MS = 30_000;
 
 /**
  * 真实执行一个子进程。
@@ -90,22 +123,33 @@ export function spawnExec(
 	args: string[],
 	stdin?: string,
 	timeoutMs: number = EXEC_TIMEOUT_MS,
+	signal?: AbortSignal,
 ): Promise<ExecResult> {
+	if (signal?.aborted) return Promise.reject(new DOMException("操作已取消", "AbortError"));
 	return new Promise((resolve, reject) => {
 		const child = spawn(bin, args, { stdio: ["pipe", "pipe", "pipe"] });
 		let stdout = "";
 		let stderr = "";
 		let settled = false;
 		let timer: ReturnType<typeof setTimeout> | undefined;
-		/** 只允许第一个结果生效：正常结束、spawn 失败与超时三选一。 */
+		let onAbort: (() => void) | undefined;
+		/** 只允许第一个结果生效，并清理本次调用创建的定时器和取消监听。 */
 		const finish = (settle: () => void): void => {
 			if (settled) return;
 			settled = true;
 			if (timer !== undefined) clearTimeout(timer);
+			if (onAbort !== undefined) signal?.removeEventListener("abort", onAbort);
 			settle();
 		};
+		const kill = (): void => {
+			try {
+				child.kill("SIGKILL");
+			} catch {
+				// 子进程可能已退出；取消/超时仍按固定错误结束。
+			}
+		};
 		timer = setTimeout(() => {
-			child.kill("SIGKILL");
+			kill();
 			finish(() => reject(new Error(`凭据库命令超时（超过 ${timeoutMs}ms）`)));
 		}, timeoutMs);
 		child.stdout?.setEncoding("utf8");
@@ -118,6 +162,16 @@ export function spawnExec(
 		});
 		child.on("error", (error) => finish(() => reject(error)));
 		child.on("close", (code) => finish(() => resolve({ code: code ?? 1, stdout, stderr })));
+		onAbort = () => {
+			if (settled) return;
+			kill();
+			finish(() => reject(new DOMException("操作已取消", "AbortError")));
+		};
+		signal?.addEventListener("abort", onAbort, { once: true });
+		if (signal?.aborted) {
+			onAbort();
+			return;
+		}
 		// 写入失败（如进程提前退出）不额外抛出：退出码已足够说明问题。
 		child.stdin?.on("error", () => undefined);
 		if (stdin !== undefined) child.stdin?.write(stdin);
@@ -151,7 +205,7 @@ export class MacKeychainStore implements SecretStore {
 		private readonly account: string = currentAccount(),
 	) {}
 
-	async read(backend: SecretBackend): Promise<SecretReadResult> {
+	async read(backend: SecretBackend, signal?: AbortSignal): Promise<SecretReadResult> {
 		// 读：find-generic-password -a <account> -s <service> -w，密码在 stdout。
 		const result = await this.call([
 			SECURITY_LOOKUP,
@@ -160,7 +214,7 @@ export class MacKeychainStore implements SecretStore {
 			"-s",
 			this.service(backend),
 			"-w",
-		]);
+		], signal);
 		if (typeof result === "string") return { status: "unavailable", reason: result };
 		if (result.code === MAC_NOT_FOUND_EXIT) return { status: "missing" };
 		if (result.code !== 0) {
@@ -168,6 +222,31 @@ export class MacKeychainStore implements SecretStore {
 		}
 		const value = readSecretValue(result.stdout);
 		return value === undefined ? { status: "missing" } : { status: "found", value };
+	}
+
+	async write(backend: SecretBackend, value: string): Promise<SecretWriteResult> {
+		if (!isValidSecretValue(value)) return invalidSecretResult();
+		let result: ExecResult;
+		try {
+			result = await this.run(
+				SWIFT_BIN,
+				[MACOS_KEYCHAIN_HELPER, this.account, this.service(backend)],
+				value,
+				WRITE_EXEC_TIMEOUT_MS,
+			);
+		} catch (error) {
+			const timedOut = error instanceof Error && error.message.startsWith("凭据库命令超时");
+			return {
+				status: "unavailable",
+				reason: timedOut ? "macOS Keychain 写入超时（系统密钥库无响应）" : "macOS Keychain 写入失败（系统密钥库不可用）",
+			};
+		}
+		if (result.code !== 0) {
+			return { status: "unavailable", reason: `macOS Keychain 写入失败（退出码 ${result.code}）` };
+		}
+		const verified = await this.read(backend);
+		if (verified.status === "found" && verified.value === value) return { status: "written" };
+		return { status: "unavailable", reason: "macOS Keychain 写入后验证失败" };
 	}
 
 	async clear(backend: SecretBackend): Promise<SecretClearResult> {
@@ -185,9 +264,9 @@ export class MacKeychainStore implements SecretStore {
 	}
 
 	/** 返回执行结果，或命令缺失时的诊断文本。 */
-	private async call(args: string[]): Promise<ExecResult | string> {
+	private async call(args: string[], signal?: AbortSignal): Promise<ExecResult | string> {
 		try {
-			return await this.run(SECURITY_BIN, args);
+			return await this.run(SECURITY_BIN, args, undefined, undefined, signal);
 		} catch (error) {
 			if (error instanceof Error && error.message.startsWith("凭据库命令超时")) {
 				return "security 命令执行超时（系统密钥库无响应）";
@@ -207,8 +286,8 @@ export class SecretToolStore implements SecretStore {
 
 	constructor(private readonly run: ExecRunner = spawnExec) {}
 
-	async read(backend: SecretBackend): Promise<SecretReadResult> {
-		const result = await this.call(["lookup", "service", SECRET_TOOL_SERVICE, "provider", backend]);
+	async read(backend: SecretBackend, signal?: AbortSignal): Promise<SecretReadResult> {
+		const result = await this.call(["lookup", "service", SECRET_TOOL_SERVICE, "provider", backend], undefined, signal);
 		if (typeof result === "string") return { status: "unavailable", reason: result };
 		if (result.code === SECRET_TOOL_NOT_FOUND_EXIT) {
 			// 无匹配项通常是空 stderr；少数实现会写明「未找到」，也按 missing 处理。
@@ -226,6 +305,21 @@ export class SecretToolStore implements SecretStore {
 		return value === undefined ? { status: "missing" } : { status: "found", value };
 	}
 
+	async write(backend: SecretBackend, value: string): Promise<SecretWriteResult> {
+		if (!isValidSecretValue(value)) return invalidSecretResult();
+		const result = await this.call(
+			["store", `--label=Pi web search: ${backend}`, "service", SECRET_TOOL_SERVICE, "provider", backend],
+			value,
+		);
+		if (typeof result === "string") return { status: "unavailable", reason: result };
+		if (result.code !== 0) {
+			return { status: "unavailable", reason: `secret-tool 写入失败（退出码 ${result.code}）` };
+		}
+		const verified = await this.read(backend);
+		if (verified.status === "found" && verified.value === value) return { status: "written" };
+		return { status: "unavailable", reason: "secret-tool 写入后验证失败" };
+	}
+
 	async clear(backend: SecretBackend): Promise<SecretClearResult> {
 		// secret-tool clear 对不存在的条目也返回 0，先 lookup 才能区分删除与未配置。
 		const existing = await this.read(backend);
@@ -237,9 +331,9 @@ export class SecretToolStore implements SecretStore {
 		return { status: "unavailable", reason: `secret-tool 删除失败（退出码 ${result.code}）` };
 	}
 
-	private async call(args: string[]): Promise<ExecResult | string> {
+	private async call(args: string[], stdin?: string, signal?: AbortSignal): Promise<ExecResult | string> {
 		try {
-			return await this.run(SECRET_TOOL_BIN, args);
+			return await this.run(SECRET_TOOL_BIN, args, stdin, undefined, signal);
 		} catch (error) {
 			if (error instanceof Error && error.message.startsWith("凭据库命令超时")) {
 				return "secret-tool 命令执行超时（系统密钥库无响应）";
@@ -249,7 +343,7 @@ export class SecretToolStore implements SecretStore {
 	}
 }
 
-/** 无系统密钥库的平台：一切读取 / 删除都返回 unavailable。 */
+/** 无系统密钥库的平台：读取、写入、删除均返回 unavailable。 */
 export class NoopSecretStore implements SecretStore {
 	readonly kind = "none" as const;
 
@@ -259,7 +353,11 @@ export class NoopSecretStore implements SecretStore {
 		return `平台 ${this.platform} 没有支持的系统密钥库`;
 	}
 
-	async read(_backend: SecretBackend): Promise<SecretReadResult> {
+	async read(_backend: SecretBackend, _signal?: AbortSignal): Promise<SecretReadResult> {
+		return { status: "unavailable", reason: this.reason };
+	}
+
+	async write(_backend: SecretBackend, _value: string): Promise<SecretWriteResult> {
 		return { status: "unavailable", reason: this.reason };
 	}
 
