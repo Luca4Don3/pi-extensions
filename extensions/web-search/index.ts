@@ -8,7 +8,7 @@
  * 设计要点：
  * - 单请求预算可注入（默认 25 秒），外部取消信号会被转发且立即生效。
  * - 响应体既可能是直接 JSON，也可能是 SSE（`data:` 事件块），两种都解析。
- * - 路由为「Key 优先、失败降级免费通道」：Exa Key → Exa Free → Parallel Key → Parallel Free。
+ * - 默认先尝试免费通道；可用 PI_WEB_SEARCH_ROUTING=key-first 保留旧的 Key 优先顺序。
  * - 失败按错误类型决策：额度/鉴权直接换通道，限流与 5xx 退避重试，取消立即终止。
  * - 模型可见正文截断到 MAX_TEXT_CHARS，原文落盘供模型按需 read。
  * - Exa / Parallel key 解析顺序：环境变量优先，其次系统密钥库
@@ -26,14 +26,14 @@ import { Type } from "typebox";
 import { createSecretStore, type SecretStore } from "./credentials.js";
 import {
 	BACKENDS,
-	envVarName,
 	resolvePlanKeys,
 	redactSecrets,
 	safeDiagnostic,
 	type Backend,
-	hasFreeChannel,
 } from "./auth.js";
 import { registerAuthCommand } from "./auth-ui.js";
+import { createChannelHealth, type ChannelHealth } from "./channel-health.js";
+import { buildRoutePlan, getRoutingStatus, readRoutingConfig, type Provider, type RoutingStep } from "./routing.js";
 import {
 	BackendError,
 	errorDetailFrom,
@@ -71,15 +71,8 @@ const SPILL_DIR_NAME = "pi-web-search";
 /** 归属标识，便于端点侧识别调用方。 */
 const USER_AGENT = "pi-web-search/0.4.0-beta.1";
 
-/** 后端选择：auto 表示按计划依次尝试。 */
-type Provider = "auto" | Backend;
-/** 认证通道：key 使用配置的 API Key，free 不带任何凭据。 */
-type Channel = "key" | "free";
-
 /** 一次尝试：某个后端的某个通道。 */
-interface RouteStep {
-	backend: Backend;
-	channel: Channel;
+interface RouteStep extends RoutingStep {
 	/** key 通道使用的凭据；仅存在于内存，绝不写入日志、session 或落盘内容。 */
 	apiKey?: string;
 }
@@ -153,40 +146,14 @@ function readIntEnv(name: string, fallback: number, min: number): number {
 	return Number.isInteger(value) && value >= min ? value : fallback;
 }
 
-/** 解析 Retry-After（秒数或 HTTP 日期），并夹到上限内。 */
+/** 解析 Retry-After（秒数或 HTTP 日期）；原值用于冷却，重试等待另行限幅。 */
 function parseRetryAfter(value: string | null): number | undefined {
 	if (value === null) return undefined;
 	const seconds = Number(value);
-	if (Number.isFinite(seconds) && seconds >= 0) return Math.min(seconds * 1000, RETRY_MAX_WAIT_MS);
+	if (Number.isFinite(seconds) && seconds >= 0) return Math.min(Math.ceil(seconds * 1000), Number.MAX_SAFE_INTEGER);
 	const at = Date.parse(value);
 	if (Number.isNaN(at)) return undefined;
-	return Math.min(Math.max(at - Date.now(), 0), RETRY_MAX_WAIT_MS);
-}
-
-/**
- * 单后端的通道顺序：解析到 key 就先走 key 通道，再走免费通道。
- * key 由调用方在本次搜索开始时解析一次（环境变量优先，其次系统密钥库），
- * 之后只随 RouteStep 在内存中流转。
- */
-function backendSteps(backend: Backend, key: string | undefined): RouteStep[] {
-	const steps: RouteStep[] = [];
-	if (key !== undefined && key.length > 0) steps.push({ backend, channel: "key", apiKey: key });
-	if (hasFreeChannel(backend)) steps.push({ backend, channel: "free" });
-	return steps;
-}
-
-/**
- * 完整尝试计划：自动模式按 Exa → Parallel → Tavily → SerpApi 依次尝试；
- * 显式指定的后端未配置密钥时立即报错，不发出任何请求。
- */
-function routePlan(provider: Provider, keys: Record<Backend, string | undefined>): RouteStep[] {
-	const backends = provider === "auto" ? BACKENDS : [provider];
-	const steps = backends.flatMap((backend) => backendSteps(backend, keys[backend]));
-	if (steps.length === 0) {
-		// 只有显式指定的后端才可能为空，此时 provider 必然不是 auto。
-		throw new Error(`${provider} 未配置密钥：请设置环境变量 ${envVarName(provider as Backend)} 或使用 /web-search-auth 配置`);
-	}
-	return steps;
+	return Math.min(Math.max(at - Date.now(), 0), Number.MAX_SAFE_INTEGER);
 }
 
 /** 失败信息里标识具体通道。 */
@@ -194,9 +161,19 @@ function stepLabel(step: RouteStep): string {
 	return step.channel === "key" ? `${step.backend}(key)` : step.backend;
 }
 
+/** Exa 免费 MCP 的精确额度提示；仅允许有限标点/空白变化，不匹配普通摘要。 */
+function isExaFreeRateLimitNotice(text: string): boolean {
+	return /^\s*You['’‘]ve\s+hit\s+Exa['’‘]s\s+free\s+MCP\s+rate\s+limit\b(?:[\s.!?…:;,—–-]|$)/iu.test(text);
+}
+
 /** 统一创建可被运行时识别的取消错误，不传播底层错误文本。 */
 function createAbortError(): DOMException {
 	return new DOMException("web_search aborted", "AbortError");
+}
+
+/** 取消状态可在异步等待期间改变，每次检查都重新读取。 */
+function isAborted(signal?: AbortSignal): boolean {
+	return signal?.aborted === true;
 }
 
 /** 后端错误信息不再在内部预截断：截断必须发生在脱敏之后（见 safeDiagnostic）。 */
@@ -213,7 +190,7 @@ function sleep(ms: number, signal?: AbortSignal): Promise<void> {
 			signal?.removeEventListener("abort", abort);
 			resolve();
 		}, ms);
-		if (signal?.aborted === true) {
+		if (isAborted(signal)) {
 			abort();
 			return;
 		}
@@ -536,7 +513,7 @@ async function searchChannel(
 			controller.abort();
 		}, timeoutMs);
 		const onAbort = (): void => controller.abort(signal?.reason);
-		if (signal?.aborted === true) {
+		if (isAborted(signal)) {
 			clearTimeout(timer);
 			throw createAbortError();
 		}
@@ -581,9 +558,12 @@ async function searchChannel(
 			}
 			const text = parseMcpResponse(body);
 			if (text === undefined) throw new BackendError(`${backend} returned no usable results`, "protocol_error");
+			if (backend === "exa" && channel === "free" && isExaFreeRateLimitNotice(text)) {
+				throw new BackendError(text.trim(), "quota_exhausted");
+			}
 			return { text, sources: extractSources(text) };
 		} catch (error) {
-			if (signal?.aborted === true) throw createAbortError();
+			if (isAborted(signal)) throw createAbortError();
 			if (timedOut) throw new BackendError(`${backend} timed out after ${timeoutMs}ms`, "timeout");
 			if (error instanceof BackendError) throw error;
 			// fetch 网络层错误（DNS、连接重置等）值得重试。
@@ -599,11 +579,11 @@ async function searchChannel(
 			const result = await attempt();
 			return { ...result, attempts: round + 1 };
 		} catch (error) {
-			if (signal?.aborted === true) throw createAbortError();
+			if (isAborted(signal)) throw createAbortError();
 			if (error instanceof BackendError) error.attempts = round + 1;
 			if (!(error instanceof BackendError) || !error.retryable || round >= retries) throw error;
-			// 退避等待可被取消打断；上游给出的 Retry-After 不短于本地退避。
-			await sleep(Math.max(RETRY_BASE_MS * 2 ** round, error.retryAfterMs ?? 0), signal);
+			// 退避等待可被取消打断；Retry-After 影响退避但等待最多 5 秒。
+			await sleep(Math.min(RETRY_MAX_WAIT_MS, Math.max(RETRY_BASE_MS * 2 ** round, error.retryAfterMs ?? 0)), signal);
 		}
 	}
 }
@@ -612,12 +592,15 @@ async function searchChannel(
 export interface WebSearchOptions {
 	/** 系统密钥库；默认按平台选择（macOS Keychain / Linux secret-tool）。测试注入 fake，不触碰真实密钥库。 */
 	credentialStore?: SecretStore;
+	/** 可注入的进程内通道冷却状态；用于测试或与认证状态界面共享。 */
+	channelHealth?: ChannelHealth;
 }
 
 /** 注册 `web_search` 工具与 `/web-search-auth` 命令。 */
 export default function piWebSearch(pi: ExtensionAPI, options: WebSearchOptions = {}): void {
 	const store: SecretStore = options.credentialStore ?? createSecretStore();
-	registerAuthCommand(pi, store);
+	const channelHealth = options.channelHealth ?? createChannelHealth();
+	registerAuthCommand(pi, store, () => getRoutingStatus(readRoutingConfig(), channelHealth.snapshot().channels));
 
 	pi.registerTool({
 		name: "web_search",
@@ -629,20 +612,40 @@ export default function piWebSearch(pi: ExtensionAPI, options: WebSearchOptions 
 		async execute(_toolCallId, params, signal) {
 			const query = params.query.trim();
 			if (query.length === 0) throw new Error("query must not be empty");
+			if (isAborted(signal)) throw createAbortError();
 
 			const provider = params.provider ?? "auto";
 			const numResults = params.maxResults ?? DEFAULT_NUM_RESULTS;
-			// 每次搜索只为可能用到的后端解析一次 key（环境变量优先，其次系统密钥库）。
-			const keys = await resolvePlanKeys(provider, store);
+			const config = readRoutingConfig();
+			// 禁用付费路由时不读取任何 key 环境变量，也不访问 SecretStore。
+			const keys: Record<Backend, string | undefined> = config.allowPaid
+				? await resolvePlanKeys(provider, store, signal)
+				: { exa: undefined, parallel: undefined, tavily: undefined, serpapi: undefined };
+			if (isAborted(signal)) throw createAbortError();
+			const routes: RouteStep[] = buildRoutePlan(provider, keys, config).map((step) => ({
+				...step,
+				...(step.channel === "key" ? { apiKey: keys[step.backend] } : {}),
+			}));
 			// 本次请求涉及的全部 key，用于把所有对外错误文本中的凭据抹掉。
 			const secrets = BACKENDS.map((backend) => keys[backend]);
-			const failures: { label: string; kind: SearchErrorKind | "unknown"; message: string }[] = [];
+			const failures: { label: string; kind: SearchErrorKind | "unknown" | "cooldown"; message: string }[] = [];
 			let attemptCount = 0;
 
-			// Key 通道失败会降级到同后端的免费通道，再进入下一个后端。
-			for (const step of routePlan(provider, keys)) {
+			for (const step of routes) {
+				if (isAborted(signal)) throw createAbortError();
+				if (config.freeCooldownMs > 0) {
+					const cooldown = channelHealth.getCooldown(step.backend, step.channel);
+					if (cooldown !== undefined) {
+						failures.push({
+							label: stepLabel(step),
+							kind: "cooldown",
+							message: `通道正在冷却，剩余约 ${Math.ceil(cooldown.remainingMs / 1000)} 秒；本次未发送网络请求`,
+						});
+						continue;
+					}
+				}
 				try {
-					if (signal?.aborted === true) throw createAbortError();
+					if (isAborted(signal)) throw createAbortError();
 					const { text: rawText, sources: rawSources, attempts } = await searchChannel(step, query, numResults, signal);
 					attemptCount += attempts;
 					// 上游响应可能回显 key（错误正文、URL 查询参数等）：在进入模型上下文
@@ -657,10 +660,12 @@ export default function piWebSearch(pi: ExtensionAPI, options: WebSearchOptions 
 						sources,
 						truncated: text.length > MAX_TEXT_CHARS,
 					};
-					// 取消贯穿整个生命周期：拿到结果后、落盘前再确认一次。
-					if (signal?.aborted === true) throw createAbortError();
 					// 超限正文落盘，模型仍可按需 read 完整内容（沿用 Pi 对大结果的惯例）。
+					if (isAborted(signal)) throw createAbortError();
 					const spill = outcome.truncated ? await spillFullText(text) : undefined;
+					// 取消贯穿整个生命周期：取消时不改变任何通道健康状态。
+					if (isAborted(signal)) throw createAbortError();
+					channelHealth.recordSuccess(step.backend, step.channel);
 					const fallbackReason =
 						failures.length > 0
 							? safeDiagnostic(
@@ -684,8 +689,23 @@ export default function piWebSearch(pi: ExtensionAPI, options: WebSearchOptions 
 						},
 					};
 				} catch (error) {
-					if (signal?.aborted === true) throw createAbortError();
+					if (isAborted(signal)) throw createAbortError();
 					attemptCount += error instanceof BackendError ? error.attempts : 1;
+					if (error instanceof BackendError && config.freeCooldownMs > 0) {
+						if (error.kind === "rate_limited" || (error.kind === "quota_exhausted" && step.channel === "free")) {
+							channelHealth.recordFailure(
+								step.backend,
+								step.channel,
+								error.kind === "rate_limited" ? "rate_limited" : "quota_exhausted",
+								{
+									cooldownMs: config.freeCooldownMs,
+									...(error.kind === "rate_limited" && error.retryAfterMs !== undefined
+										? { retryAfterMs: error.retryAfterMs }
+										: {}),
+								},
+							);
+						}
+					}
 					failures.push({
 						label: stepLabel(step),
 						kind: error instanceof BackendError ? error.kind : "unknown",
@@ -694,7 +714,7 @@ export default function piWebSearch(pi: ExtensionAPI, options: WebSearchOptions 
 				}
 			}
 			throw new Error(
-				`web_search failed — ${failures.map((failure) => `${failure.label}: ${failure.message}`).join(" | ")}`,
+				`web_search failed — ${failures.map((failure) => `${failure.label}[${failure.kind}]: ${failure.message}`).join(" | ")}`,
 			);
 		},
 	});

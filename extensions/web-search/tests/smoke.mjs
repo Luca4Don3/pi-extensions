@@ -18,6 +18,7 @@ const tools = [];
 const noSystemStore = {
 	kind: "none",
 	read: async () => ({ status: "unavailable", reason: "smoke test skips system key stores" }),
+	write: async () => ({ status: "unavailable", reason: "smoke test never writes credentials" }),
 	clear: async () => ({ status: "unavailable", reason: "smoke test skips system key stores" }),
 };
 plugin(
@@ -45,6 +46,7 @@ async function run(label, params) {
 		console.log(`[${label}] 正文前 400 字:\n${text.slice(0, 400)}`);
 		console.log(`[${label}] 首条来源: ${JSON.stringify(details.sources?.[0]?.url ?? null)}`);
 	} catch (error) {
+		process.exitCode = 1;
 		console.log(`\n[${label}] FAIL ${Date.now() - startedAt}ms | ${error instanceof Error ? error.message : String(error)}`);
 	}
 }
@@ -66,6 +68,7 @@ for (const [provider, variable] of [["tavily", "TAVILY_API_KEY"], ["serpapi", "S
 try {
 	await tool.execute("smoke-2", { query: "   " }, undefined, undefined, {});
 	console.log("\n[empty-query] FAIL 未按预期抛错");
+	process.exitCode = 1;
 } catch (error) {
 	console.log(`\n[empty-query] OK 已按预期失败 | ${error instanceof Error ? error.message : String(error)}`);
 }

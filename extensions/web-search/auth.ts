@@ -68,19 +68,61 @@ export function envKey(backend: Backend): string | undefined {
 	return trimmed.length > 0 ? trimmed : undefined;
 }
 
+function abortError(): DOMException {
+	return new DOMException("操作已取消", "AbortError");
+}
+
+function throwIfAborted(signal?: AbortSignal): void {
+	if (signal?.aborted) throw abortError();
+}
+
+/** 允许上层取消等待，同时消费底层稍后到达的结果或异常。 */
+function waitForAbort<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T> {
+	if (signal === undefined) return promise;
+	if (signal.aborted) {
+		// 凭据读取可能在构造 Promise 时同步触发取消，仍须消费其迟到的拒绝。
+		void promise.catch(() => undefined);
+		return Promise.reject(abortError());
+	}
+	return new Promise((resolve, reject) => {
+		let settled = false;
+		const finish = (settle: () => void): void => {
+			if (settled) return;
+			settled = true;
+			signal.removeEventListener("abort", onAbort);
+			settle();
+		};
+		const onAbort = (): void => finish(() => reject(abortError()));
+		signal.addEventListener("abort", onAbort, { once: true });
+		Promise.resolve(promise).then(
+			(value) => finish(() => resolve(value)),
+			(error) => finish(() => reject(error)),
+		);
+		if (signal.aborted) onAbort();
+	});
+}
+
 /**
  * 解析单个后端的 key：环境变量优先，其次系统密钥库。
  * 任何读取失败都静默回退为 undefined，保证匿名搜索不被密钥库问题阻断。
  */
-export async function resolveBackendKey(backend: Backend, store: SecretStore): Promise<string | undefined> {
+export async function resolveBackendKey(
+	backend: Backend,
+	store: SecretStore,
+	signal?: AbortSignal,
+): Promise<string | undefined> {
+	throwIfAborted(signal);
 	const fromEnv = envKey(backend);
 	if (fromEnv !== undefined) return fromEnv;
+	let result: Awaited<ReturnType<SecretStore["read"]>>;
 	try {
-		const result = await store.read(backend);
-		return result.status === "found" ? result.value : undefined;
+		result = await store.read(backend, signal);
 	} catch {
+		throwIfAborted(signal);
 		return undefined;
 	}
+	throwIfAborted(signal);
+	return result.status === "found" ? result.value : undefined;
 }
 
 /**
@@ -90,14 +132,17 @@ export async function resolveBackendKey(backend: Backend, store: SecretStore): P
 export async function resolvePlanKeys(
 	provider: "auto" | Backend,
 	store: SecretStore,
+	signal?: AbortSignal,
 ): Promise<Record<Backend, string | undefined>> {
+	throwIfAborted(signal);
 	const needed = provider === "auto" ? BACKENDS : ([provider] as readonly Backend[]);
-	const entries = await Promise.all(
+	const entries = await waitForAbort(Promise.all(
 		needed.map(async (backend): Promise<[Backend, string | undefined]> => [
 			backend,
-			await resolveBackendKey(backend, store),
+			await resolveBackendKey(backend, store, signal),
 		]),
-	);
+	), signal);
+	throwIfAborted(signal);
 	const keys: Record<Backend, string | undefined> = {
 		exa: undefined, parallel: undefined, tavily: undefined, serpapi: undefined,
 	};
@@ -191,9 +236,9 @@ export function configGuide(backend: Backend, kind: SecretStore["kind"]): Config
 			kind,
 			lines: [
 				`macOS Keychain（service: ${service}）`,
-				"在终端执行下面的命令，回车后按系统提示粘贴 key：",
-				`  security add-generic-password -U -a "$USER" -s "${service}" -w`,
-				"注意：-w 后不要跟任何参数，否则 key 会进入 shell 历史与进程列表。",
+				"在终端交互模式运行 /web-search-auth，选择「添加或修改密钥」，通过自定义掩码输入保存。",
+				"写入使用静态 macos-keychain.swift 适配器与系统 Security Framework，需可用的 Swift 命令行工具。",
+				"密钥仅通过 stdin 传递，写入后从系统密钥库重读验证；不进入命令参数、会话或配置文件。",
 			],
 		};
 	}
@@ -203,7 +248,8 @@ export function configGuide(backend: Backend, kind: SecretStore["kind"]): Config
 			kind,
 			lines: [
 				`Linux Secret Service（service: ${SECRET_TOOL_SERVICE}, provider: ${backend}）`,
-				"在终端执行下面的命令，回车后按提示粘贴 key：",
+				"推荐在终端交互模式运行 /web-search-auth，通过自定义掩码输入保存并重读验证。",
+				"也可在终端执行下面的命令，回车后按提示粘贴密钥：",
 				`  secret-tool store --label="Pi web search: ${backend}" service ${SECRET_TOOL_SERVICE} provider ${backend}`,
 				"注意：不要把 key 写在命令参数里，只通过交互提示输入。",
 			],

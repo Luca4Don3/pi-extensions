@@ -13,9 +13,21 @@ import { fileURLToPath } from "node:url";
 
 import { createJiti } from "jiti";
 
+for (const key of [
+	"EXA_API_KEY",
+	"PARALLEL_API_KEY",
+	"TAVILY_API_KEY",
+	"SERPAPI_API_KEY",
+	"PI_WEB_SEARCH_ROUTING",
+	"PI_WEB_SEARCH_ALLOW_PAID",
+]) {
+	delete process.env[key];
+}
+
 const jiti = createJiti(import.meta.url);
 const auth = await jiti.import(fileURLToPath(new URL("../auth.ts", import.meta.url)));
 const credentials = await jiti.import(fileURLToPath(new URL("../credentials.ts", import.meta.url)));
+const channelHealthModule = await jiti.import(fileURLToPath(new URL("../channel-health.ts", import.meta.url)));
 const loaded = await jiti.import(fileURLToPath(new URL("../index.ts", import.meta.url)));
 const plugin = loaded.default ?? loaded;
 
@@ -25,16 +37,17 @@ const SECRET = "exa_test_SUPER_SECRET_123";
 const SPECIAL_SECRET = "exa+test/SUPER SECRET=123";
 
 /** 构造一个 fake 密钥库。 */
-function fakeStore({ kind = "keychain", read, clear } = {}) {
+function fakeStore({ kind = "keychain", read, write, clear } = {}) {
 	return {
 		kind,
 		read: read ?? (async () => ({ status: "missing" })),
+		write: write ?? (async () => ({ status: "unavailable", reason: "fake 未配置写入" })),
 		clear: clear ?? (async () => ({ status: "missing" })),
 	};
 }
 
 /** 注册扩展并返回工具与命令；注入 fake 密钥库。 */
-function setup(store = fakeStore()) {
+function setup(store = fakeStore(), options = {}) {
 	const tools = [];
 	const commands = [];
 	plugin(
@@ -43,7 +56,7 @@ function setup(store = fakeStore()) {
 			registerCommand: (name, command) => commands.push({ name, ...command }),
 			on: () => undefined,
 		},
-		{ credentialStore: store },
+		{ credentialStore: store, ...options },
 	);
 	if (tools.length === 0) throw new Error("扩展没有注册任何工具");
 	return { tool: tools[0], commands, authCommand: commands.find((c) => c.name === "web-search-auth") };
@@ -145,17 +158,22 @@ test("auth: 密钥库读取异常不阻断匿名搜索", async () => {
 	});
 });
 
-// 4. 配置说明输出安全终端命令，且绝不建议把 key 放进参数。
-test("auth: 配置说明给出安全命令且不含 key", () => {
+// 4. 配置说明推荐掩码菜单与静态 Swift 适配器，不建议 argv 密钥或明文文件。
+test("auth: 配置说明推荐安全掩码写入且不建议 argv 密钥或明文文件", () => {
 	const mac = auth.configGuide("exa", "keychain").lines.join("\n");
-	assert.match(mac, /security add-generic-password -U -a "\$USER" -s "pi-web-search-exa" -w$/m);
-	const macCommand = mac.split("\n").find((line) => line.includes("security add-generic-password"));
-	assert.match(macCommand.trim(), /-w$/u, "macOS 命令的 -w 后不能跟任何参数");
+	assert.match(mac, /\/web-search-auth/u);
+	assert.match(mac, /掩码/u);
+	assert.match(mac, /macos-keychain\.swift|Swift.{0,12}(?:静态|适配器)|(?:静态|适配器).{0,12}Swift/iu);
+	assert.ok(!/security add-generic-password/u.test(mac), "不应再推荐 security -w 命令");
+	assert.ok(!/\bexport\s+[A-Z0-9_]+_API_KEY\s*=/u.test(mac), "不应建议把 key 写入 shell 文件");
+	assert.ok(!/^\s*(?:echo|printf|tee)\b[^\n]*(?:>>?\s*~\/|\.zshrc|\.bashrc|\.profile|\.env)/imu.test(mac), "不应建议写入明文配置文件");
 	assert.ok(!mac.includes(SECRET), "配置说明不应包含任何 key");
 
 	const linux = auth.configGuide("parallel", "secret-tool").lines.join("\n");
-	assert.match(linux, /secret-tool store --label="Pi web search: parallel" service pi-web-search provider parallel/u);
-	assert.ok(!/secret-tool store[^\n]*=[^\s]/u.test(linux.replace(/--label="[^"]*"/u, "")), "key 不能作为参数");
+	assert.match(linux, /\/web-search-auth/u);
+	assert.ok(!/secret-tool store[^\n]*\b(?:key|secret)\s*=/iu.test(linux), "key 不能作为参数");
+	assert.ok(!/\bexport\s+[A-Z0-9_]+_API_KEY\s*=/u.test(linux), "不应建议把 key 写入 shell 文件");
+	assert.ok(!/^\s*(?:echo|printf|tee)\b[^\n]*(?:>>?\s*~\/|\.zshrc|\.bashrc|\.profile|\.env)/imu.test(linux), "不应建议写入明文配置文件");
 });
 
 // 5. 脱敏覆盖原文与 URL 编码形式。
@@ -235,7 +253,7 @@ test("auth: Exa key 进入 URL，每次搜索只读一次密钥库", async () =>
 		},
 	});
 	const { tool } = setup(store);
-	await withEnv({ EXA_API_KEY: undefined, PARALLEL_API_KEY: undefined, PI_WEB_SEARCH_RETRIES: "0" }, async () => {
+	await withEnv({ EXA_API_KEY: undefined, PARALLEL_API_KEY: undefined, PI_WEB_SEARCH_RETRIES: "0", PI_WEB_SEARCH_ROUTING: "key-first" }, async () => {
 		const seen = [];
 		await withFetch(
 			async (url) => {
@@ -258,7 +276,7 @@ test("auth: Parallel key 从密钥库进入 Authorization 头", async () => {
 		read: async (backend) => (backend === "parallel" ? { status: "found", value: "parallel-store-key" } : { status: "missing" }),
 	});
 	const { tool } = setup(store);
-	await withEnv({ EXA_API_KEY: undefined, PARALLEL_API_KEY: undefined }, async () => {
+	await withEnv({ EXA_API_KEY: undefined, PARALLEL_API_KEY: undefined, PI_WEB_SEARCH_ROUTING: "key-first" }, async () => {
 		const seen = [];
 		await withFetch(
 			async (_url, init) => {
@@ -308,8 +326,8 @@ test("auth: HTTP / MCP 回显 key 时 fallbackReason 与最终 throw 均脱敏",
 	const store = fakeStore({
 		read: async (backend) => (backend === "exa" ? { status: "found", value: SECRET } : { status: "missing" }),
 	});
-	await withEnv({ EXA_API_KEY: undefined, PARALLEL_API_KEY: undefined, PI_WEB_SEARCH_RETRIES: "0" }, async () => {
-		// 12a. Key 通道 500 回显 key，free 成功 → details.fallbackReason 不含 key。
+	await withEnv({ EXA_API_KEY: undefined, PARALLEL_API_KEY: undefined, PI_WEB_SEARCH_RETRIES: "0", PI_WEB_SEARCH_ROUTING: "key-first" }, async () => {
+		// 12a. Key 通道 500 回显 key，free 成功 → details.fallbackReason 不含 key.
 		{
 			const { tool } = setup(store);
 			await withFetch(
@@ -353,16 +371,19 @@ test("auth: HTTP / MCP 回显 key 时 fallbackReason 与最终 throw 均脱敏",
 	});
 });
 
-// 13. 菜单：配置说明走 notify，且命令安全。
-test("auth-ui: 配置说明菜单输出安全命令", async () => {
+// 13. 菜单：配置说明推荐掩码输入，不建议 argv 密钥或明文文件。
+test("auth-ui: 配置说明推荐掩码输入且不建议 argv 密钥或明文文件", async () => {
 	const { authCommand } = setup(fakeStore());
 	assert.ok(authCommand, "应注册 /web-search-auth");
 	const ctx = fakeCtx({ selections: ["查看配置说明"] });
 	await authCommand.handler("", ctx);
 	const text = ctx.notes.map((note) => note.message).join("\n");
-	assert.match(text, /security add-generic-password -U -a "\$USER" -s "pi-web-search-exa" -w/u);
-	const commandLine = text.split("\n").find((line) => line.includes("security add-generic-password"));
-	assert.match(commandLine.trim(), /-w$/u, "-w 后不能跟 key");
+	assert.match(text, /\/web-search-auth/u);
+	assert.match(text, /掩码/u);
+	assert.match(text, /macos-keychain\.swift|Swift.{0,12}(?:静态|适配器)|(?:静态|适配器).{0,12}Swift/iu);
+	assert.ok(!/security add-generic-password/u.test(text), "不应再推荐 security -w 命令");
+	assert.ok(!/\bexport\s+[A-Z0-9_]+_API_KEY\s*=/u.test(text), "不应建议明文 shell 配置");
+	assert.ok(!/^\s*(?:echo|printf|tee)\b[^\n]*(?:>>?\s*~\/|\.zshrc|\.bashrc|\.profile|\.env)/imu.test(text), "不应建议写入明文配置文件");
 });
 
 // 14. 菜单：状态同时报告两个后端，并区分不可用。
@@ -428,11 +449,17 @@ test("auth-ui: 删除流程给出成功 / 未找到 / 失败诊断", async () =>
 	}
 });
 
-// 16. 生产入口不再引用 masked-input（文件保留，但不再被 import）。
-test("生产入口不再 import masked-input", () => {
-	const source = readFileSync(new URL("../index.ts", import.meta.url), "utf8");
-	assert.ok(!source.includes("masked-input"), "index.ts 不应引用 masked-input");
-	assert.ok(!source.includes("web-search-config"), "旧命令名应已移除");
+// 16. 生产认证 UI 实际使用掩码组件，不使用普通 Input；index 委托注册认证命令。
+test("生产认证 UI 引用 MaskedInput 且不使用普通 Input", () => {
+	const authUi = readFileSync(new URL("../auth-ui.ts", import.meta.url), "utf8");
+	const index = readFileSync(new URL("../index.ts", import.meta.url), "utf8");
+	assert.match(authUi, /from ["']\.\/masked-input\.js["']/u);
+	assert.ok(!/\bnew\s+Input\b|\bui\.input\s*\(/u.test(authUi), "认证 UI 不应退化为普通 Input");
+	assert.ok(!/\bundo\b/iu.test(authUi), "认证 UI 不应暴露撤销输入组件");
+	assert.match(index, /registerAuthCommand/u);
+	assert.ok(!index.includes("masked-input"), "index.ts 应由 auth-ui 间接使用 MaskedInput");
+	assert.ok(!/\bpi\.registerCommand\s*\(/u.test(index), "命令注册应由 auth-ui 负责");
+	assert.ok(!index.includes("web-search-config"), "旧命令名应已移除");
 });
 
 // 17. 成功响应回显 key：content / details / 落盘都不得出现 key（原文与 URL 编码）。
@@ -565,4 +592,35 @@ test("auth: 无系统密钥库时不建议写 shell 配置文件", () => {
 	assert.ok(!guide.includes("export EXA_API_KEY"), "不应建议将 key 放入 shell 命令历史");
 	assert.match(guide, /secret manager/);
 	assert.match(guide, /免 key 通道/);
+});
+
+// 24. 菜单与搜索共用同一 channelHealth：搜索触发冷却后，认证菜单可见。
+test("auth-ui: 路由菜单读取插件共享的搜索通道健康状态", async () => {
+	const health = channelHealthModule.createChannelHealth({ clock: () => 10_000 });
+	const { tool, authCommand } = setup(fakeStore(), { channelHealth: health });
+	await withEnv(
+		{
+			EXA_API_KEY: undefined,
+			PARALLEL_API_KEY: undefined,
+			TAVILY_API_KEY: undefined,
+			SERPAPI_API_KEY: undefined,
+			PI_WEB_SEARCH_ROUTING: "free-first",
+			PI_WEB_SEARCH_ALLOW_PAID: "true",
+			PI_WEB_SEARCH_FREE_COOLDOWN_MS: "5000",
+			PI_WEB_SEARCH_RETRIES: "0",
+		},
+		async () => {
+			await withFetch(
+				async () => new Response("rate limited", { status: 429, headers: { "retry-after": "5" } }),
+				async () => {
+					await assert.rejects(tool.execute("a24", EXA_PARAMS, undefined, undefined, {}));
+				},
+			);
+			const ctx = fakeCtx({ selections: ["查看路由与冷却状态"] });
+			await authCommand.handler("", ctx);
+			const message = ctx.notes.map((note) => note.message).join("\n");
+			assert.match(message, /exa（免费通道）：冷却剩余约 5 秒/u);
+			assert.ok(!message.includes(SECRET));
+		},
+	);
 });

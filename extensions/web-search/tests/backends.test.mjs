@@ -46,7 +46,14 @@ function setup(store) {
 /** 注入环境变量，结束后恢复；默认清空四个 key。 */
 async function withEnv(vars, fn) {
 	const saved = {};
-	const merged = { PI_WEB_SEARCH_RETRIES: "0", ...Object.fromEntries(KEY_ENV.map((key) => [key, undefined])), ...vars };
+	const merged = {
+		PI_WEB_SEARCH_RETRIES: "0",
+		PI_WEB_SEARCH_ROUTING: "free-first",
+		PI_WEB_SEARCH_ALLOW_PAID: "true",
+		PI_WEB_SEARCH_FREE_COOLDOWN_MS: "0",
+		...Object.fromEntries(KEY_ENV.map((key) => [key, undefined])),
+		...vars,
+	};
 	for (const key of Object.keys(merged)) saved[key] = process.env[key];
 	for (const [key, value] of Object.entries(merged)) {
 		if (value === undefined) delete process.env[key];
@@ -243,10 +250,10 @@ test("显式未配置：tavily / serpapi 立即报错且零请求", async () => 
 });
 
 // 8. auto 完整六通道顺序，且未配置的新后端不产生请求。
-test("auto：Exa Key → Exa Free → Parallel Key → Parallel Free → Tavily → SerpApi", async () => {
+test("auto key-first：Exa Key → Exa Free → Parallel Key → Parallel Free → Tavily → SerpApi", async () => {
 	const { store } = fakeStore({ exa: "e", parallel: "p", tavily: TAVILY_KEY, serpapi: SERP_KEY });
 	const tool = setup(store);
-	await withEnv({}, () =>
+	await withEnv({ PI_WEB_SEARCH_ROUTING: "key-first" }, () =>
 		withFetch(
 			() => json({ error: "boom" }, 500),
 			async (calls) => {
@@ -390,6 +397,27 @@ test("details：标明 tavily / serpapi 的实际后端与 key 通道", async ()
 				assert.equal(result.details.channel, "key");
 				assert.equal(result.details.sourceCount, 1);
 				assert.ok(!JSON.stringify(result.details).includes(SERP_KEY));
+			},
+		),
+	);
+});
+
+test("allowPaid=false 不读 SecretStore、不走已配置密钥且无免费通道时明确禁用", async () => {
+	const { store, reads } = fakeStore({ exa: "store-exa", tavily: TAVILY_KEY });
+	const tool = setup(store);
+	await withEnv({ PI_WEB_SEARCH_ALLOW_PAID: "false", EXA_API_KEY: "env-exa", TAVILY_API_KEY: TAVILY_KEY }, () =>
+		withFetch(
+			(url) => {
+				assert.ok(String(url).includes("mcp.exa.ai"));
+				assert.ok(!String(url).includes("exaApiKey"));
+				return json({ result: { content: [{ type: "text", text: "Title: X\nURL: https://example.com/x" }] } });
+			},
+			async (calls) => {
+				const result = await tool.execute("b13", { query: "q", provider: "auto" });
+				assert.equal(result.details.channel, "free");
+				assert.equal(calls.length, 1);
+				await assert.rejects(tool.execute("b13b", { query: "q", provider: "tavily" }), /已被 PI_WEB_SEARCH_ALLOW_PAID=false 禁用/);
+				assert.deepEqual(reads, { exa: 0, parallel: 0, tavily: 0, serpapi: 0 });
 			},
 		),
 	);

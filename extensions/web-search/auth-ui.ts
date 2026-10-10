@@ -1,13 +1,10 @@
 /**
  * `/web-search-auth` 命令的交互菜单
  *
- * 只使用 Pi 自带的 select / confirm / notify：
- * - 状态：分别报告四个后端的配置与凭据来源，区分「未配置」与「密钥库不可用」。
- * - 配置说明：输出安全的终端命令（key 只从交互提示读取，绝不放命令参数）。
- * - 删除：二次确认后只删除系统密钥库中的条目，并给出成功 / 未找到 / 失败诊断。
- *
- * 该菜单不接收任何 key 输入：key 的写入由用户在终端用平台自带命令完成，
- * 因此这里没有普通输入框，也没有自定义掩码组件。
+ * - 状态：区分凭据来源、路由策略、付费开关与独立通道冷却。
+ * - 添加 / 修改：仅在终端模式中使用自绘掩码组件，二次确认后写入系统密钥库。
+ * - 删除：二次确认后只删除系统密钥库条目，环境变量不受影响。
+ * - 不支持安全输入或系统密钥库时明确失败，不退化为明文输入或明文文件。
  *
  * @module pi-web-search-auth-ui
  */
@@ -24,7 +21,9 @@ import {
 	probeBackendStatus,
 	safeDiagnostic,
 } from "./auth.js";
-import type { SecretStore } from "./credentials.js";
+import { isValidSecretValue, type SecretStore } from "./credentials.js";
+import { MaskedInput } from "./masked-input.js";
+import { getRoutingStatus, type RoutingStatus } from "./routing.js";
 
 /** 认证命令名。 */
 export const AUTH_COMMAND = "web-search-auth";
@@ -32,14 +31,23 @@ export const AUTH_COMMAND = "web-search-auth";
 /** 菜单选项文案。 */
 const OPTION_STATUS = "查看状态";
 const OPTION_GUIDE = "查看配置说明";
+const OPTION_WRITE = "添加或修改密钥";
+const OPTION_ROUTING = "查看路由与冷却状态";
 const OPTION_DELETE = "删除系统密钥库中的密钥";
 
+/** 搜索与认证菜单共用同一实例的状态，仅返回无凭据的数据。 */
+export type RoutingStatusReader = () => RoutingStatus;
+
 /** 注册 `/web-search-auth` 命令。 */
-export function registerAuthCommand(pi: ExtensionAPI, store: SecretStore): void {
+export function registerAuthCommand(
+	pi: ExtensionAPI,
+	store: SecretStore,
+	readStatus: RoutingStatusReader = () => getRoutingStatus(),
+): void {
 	pi.registerCommand(AUTH_COMMAND, {
-		description: "查看 / 配置 Exa、Parallel、Tavily、SerpApi 的密钥（环境变量或系统密钥库）",
+		description: "安全管理搜索密钥，查看路由与通道冷却状态",
 		handler: async (_args, ctx) => {
-			await runAuthMenu(ctx, store);
+			await runAuthMenu(ctx, store, readStatus);
 		},
 	});
 }
@@ -59,7 +67,7 @@ function statusLine(status: BackendStatus, store: SecretStore): string {
 	}
 	if (status.state === "not_configured") {
 		return hasFreeChannel(status.backend)
-			? `${name}：未配置（免 key 通道仍可用）`
+			? `${name}：未配置（具备免 key 通道，冷却状态单独查看）`
 			: `${name}：未配置（需要密钥，没有免 key 通道）`;
 	}
 	return `${name}：系统密钥库不可用（${status.reason ?? "未知原因"}）`;
@@ -84,7 +92,7 @@ async function reportStatus(
 ): Promise<void> {
 	const statuses = probed ?? (await Promise.all(BACKENDS.map((backend) => probeBackendStatus(backend, store))));
 	const lines = statuses.map((status) => statusLine(status, store));
-	lines.push("Exa / Parallel 的免 key 通道仍可用；Tavily / SerpApi 必须通过环境变量或系统密钥库配置密钥。");
+	lines.push("Exa / Parallel 具备免 key 通道，实时冷却状态见「查看路由与冷却状态」；Tavily / SerpApi 必须配置密钥。");
 	const hasUnavailable = statuses.some((status) => status.state === "unavailable");
 	notify(ctx, lines.join("\n"), hasUnavailable ? "warning" : "info");
 }
@@ -129,8 +137,76 @@ async function deleteStoredKey(ctx: ExtensionCommandContext, store: SecretStore)
 	}
 }
 
-/** `/web-search-auth` 主流程：状态 / 配置说明 / 删除。 */
-async function runAuthMenu(ctx: ExtensionCommandContext, store: SecretStore): Promise<void> {
+/** 路由状态与认证状态分开读取；不暴露密钥，也不修改冷却。 */
+function reportRouting(ctx: ExtensionCommandContext, readStatus: RoutingStatusReader): void {
+	try {
+		const status = readStatus();
+		const lines = [
+			`路由：${status.strategy === "free-first" ? "免费优先" : "密钥优先"}；密钥通道：${status.allowPaid ? "允许（可能产生费用）" : "已禁用"}。`,
+			`免费通道默认冷却：${status.freeCooldownMs / 1000} 秒；仅存于本进程内存。`,
+		];
+		if (status.channels.length === 0) lines.push("当前没有正在冷却的通道。");
+		for (const channel of status.channels) {
+			lines.push(`${channel.backend}（${channel.channel === "free" ? "免费" : "密钥"}通道）：冷却剩余约 ${Math.ceil(channel.remainingMs / 1000)} 秒。`);
+		}
+		notify(ctx, lines.join("\n"));
+	} catch {
+		notify(ctx, "路由配置无效，请检查 PI_WEB_SEARCH_ROUTING、PI_WEB_SEARCH_ALLOW_PAID 与 PI_WEB_SEARCH_FREE_COOLDOWN_MS。", "error");
+	}
+}
+
+/** 密钥只流经掩码组件与系统密钥库；取消、无安全输入或无密钥库均不写入。 */
+async function writeStoredKey(ctx: ExtensionCommandContext, store: SecretStore): Promise<void> {
+	if (ctx.mode !== "tui" || typeof ctx.ui.custom !== "function") {
+		notify(ctx, "当前模式不支持安全掩码输入；请在终端交互模式中运行 /web-search-auth，不会使用明文输入。", "warning");
+		return;
+	}
+	if (store.kind === "none") {
+		notify(ctx, "当前平台没有支持的系统密钥库，不能保存密钥；不会退化为明文文件。", "warning");
+		return;
+	}
+	const selected = await ctx.ui.select("选择要添加或修改密钥的后端", [...BACKENDS]);
+	if (!isBackend(selected)) {
+		notify(ctx, "已取消，未写入任何凭据。");
+		return;
+	}
+	const confirmed = await ctx.ui.confirm(
+		`写入或替换 ${selected} 的系统密钥库条目？`,
+		`将保存此后端的密钥，如已存在则替换；环境变量 ${envVarName(selected)} 仍优先且不会被修改。`,
+	);
+	if (!confirmed) {
+		notify(ctx, "已取消，未写入任何凭据。");
+		return;
+	}
+	let value: string | undefined;
+	try {
+		value = await ctx.ui.custom<string | undefined>((tui, _theme, _keybindings, done) =>
+			new MaskedInput(`输入 ${selected} 的密钥（仅显示掩码）`, done, () => tui.requestRender()),
+		);
+		if (value === undefined) {
+			notify(ctx, "已取消，未写入任何凭据。");
+			return;
+		}
+		if (!isValidSecretValue(value)) {
+			notify(ctx, "密钥输入无效或超长，未写入任何凭据。", "error");
+			return;
+		}
+		const result = await store.write(selected, value);
+		if (result.status === "written") {
+			notify(ctx, `已保存 ${selected} 的系统密钥库条目，并通过重读验证；如已配置 ${envVarName(selected)}，仍以环境变量为准。`);
+		} else {
+			notify(ctx, `保存 ${selected} 失败：${safeDiagnostic(result.reason, [value])}。未验证成功，请查看密钥库状态。`, "error");
+		}
+	} catch {
+		// 输入组件、第三方注入的存储实现都可能在错误中回显密钥，故不传播原始错误。
+		notify(ctx, `保存 ${selected} 失败：安全输入或系统密钥库不可用。未验证成功。`, "error");
+	} finally {
+		value = undefined;
+	}
+}
+
+/** `/web-search-auth` 主流程。 */
+async function runAuthMenu(ctx: ExtensionCommandContext, store: SecretStore, readStatus: RoutingStatusReader): Promise<void> {
 	if (!ctx.hasUI) {
 		// JSON / print 模式没有 UI，notify / select 都不可见：这里保持安全 no-op，
 		// 不假装通知成功；凭据状态可通过 web_search 的 details 观察。
@@ -140,15 +216,19 @@ async function runAuthMenu(ctx: ExtensionCommandContext, store: SecretStore): Pr
 	const statuses = await Promise.all(BACKENDS.map((backend) => probeBackendStatus(backend, store)));
 	const choice = await ctx.ui.select(`Web Search 认证（${summarize(statuses)}）`, [
 		OPTION_STATUS,
+		OPTION_WRITE,
+		OPTION_ROUTING,
 		OPTION_GUIDE,
 		OPTION_DELETE,
 	]);
 	// 运行时验证选择值：非白名单（取消、自定义输入等）一律视为取消。
-	if (choice !== OPTION_STATUS && choice !== OPTION_GUIDE && choice !== OPTION_DELETE) {
+	if (![OPTION_STATUS, OPTION_WRITE, OPTION_ROUTING, OPTION_GUIDE, OPTION_DELETE].includes(choice ?? "")) {
 		notify(ctx, "已取消。");
 		return;
 	}
 	if (choice === OPTION_STATUS) return reportStatus(ctx, store, statuses);
+	if (choice === OPTION_WRITE) return writeStoredKey(ctx, store);
+	if (choice === OPTION_ROUTING) return reportRouting(ctx, readStatus);
 	if (choice === OPTION_GUIDE) return showGuides(ctx, store);
 	return deleteStoredKey(ctx, store);
 }
