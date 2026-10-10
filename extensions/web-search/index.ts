@@ -45,6 +45,7 @@ import {
 } from "./search-core.js";
 import { apiHttpKind, buildApiRequest, isApiBackend, parseApiResponse, type RequestSpec } from "./search-api.js";
 import { getProviderMetadata, isProviderId, PROVIDER_IDS } from "./search/registry.js";
+import { readMaxResponseBytes, readResponseTextLimited } from "./response-body.js";
 
 export type { WebSource };
 
@@ -71,7 +72,7 @@ const SPILL_KEEP_FILES = 20;
 /** 落盘目录名（位于系统临时目录下，不进入任何公开目录）。 */
 const SPILL_DIR_NAME = "pi-web-search";
 /** 归属标识，便于端点侧识别调用方。 */
-const USER_AGENT = "pi-web-search/0.5.0-beta.1";
+const USER_AGENT = "pi-web-search/0.5.0-beta.2";
 
 /** 一次尝试：某个后端的某个通道。 */
 interface RouteStep extends RoutingStep {
@@ -467,6 +468,7 @@ async function searchChannel(
 	step: RouteStep,
 	query: string,
 	numResults: number,
+	maxResponseBytes: number,
 	signal?: AbortSignal,
 ): Promise<{ text: string; sources: WebSource[]; attempts: number }> {
 	// 每次调用时读取，便于测试注入（PI_WEB_SEARCH_TIMEOUT_MS / PI_WEB_SEARCH_RETRIES）。
@@ -541,16 +543,26 @@ async function searchChannel(
 			if (!response.ok) {
 				let detail = "";
 				try {
-					const raw = errorDetailFrom(await response.json());
+					const body = await readResponseTextLimited(response, maxResponseBytes, controller);
+					const raw = errorDetailFrom(JSON.parse(body));
 					if (raw !== undefined) detail = `: ${raw}`;
-				} catch {
-					// 状态码已经足够定位问题，非 JSON 响应体不覆盖它。
+				} catch (error) {
+					if (isAborted(signal)) throw createAbortError();
+					if (timedOut) throw error;
+					if (error instanceof BackendError && error.kind === "response_too_large") throw error;
+					// 普通正文读取或 JSON 解析失败时，仍以已知 HTTP 状态码分类。
 				}
 				const kind = apiHttpKind(backend, response.status, detail);
 				const retryAfterMs = kind === "rate_limited" ? parseRetryAfter(response.headers.get("retry-after")) : undefined;
 				throw new BackendError(`${backend} HTTP ${response.status}${detail}`, kind, retryAfterMs);
 			}
-			const body = await response.text();
+			let body: string;
+			try {
+				body = await readResponseTextLimited(response, maxResponseBytes, controller);
+			} catch (error) {
+				if (isAborted(signal) || timedOut || error instanceof BackendError) throw error;
+				throw new Error("Response body stream read failed");
+			}
 			if (isApiBackend(backend)) {
 				const sources = parseApiResponse(backend, body, numResults);
 				return { text: renderParallel(sources, ""), sources };
@@ -616,6 +628,7 @@ export default function piWebSearch(pi: ExtensionAPI, options: WebSearchOptions 
 			const query = params.query.trim();
 			if (query.length === 0) throw new Error("query must not be empty");
 			if (isAborted(signal)) throw createAbortError();
+			const maxResponseBytes = readMaxResponseBytes();
 
 			const provider = params.provider ?? "auto";
 			if (provider !== "auto" && !isProviderId(provider)) throw new Error("未知的搜索后端");
@@ -650,7 +663,13 @@ export default function piWebSearch(pi: ExtensionAPI, options: WebSearchOptions 
 				}
 				try {
 					if (isAborted(signal)) throw createAbortError();
-					const { text: rawText, sources: rawSources, attempts } = await searchChannel(step, query, numResults, signal);
+					const { text: rawText, sources: rawSources, attempts } = await searchChannel(
+						step,
+						query,
+						numResults,
+						maxResponseBytes,
+						signal,
+					);
 					attemptCount += attempts;
 					// 上游响应可能回显 key（错误正文、URL 查询参数等）：在进入模型上下文
 					// （content / details）与落盘前统一脱敏，key 绝不流出。

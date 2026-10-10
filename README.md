@@ -22,6 +22,7 @@ pi-extensions/
 ├── extensions/
 │   ├── web-search/
 │   │   ├── index.ts              # 扩展入口与搜索执行
+│   │   ├── response-body.ts      # 响应体流式解码与字节上限
 │   │   ├── search/
 │   │   │   ├── registry.ts       # provider ID、环境变量与匿名能力元数据
 │   │   │   ├── protocol.ts       # REST provider 共用协议
@@ -288,9 +289,11 @@ Pi 的内置工具只有 `read` / `bash` / `edit` / `write` / `grep` / `find` / 
 
 > **与 npm 上同名包 `pi-web-search` 的区别**：本扩展直接连接 Exa / Parallel 的远程模型上下文协议（Model Context Protocol，MCP）端点，并通过原生 REST 接口调用 Tavily、Firecrawl 与 SerpApi。本扩展不发布到 npm，只通过上面的 GitHub 安装方式分发。
 
-## 状态：v0.5.0-beta.1
+## 状态：v0.5.0-beta.2
 
-`web_search` 工具名、Pi 安装方式和 `/web-search-auth` 命令保持不变。本轮实现说明：
+本轮仅修复 HTTP 响应资源消耗风险：五家服务的成功与错误响应统一受流式字节上限约束。匿名顺序、计费授权、重试与冷却策略不变；不新增引擎、质量评分、结果融合或 `web_fetch`。
+
+`web_search` 工具名、Pi 安装方式和 `/web-search-auth` 命令保持不变。既有功能说明：
 
 - 默认匿名候选顺序为 **Parallel → Exa → Tavily → Firecrawl**；依次尝试并在首个可用结果处返回。该顺序是本项目的路由候选顺序，不是服务质量排行榜。
 - SerpApi（不是 Serper）仍作为第五个、仅密钥的 provider；所有密钥通道都按可能计费处理，默认关闭。
@@ -309,6 +312,7 @@ Pi 的内置工具只有 `read` / `bash` / `edit` / `write` / `grep` / `find` / 
 - 同时解析直接 JSON 与服务端发送事件（Server-Sent Events，SSE）数据帧
 - 单请求预算默认 25 秒；密钥库读取、请求、读体和退避可中断，切换与落盘前后检查取消；在途文件操作须完成后才返回取消
 - 失败分类分别处理额度、限流、鉴权、服务端、网络、超时、取消与协议错误
+- HTTP 响应体按实际交付的解压后字节累计，默认上限 5 MiB；成功、错误及分块传输均受限，不信任 `Content-Length`
 - 模型可见正文截断到 24 000 字符，结构化来源与路由信息完整保留在 `details`
 
 ## 用法
@@ -348,6 +352,7 @@ Pi 的内置工具只有 `read` / `bash` / `edit` / `write` / `grep` / `find` / 
 | `PI_WEB_SEARCH_ALLOW_BILLABLE` | `false` | 只接受严格的 `true` 或 `false`；只有显式 `true` 才授权可能计费的密钥通道 |
 | `PI_WEB_SEARCH_ALLOW_PAID` | 未设置 | 旧开关兼容别名，只接受严格的 `true` 或 `false`；单独显式设为 `true` 仍可授权。与新开关同时设置且取值不同会报错；非法值报错 |
 | `PI_WEB_SEARCH_FREE_COOLDOWN_MS` | `1800000` | 默认冷却 30 分钟；接受 `0` 至 `86400000` 的安全整数，`0` 禁用冷却，非法值报错 |
+| `PI_WEB_SEARCH_MAX_RESPONSE_BYTES` | `5242880` | 解压后响应体上限，默认 5 MiB；只接受十进制正整数 `1` 至 `20971520`（20 MiB），首尾空白允许，非法配置在读取凭据或请求前报错 |
 | `PI_WEB_SEARCH_TIMEOUT_MS` | `25000` | 单次请求预算，最小 `100` 毫秒 |
 | `PI_WEB_SEARCH_RETRIES` | `1` | 可重试错误的重试次数，`0` 表示不重试；单次退避等待最多 5 秒 |
 
@@ -395,7 +400,18 @@ Parallel → Exa → Tavily → Firecrawl
 | HTTP 429 | 按原重试规则处理，随后根据 `Retry-After` 或默认值冷却 |
 | 服务端错误、可重试网络错误 | 按 `PI_WEB_SEARCH_RETRIES` 重试，之后尝试下一通道 |
 | 超时、协议错误、无可用结果 | 不重试，尝试下一通道 |
+| `response_too_large` | 立即中止底层请求并取消读取；不重试当前通道、不记录冷却，按原路由尝试下一通道 |
 | 取消 | 立即终止，不再发请求，也不记录冷却 |
+
+### 响应体资源上限
+
+`response-body.ts` 按流累计 `Uint8Array.byteLength`，再增量解码 UTF-8；恰好达到上限允许返回，超过上限立即终止底层 HTTP 请求。正常响应与 HTTP 429、500 等错误正文共用此限制；即使错误响应带有限流状态，正文超限也归为 `response_too_large`，不触发重试或额度冷却。解码保持跨数据块的中文字符完整。
+
+在 Node.js 内置 `fetch` 的正常自动解压流程下，统计的是流交付的解压后字节，而不是 gzip 压缩体积。超限不会返回部分搜索结果；`Content-Length` 缺失、伪造或代表压缩体积时也不能绕过限制。外部取消与原有单请求超时保持各自语义；外部取消立即终止全部路由，超时仍按原策略切换下一通道。默认禁止计费的规则不变。
+
+**5 MiB 仅是响应体有效载荷的字节上限，不是 JavaScript 进程整体内存的绝对上限。** 字符串解码、JSON 解析和结构化来源仍有额外开销。它也不同于原有的 24 000 字符模型正文上限与 2 MiB 落盘上限：三者分别限制网络正文、模型上下文和磁盘写入。
+
+本修复的解压、边界与中断验收使用本地 HTTP 测试服务器，不发起厂商搜索；前文四家匿名通道与终端验证记录来自 `v0.5.0-beta.1`。
 
 匿名候选顺序不是质量排名；当前不做质量不足后的跨 provider 选择，质量感知路由留待后续路线图。
 

@@ -9,7 +9,7 @@ export interface WebSource {
 
 export type SearchErrorKind =
 	| "quota_exhausted" | "rate_limited" | "invalid_key" | "server_error"
-	| "network_error" | "timeout" | "aborted" | "protocol_error";
+	| "network_error" | "timeout" | "aborted" | "protocol_error" | "response_too_large";
 
 /** 带分类的错误；请求层回填实际尝试次数。 */
 export class BackendError extends Error {

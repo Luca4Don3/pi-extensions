@@ -232,22 +232,10 @@ test("6. 超时：fetch 永不 resolve 时按预算中止", async () => {
 });
 
 test("7. 超时：HTTP 200 但响应体不结束", async () => {
-	// mock fetch 不经过 undici，真实 Response 的 body 不会随内部 controller.abort 而结束，
-	// 因此这里返回自制响应对象，让 text() 在内部 signal abort 时 reject。
+	// 自制响应流不随 fetch 的 signal 自动终止，验证有界 reader 能被预算超时打断。
 	await withEnv({ PI_WEB_SEARCH_TIMEOUT_MS: "100", PI_WEB_SEARCH_RETRIES: "0" }, async () => {
 		await withFetch(
-			(_url, init) =>
-				Promise.resolve({
-					ok: true,
-					status: 200,
-					text: () =>
-						new Promise((_resolve, reject) => {
-							init.signal.addEventListener("abort", () => reject(new DOMException("Aborted", "AbortError")), {
-								once: true,
-							});
-						}),
-					json: () => Promise.reject(new Error("not json")),
-				}),
+			() => Promise.resolve({ ok: true, status: 200, body: new ReadableStream({}) }),
 			async () => {
 				await assert.rejects(tool.execute("t7", { query: "hang", provider: "exa" }), /timed out/);
 			},
