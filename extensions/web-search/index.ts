@@ -46,6 +46,12 @@ import {
 	type WebSource,
 } from "./search-core.js";
 import { apiHttpKind, buildApiRequest, isApiBackend, parseApiResponse, type RequestSpec } from "./search-api.js";
+import {
+	buildTinyFishHeaders,
+	buildTinyFishPayload,
+	parseTinyFishResults,
+	TINYFISH_MCP_URL,
+} from "./search/providers/tinyfish.js";
 import { getProviderMetadata, isProviderId, PROVIDER_IDS } from "./search/registry.js";
 import { readMaxResponseBytes, readResponseTextLimited } from "./response-body.js";
 
@@ -74,7 +80,7 @@ const SPILL_KEEP_FILES = 20;
 /** 落盘目录名（位于系统临时目录下，不进入任何公开目录）。 */
 const SPILL_DIR_NAME = "pi-web-search";
 /** 归属标识，便于端点侧识别调用方。 */
-const USER_AGENT = "pi-web-search/0.6.0-beta.2";
+const USER_AGENT = "pi-web-search/0.6.0-beta.3";
 
 /** 一次尝试：某个后端的某个通道。 */
 interface RouteStep extends RoutingStep {
@@ -608,10 +614,12 @@ async function searchChannel(
 							contextMaxCharacters: 10_000,
 						},
 					}
-				: {
-						name: "web_search",
-						arguments: { objective: query, search_queries: [query] },
-					},
+				: backend === "tinyfish"
+					? buildTinyFishPayload(query)
+					: {
+							name: "web_search",
+							arguments: { objective: query, search_queries: [query] },
+						},
 	};
 
 	const headers: Record<string, string> = {
@@ -622,6 +630,7 @@ async function searchChannel(
 	if (backend === "parallel" && channel === "key" && step.apiKey !== undefined && step.apiKey.length > 0) {
 		headers.authorization = `Bearer ${step.apiKey}`;
 	}
+	if (backend === "tinyfish") Object.assign(headers, buildTinyFishHeaders());
 
 	/** 执行一次请求；失败一律以带分类的 BackendError 抛出。 */
 	const attempt = async (): Promise<{ text: string; sources: WebSource[] }> => {
@@ -647,7 +656,11 @@ async function searchChannel(
 				isApiBackend(backend)
 					? buildApiRequest(backend, query, numResults, step.apiKey, channel)
 					: {
-							url: backend === "exa" ? exaEndpoint(step) : PARALLEL_MCP_URL,
+							url: backend === "exa"
+								? exaEndpoint(step)
+								: backend === "tinyfish"
+									? TINYFISH_MCP_URL
+									: PARALLEL_MCP_URL,
 							method: "POST",
 							headers,
 							body: JSON.stringify(payload),
@@ -750,7 +763,7 @@ async function searchChannel(
 			if (backend === "exa" && channel === "free" && isExaFreeRateLimitNotice(text)) {
 				throw new BackendError(text.trim(), "quota_exhausted");
 			}
-			const sources = extractSources(text);
+			const sources = backend === "tinyfish" ? parseTinyFishResults(text, numResults) : extractSources(text);
 			if (sources.length === 0) {
 				throw new BackendError(`${backend} 未返回可用的搜索来源`, "protocol_error");
 			}

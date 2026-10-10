@@ -18,7 +18,13 @@ import {
 	type SecretBackend,
 	type SecretStore,
 } from "./credentials.js";
-import { getProviderMetadata, hasAnonymousChannel, isProviderId, PROVIDER_IDS } from "./search/registry.js";
+import {
+	getProviderMetadata,
+	hasAnonymousChannel,
+	isProviderId,
+	PROVIDER_IDS,
+	supportsKeyChannel,
+} from "./search/registry.js";
 
 /** 后端标识（与存储层共用）。 */
 export type Backend = SecretBackend;
@@ -39,6 +45,8 @@ export interface BackendStatus {
 
 /** 认证菜单、凭据解析与搜索能力共用同一注册表。 */
 export const BACKENDS: readonly Backend[] = PROVIDER_IDS;
+/** 仅可能计费的后端进入凭据解析；纯匿名后端（如 TinyFish keyless）不读取任何密钥。 */
+export const KEY_BACKENDS: readonly Backend[] = BACKENDS.filter(supportsKeyChannel);
 
 /** 运行时白名单，避免非法选择进入凭据操作。 */
 export function isBackend(value: unknown): value is Backend {
@@ -135,7 +143,7 @@ export async function resolvePlanKeys(
 	signal?: AbortSignal,
 ): Promise<Record<Backend, string | undefined>> {
 	throwIfAborted(signal);
-	const needed = provider === "auto" ? BACKENDS : ([provider] as readonly Backend[]);
+	const needed = provider === "auto" ? KEY_BACKENDS : ([provider] as readonly Backend[]).filter(supportsKeyChannel);
 	const entries = await waitForAbort(Promise.all(
 		needed.map(async (backend): Promise<[Backend, string | undefined]> => [
 			backend,

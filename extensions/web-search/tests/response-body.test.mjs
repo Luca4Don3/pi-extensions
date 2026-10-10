@@ -24,6 +24,9 @@ const KEY_NAMES = ["EXA_API_KEY", "PARALLEL_API_KEY", "TAVILY_API_KEY", "FIRECRA
 const TEMP_DIR = fileURLToPath(new URL("../.temp/", import.meta.url));
 const encoder = new TextEncoder();
 
+/** 每个后端一个密钥库读取槽位；零凭据后端同一律不得被读取。 */
+const KEY_READ_SLOTS = Object.fromEntries(PROVIDER_IDS.map((id) => [id, 0]));
+
 function fakeStore() {
 	const reads = Object.fromEntries(PROVIDER_IDS.map((id) => [id, 0]));
 	return {
@@ -387,7 +390,7 @@ test("auto 遇 Exa 超限后按新匿名顺序回退 Tavily，不读取 Keys 或
 			assert.equal(result.details.accessTier, "anonymous");
 			assert.deepEqual(calls.map(({ url }) => new URL(url).hostname), ["mcp.exa.ai", "api.tavily.com"]);
 			assert.equal(keyReads.count, 0);
-			assert.deepEqual(Object.values(store.reads), [0, 0, 0, 0, 0]);
+			assert.deepEqual(Object.values(store.reads), Object.values(KEY_READ_SLOTS).map(() => 0), "未授权不得读取任何密钥库条目");
 		});
 	});
 	assert.deepEqual(health.snapshot().channels, []);
@@ -417,7 +420,7 @@ test("读取响应期间预算超时保留超时诊断与原有匿名回退", as
 		assert.equal(keyReads.count, 0);
 	});
 	assert.deepEqual(health.snapshot().channels, []);
-	assert.deepEqual(Object.values(store.reads), [0, 0, 0, 0, 0]);
+	assert.deepEqual(Object.values(store.reads), Object.values(KEY_READ_SLOTS).map(() => 0), "未授权不得读取任何密钥库条目");
 });
 
 test("读取响应期间外部取消保留取消错误且不触发回退或计费", async () => {
@@ -433,7 +436,7 @@ test("读取响应期间外部取消保留取消错误且不触发回退或计�
 			assert.equal(keyReads.count, 0);
 		});
 	});
-	assert.deepEqual(Object.values(store.reads), [0, 0, 0, 0, 0]);
+	assert.deepEqual(Object.values(store.reads), Object.values(KEY_READ_SLOTS).map(() => 0), "未授权不得读取任何密钥库条目");
 });
 
 test("非法上限配置在读 Keys 或发送请求之前失败，且不泄漏配置值", async () => {

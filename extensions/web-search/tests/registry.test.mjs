@@ -10,8 +10,8 @@ const registryUrl = new URL("../search/registry.ts", import.meta.url);
 const jiti = createJiti(import.meta.url);
 const registry = await jiti.import(fileURLToPath(registryUrl));
 
-test("registry 只含五个 provider 的纯元数据且不声明 free-key 能力", async () => {
-	assert.deepEqual(registry.PROVIDER_IDS, ["exa", "parallel", "tavily", "firecrawl", "serpapi"]);
+test("registry 只含已登记 provider 的纯元数据且不声明 free-key 能力", async () => {
+	assert.deepEqual(registry.PROVIDER_IDS, ["exa", "parallel", "tavily", "firecrawl", "serpapi", "tinyfish"]);
 	assert.deepEqual(registry.BILLABLE_PROVIDER_ORDER, ["exa", "tavily", "parallel", "firecrawl", "serpapi"]);
 	assert.deepEqual(Object.keys(registry.PROVIDERS), [...registry.PROVIDER_IDS]);
 	for (const provider of registry.PROVIDER_IDS) {
@@ -25,6 +25,10 @@ test("registry 只含五个 provider 的纯元数据且不声明 free-key 能力
 	assert.equal(registry.PROVIDERS.tavily.protocol, "rest");
 	assert.equal(registry.PROVIDERS.firecrawl.envVar, "FIRECRAWL_API_KEY");
 	assert.deepEqual(registry.PROVIDERS.serpapi.supportedTiers, ["billable"]);
+	// TinyFish 仅有零凭据 keyless 匿名通道，不读取也不声明任何密钥能力。
+	assert.deepEqual(registry.PROVIDERS.tinyfish.supportedTiers, ["anonymous"]);
+	assert.equal(registry.supportsKeyChannel("tinyfish"), false);
+	assert.equal(registry.hasAnonymousChannel("tinyfish"), true);
 	assert.equal(registry.isProviderId("unknown"), false);
 
 	const source = await readFile(registryUrl, "utf8");
@@ -33,13 +37,13 @@ test("registry 只含五个 provider 的纯元数据且不声明 free-key 能力
 });
 
 test("匿名 provider 顺序唯一且与匿名能力元数据一致", () => {
-	assert.deepEqual(registry.ANONYMOUS_PROVIDER_ORDER, ["exa", "tavily", "parallel", "firecrawl"]);
+	assert.deepEqual(registry.ANONYMOUS_PROVIDER_ORDER, ["exa", "tavily", "parallel", "firecrawl", "tinyfish"]);
 	for (const provider of registry.PROVIDER_IDS) {
 		assert.equal(registry.hasAnonymousChannel(provider), registry.PROVIDERS[provider].supportedTiers.includes("anonymous"));
 	}
 	assert.deepEqual(
 		registry.PROVIDER_IDS.filter((provider) => registry.hasAnonymousChannel(provider)),
-		["exa", "parallel", "tavily", "firecrawl"],
+		["exa", "parallel", "tavily", "firecrawl", "tinyfish"],
 	);
 	assert.throws(() => registry.getProviderMetadata("secret-value"), /未知的搜索 provider/);
 	assert.throws(() => registry.hasAnonymousChannel("secret-value"), /未知的搜索 provider/);

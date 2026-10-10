@@ -118,8 +118,8 @@ test("匿名全部失败后才按独立付费顺序尝试已配置密钥", async
 		}, async (calls) => {
 			const result = await tool.execute("lazy-key", { query: "查询", provider: "auto" });
 			assert.equal(result.details.provider, "exa");
-			assert.deepEqual(calls.slice(0, 4).map((call) => call.url.match(/exa\.ai|tavily\.com|parallel\.ai|firecrawl\.dev/)?.[0]), ["exa.ai", "tavily.com", "parallel.ai", "firecrawl.dev"]);
-			assert.ok(calls[4].url.includes("exaApiKey="));
+			assert.deepEqual(calls.slice(0, 5).map((call) => call.url.match(/exa\.ai|tavily\.com|parallel\.ai|firecrawl\.dev|agent\.tinyfish\.ai/)?.[0]), ["exa.ai", "tavily.com", "parallel.ai", "firecrawl.dev", "agent.tinyfish.ai"]);
+			assert.ok(calls[5].url.includes("exaApiKey="));
 			assert.deepEqual(storeReads, ["parallel", "firecrawl", "serpapi"]);
 		});
 	});
@@ -131,9 +131,10 @@ test("所有匿名通道失败时逐个检查缺失 Key；未授权时绝不读�
 	await withEnv({ PI_WEB_SEARCH_ALLOW_BILLABLE: "true" }, async (reads) => {
 		await withFetch(providerFailure, async (calls) => {
 			await assert.rejects(tool.execute("missing-keys", { query: "查询" }), /未配置密钥/u);
-			assert.equal(calls.length, 4);
+			assert.equal(calls.length, 5);
 			assert.deepEqual(storeReads, ["exa", "parallel", "tavily", "firecrawl", "serpapi"]);
-			assert.deepEqual(Object.values(reads), Object.values(KEY_ENVS).map(() => 1));
+			// 每个可能计费后端解析一次；零凭据的 TinyFish 完全不进入密钥解析集合。
+			assert.deepEqual(reads, { EXA_API_KEY: 1, PARALLEL_API_KEY: 1, TAVILY_API_KEY: 1, FIRECRAWL_API_KEY: 1, SERPAPI_API_KEY: 1, TINYFISH_API_KEY: 0 });
 		});
 	});
 
@@ -142,9 +143,9 @@ test("所有匿名通道失败时逐个检查缺失 Key；未授权时绝不读�
 	await withEnv({}, async (reads) => {
 		await withFetch(providerFailure, async (calls) => {
 			await assert.rejects(noBillingTool.execute("no-billing", { query: "查询" }));
-			assert.equal(calls.length, 4);
+			assert.equal(calls.length, 5);
 			assert.deepEqual(noBillingReads, []);
-			assert.deepEqual(Object.values(reads), Object.values(KEY_ENVS).map(() => 0));
+			assert.deepEqual(reads, { EXA_API_KEY: 0, PARALLEL_API_KEY: 0, TAVILY_API_KEY: 0, FIRECRAWL_API_KEY: 0, SERPAPI_API_KEY: 0, TINYFISH_API_KEY: 0 });
 		});
 	});
 });

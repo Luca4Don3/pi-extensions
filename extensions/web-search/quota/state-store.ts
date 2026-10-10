@@ -4,7 +4,7 @@ import { lstat, mkdir, open, readdir, rename, unlink } from "node:fs/promises";
 import { randomBytes } from "node:crypto";
 import { dirname, isAbsolute, join, parse, resolve, sep } from "node:path";
 
-export type QuotaBackend = "exa" | "parallel" | "tavily" | "firecrawl" | "serpapi";
+export type QuotaBackend = "exa" | "parallel" | "tavily" | "firecrawl" | "serpapi" | "tinyfish";
 export type QuotaChannel = "anonymous" | "key";
 export type QuotaFailureReason = "rate_limited" | "quota_exhausted";
 
@@ -38,7 +38,7 @@ export interface QuotaStateStore {
 	save(state: PersistedQuotaState): Promise<QuotaStateSaveResult>;
 }
 
-const BACKENDS = new Set<QuotaBackend>(["exa", "parallel", "tavily", "firecrawl", "serpapi"]);
+const BACKENDS = new Set<QuotaBackend>(["exa", "parallel", "tavily", "firecrawl", "serpapi", "tinyfish"]);
 const REASONS = new Set<QuotaFailureReason>(["rate_limited", "quota_exhausted"]);
 const MAX_ENTRIES = 512;
 const MAX_STATE_FILES = MAX_ENTRIES;

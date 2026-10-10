@@ -1,6 +1,6 @@
 {
   "name": "@luca4don3/pi-extensions",
-  "version": "0.6.0-beta.2",
+  "version": "0.6.0-beta.3",
   "description": "A collection of Pi extensions: web-search (anonymous-first multi-provider search), subagent (delegate to isolated agents), chinese-prompt, and opencode-fallback.",
   "type": "module",
   "keywords": [
