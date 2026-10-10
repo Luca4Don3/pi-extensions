@@ -115,13 +115,20 @@ function toWebResponse(raw: import("node:http").IncomingMessage, status: number)
 	return new Response(Readable.toWeb(decodeBody(raw)) as unknown as BodyInit, { status, headers });
 }
 
-/** 带重定向与预算控制的一次完整抓取。 */
+/** 总预算的软化上限：单次请求超时已由 per-request 计时器负责，这里只兜住多次跳转累计耗时。 */
+const ABSOLUTE_TOTAL_MS = 60_000;
+/** 重定向次数上限；与配置的默认值一致，超出即失败。 */
+const MAX_REDIRECTS = 3;
+
+/** 带重定向与预算控制的一次完整抓取；每一跳都重新走完整目标校验。 */
 export async function httpFetch(input: HttpFetchRequest): Promise<HttpFetchResponse> {
 	const startedAt = Date.now();
 	const resolve = input.resolveTarget ?? resolveFetchTarget;
 	let current = input.target;
 	let redirectCount = 0;
 	let url = current.url;
+	/** 剩余预算；解析与请求都不得超出它。 */
+	const remainingMs = (): number => Math.max(1, ABSOLUTE_TOTAL_MS - (Date.now() - startedAt));
 
 	for (;;) {
 		const controller = new AbortController();
@@ -129,7 +136,7 @@ export async function httpFetch(input: HttpFetchRequest): Promise<HttpFetchRespo
 		const timer = setTimeout(() => {
 			timedOut = true;
 			controller.abort();
-		}, input.timeoutMs);
+		}, Math.min(input.timeoutMs, remainingMs()));
 		const onExternalAbort = (): void => controller.abort(input.signal?.reason);
 		if (input.signal?.aborted) {
 			clearTimeout(timer);
@@ -180,12 +187,9 @@ export async function httpFetch(input: HttpFetchRequest): Promise<HttpFetchRespo
 			clearTimeout(timer);
 			input.signal?.removeEventListener("abort", onExternalAbort);
 		}
-		if (Date.now() - startedAt > MAX_TOTAL_MS) throw new FetchError("抓取超时", "timeout");
+		if (remainingMs() <= 1) throw new FetchError("抓取超时", "timeout");
 	}
 }
-
-const MAX_REDIRECTS = 3;
-const MAX_TOTAL_MS = 20_000;
 
 /** 解析 Retry-After 的秒与 HTTP 日期两种形式。 */
 function parseRetryAfter(value: string | undefined): number | undefined {

@@ -126,6 +126,7 @@ function isBlockedIPv6(groups: number[]): boolean {
 	if (first === 0x2001 && groups[1]! === 0x0db8) return true; // 2001:db8::/32 文档
 	if ((first & 0xfe00) === 0xfc00) return true; // fc00::/7 唯一本地地址
 	if ((first & 0xffc0) === 0xfe80) return true; // fe80::/10 链路本地
+	if ((first & 0xffc0) === 0xfec0) return true; // fec0::/10 站点本地单播
 	if ((first & 0xff00) === 0xff00) return true; // ff00::/8 组播
 	if (first === 0x2002) return true; // 2002::/16 6to4（内层地址可在转换后指向私网）
 	return false;
@@ -144,9 +145,11 @@ export function isPublicIPAddress(value: string): boolean {
 
 /** 把主机名或 IP 字面量解析为已校验的公网地址。 */
 async function resolveAddress(hostname: string, signal?: AbortSignal): Promise<{ address: string; family: 4 | 6 } | undefined> {
-	const version = isIP(hostname);
+	// URL 的 IPv6 主机名带方括号，`isIP` 不能直接识别，先剥掉再判断。
+	const literal = hostname.startsWith("[") && hostname.endsWith("]") ? hostname.slice(1, -1) : hostname;
+	const version = isIP(literal);
 	if (version !== 0) {
-		return isPublicIPAddress(hostname) ? { address: hostname, family: version === 6 ? 6 : 4 } : undefined;
+		return isPublicIPAddress(literal) ? { address: literal, family: version === 6 ? 6 : 4 } : undefined;
 	}
 	const records = await lookup(hostname, { all: true, verbatim: true });
 	const usable = records.filter((record: { address: string }) => isPublicIPAddress(record.address));

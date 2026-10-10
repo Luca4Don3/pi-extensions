@@ -12,6 +12,7 @@ const loaded = await jiti.import(fileURLToPath(new URL("../index.ts", import.met
 const plugin = loaded.default ?? loaded;
 const configModule = await jiti.import(fileURLToPath(new URL("../config.ts", import.meta.url)));
 const errorsModule = await jiti.import(fileURLToPath(new URL("../errors.ts", import.meta.url)));
+const FetchErrorShim = errorsModule.FetchError;
 
 function setup(options) {
 	const tools = [];
@@ -93,6 +94,34 @@ test("注入抓取实现后返回正文与结构化 details", async () => {
 });
 
 
+
+test("重定向后的最终地址被逐跳校验，details 不暴露查询串", async () => {
+	const { tool } = setup({
+		config: () => ({ timeoutMs: 1000, maxResponseBytes: 4096, maxChars: 500, maxRedirects: 3, remoteFallback: "off" }),
+		resolveTarget: async (rawUrl) => {
+			const url = new URL(rawUrl);
+			// 只放行测试用来源，其他主机一律按安全策略拒绝。
+			if (url.hostname !== "93.184.216.34") throw new FetchErrorShim("目标不是公网地址", "blocked_url");
+			return { url, address: "93.184.216.34", family: 4 };
+		},
+		fetchPage: async (request) => {
+			if (request.url.pathname === "/signed") {
+				// 模拟一次站内重定向：带令牌的地址必须被重新校验。
+				return { body: "# 重定向后的正文", contentType: "text/markdown", finalUrl: new URL("https://93.184.216.34/doc?token=SECRET"), redirectCount: 1, statusCode: 200 };
+			}
+			throw new FetchErrorShim("unexpected", "network_error");
+		},
+	});
+	await withEnv({}, async () => {
+		const result = await tool.execute("fetch-redirect", { url: "https://93.184.216.34/signed?token=SECRET" });
+		assert.match(result.content[0].text, /重定向后的正文/u);
+		assert.equal(result.details.redirectCount, 1);
+		// 请求地址与最终地址都不得带上查询串里的令牌。
+		assert.doesNotMatch(JSON.stringify(result.details), /SECRET|token=/u);
+		assert.equal(result.details.requestedUrl, "https://93.184.216.34/signed");
+		assert.equal(result.details.finalUrl, "https://93.184.216.34/doc");
+	});
+});
 
 test("空 URL、空白 URL 与非法 maxChars 被拒绝", async () => {
 	const { tool } = setup();

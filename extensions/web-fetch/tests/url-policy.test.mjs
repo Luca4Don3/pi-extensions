@@ -26,6 +26,7 @@ const BLOCKED_IPv6 = [
 	"::", "::1", "::ffff:10.0.0.1", "::ffff:169.254.169.254", "64:ff9b::10.0.0.1", "64:ff9b::192.168.0.1",
 	"100::1", "2001::1", "2001:db8::1", "fc00::1", "fd12:3456:789a:1::1", "fe80::1", "ff02::1",
 	"2002:0a00:0001::1", "0:0:0:0:0:0:0:1", "0:0:0:0:0:0:0:0",
+	"fec0::1", "fec1:2345:6789:abcd::1", // fec0::/10 站点本地单播
 ];
 
 const ALLOWED_IPv6 = [
@@ -77,6 +78,21 @@ test("协议、内嵌凭据与非法端口在解析阶段即被拒绝", async ()
 			return true;
 		});
 	}
+});
+
+test("公网 IPv6 字面量在带方括号的 URL 中同样可用", async () => {
+	const target = await module_.resolveFetchTarget("http://[2606:4700:4700::1111]/path");
+	assert.equal(target.url.hostname, "[2606:4700:4700::1111]");
+	assert.equal(target.address, "2606:4700:4700::1111");
+	assert.equal(target.family, 6);
+	await assert.rejects(module_.resolveFetchTarget("http://[fec0::1]/"), (error) => {
+		assert.equal(error.kind, "blocked_url");
+		return true;
+	});
+	await assert.rejects(module_.resolveFetchTarget("http://[::1]/"), (error) => {
+		assert.equal(error.kind, "blocked_url");
+		return true;
+	});
 });
 
 test("空白 URL 与大小写协议被规范化为合法目标", async () => {

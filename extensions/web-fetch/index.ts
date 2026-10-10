@@ -68,6 +68,8 @@ export default function piWebFetch(pi: ExtensionAPI, options: WebFetchOptions = 
 			}
 			// 先做完整的目标校验，再决定是否发起任何连接。
 			const resolveTarget = options.resolveTarget ?? resolveFetchTarget;
+			// details 一律只保留来源与路径：签名 URL、令牌等查询参数不得进入对外结果。
+			const safeUrl = (value: URL): string => `${value.origin}${value.pathname}`;
 			const target = await resolveTarget(url);
 			if (signal?.aborted) throw new FetchError("操作已取消", "aborted");
 
@@ -77,7 +79,8 @@ export default function piWebFetch(pi: ExtensionAPI, options: WebFetchOptions = 
 				signal: request.signal,
 				timeoutMs: request.timeoutMs,
 				maxResponseBytes: request.maxResponseBytes,
-				resolveTarget: async () => target,
+				// 后续每一跳都重新走完整校验；首跳目标已在上面校验过。
+				resolveTarget,
 			}).then((result) => ({
 				body: result.body,
 				contentType: result.headers["content-type"] ?? "",
@@ -94,8 +97,8 @@ export default function piWebFetch(pi: ExtensionAPI, options: WebFetchOptions = 
 			return {
 				content: [{ type: "text", text: text.length > 0 ? text : "（未提取到正文）" }],
 				details: {
-					requestedUrl: url,
-					finalUrl: fetched.finalUrl.toString(),
+					requestedUrl: safeUrl(target.url),
+					finalUrl: safeUrl(fetched.finalUrl),
 					contentType: fetched.contentType,
 					statusCode: fetched.statusCode,
 					redirectCount: fetched.redirectCount,
