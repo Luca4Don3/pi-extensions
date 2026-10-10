@@ -11,6 +11,7 @@
 | 插件 | 目录 | 安装 | 作用 |
 | --- | --- | --- | --- |
 | Web Search | `extensions/web-search/` | `pi install ~/pi-extensions/extensions/web-search` | 原生 `web_search` 工具：Exa → Tavily → Parallel → Firecrawl → TinyFish 匿名路由与额度预检；SerpApi 保留为需显式授权的密钥后端 |
+| Web Fetch | `extensions/web-fetch/` | `pi install ~/pi-extensions/extensions/web-fetch` | 原生 `web_fetch` 工具：本地优先抓取公开网页并输出可读 Markdown；SSRF 防护、有界响应体、逐跳重定向校验 |
 | Subagent | `extensions/subagent/` | `pi install ~/pi-extensions/extensions/subagent` | 把任务委派给独立上下文的子 agent（single / parallel / chain） |
 | Chinese Prompt | `extensions/chinese-prompt/` | `pi install ~/pi-extensions/extensions/chinese-prompt` | 注入中文强约束 system prompt，推理与输出全程简体中文 |
 | OpenCode Fallback | `extensions/opencode-fallback/` | `pi install ~/pi-extensions/extensions/opencode-fallback` | GPT/Grok/Muse/Claude 固定走代理，其余模型直连优先、失败回退 |
@@ -23,6 +24,15 @@ pi-extensions/
 │   ├── web-search/
 │   │   ├── index.ts              # 扩展入口与搜索执行
 │   │   ├── response-body.ts      # 响应体流式解码与字节上限
+│   │   └── quota/                 # 额度预检、成本估算与私有状态持久化
+│   ├── web-fetch/
+│   │   ├── index.ts               # web_fetch 工具注册与抓取流程
+│   │   ├── config.ts              # 环境变量读取与严格校验
+│   │   ├── errors.ts              # 抓取错误分类
+│   │   ├── params.ts              # 工具参数表
+│   │   ├── transport/             # URL 策略、HTTP 传输、有界响应解码
+│   │   ├── extract/               # HTML / Markdown / 纯文本 / JSON 正文提取
+│   │   └── tests/
 │   │   ├── search/
 │   │   │   ├── registry.ts       # provider ID、环境变量与匿名能力元数据
 │   │   │   ├── protocol.ts       # REST provider 共用协议
@@ -290,9 +300,11 @@ Pi 的内置工具只有 `read` / `bash` / `edit` / `write` / `grep` / `find` / 
 
 > **与 npm 上同名包 `pi-web-search` 的区别**：本扩展直接连接 Exa / Parallel 的远程模型上下文协议（Model Context Protocol，MCP）端点，并通过原生 REST 接口调用 Tavily、Firecrawl 与 SerpApi。本扩展不发布到 npm，只通过上面的 GitHub 安装方式分发。
 
-## 状态：v0.6.0-beta.3
+## 状态：v0.7.0-beta.1
 
 本轮新增混合额度管理（Quota Manager）与按原因区分的持久冷却，并把匿名候选顺序调整为 **Exa → Tavily → Parallel → Firecrawl → TinyFish（keyless）**；计费候选顺序独立维护，Exa 仍排第一。仍然不新增搜索 provider、不做质量评分或结果融合，也不添加 `web_fetch`。
+
+本轮新增独立扩展 `web-fetch`：本地优先的 `web_fetch` 工具，读取公开网页并输出可读 Markdown，自带 SSRF 防护与有界响应处理。搜索与抓取是两个独立安装、独立测试的扩展，互不强依赖。
 
 **TinyFish 只接入零凭据 keyless 匿名通道。** 该通道位于 MCP 端点，不需要任何 API Key 或 OAuth，服务端自述限额为 30 请求/分钟、每日 50 次搜索。官方文档对其认证通道「超出每日额度后是否扣减钱包余额」的说法相互矛盾且无法验证，因此本轮不实现认证通道，也不把配置 `TINYFISH_API_KEY` 视为免费。
 
@@ -359,6 +371,10 @@ Pi 的内置工具只有 `read` / `bash` / `edit` / `write` / `grep` / `find` / 
 | `PI_WEB_SEARCH_FREE_COOLDOWN_MS` | 未设置 | 显式设置时作为固定冷却覆盖全部通道；接受 `0` 至 `86400000` 的安全整数，`0` 禁用冷却，非法值报错。未设置时按原因阶梯退避（见下） |
 | `PI_WEB_SEARCH_MAX_RESPONSE_BYTES` | `5242880` | 解压后响应体上限，默认 5 MiB；只接受十进制正整数 `1` 至 `20971520`（20 MiB），首尾空白允许，非法配置在读取凭据或请求前报错 |
 | `PI_WEB_SEARCH_TIMEOUT_MS` | `25000` | 单次请求预算，最小 `100` 毫秒 |
+| `PI_WEB_FETCH_TIMEOUT_MS` | `20000` | `web_fetch` 单次抓取预算，最小 `100` 毫秒，最大 `60000` |
+| `PI_WEB_FETCH_MAX_RESPONSE_BYTES` | `5242880` | `web_fetch` 解压后响应体上限，`1` 至 `20971520`（20 MiB） |
+| `PI_WEB_FETCH_MAX_CHARS` | `24000` | `web_fetch` 返回给模型的正文上限，`1` 至 `200000` |
+| `PI_WEB_FETCH_MAX_REDIRECTS` | `3` | `web_fetch` 手动跟随的重定向次数，`1` 至 `5`，每一跳都重新校验目标 |
 | `PI_WEB_SEARCH_RETRIES` | `1` | 可重试错误的重试次数，`0` 表示不重试；单次退避等待最多 5 秒 |
 
 默认拒绝所有密钥通道时，搜索不会读取任何 provider 密钥环境变量或系统密钥库。所有已配置密钥均按可能计费处理；本轮只查询余额，不从余额推断免费资格，也不构造 `free-key` 通道。Firecrawl 请求与计费说明见[搜索文档](https://docs.firecrawl.dev/features/search)和[计费文档](https://docs.firecrawl.dev/billing)。
@@ -504,7 +520,7 @@ node extensions/web-search/tests/smoke.mjs
 node extensions/web-search/tests/smoke.mjs --billable
 ```
 
-普通冒烟脚本（smoke）会强制 `PI_WEB_SEARCH_ALLOW_BILLABLE=false` 并清除旧别名；`--billable` 还要求当前配置已明确授权且不存在路由冲突，运行时仍匿名优先，仅允许在匿名失败后计费回退，可能产生费用且不会打印密钥值。四家匿名通道及 `auto` 在 `v0.5.0-beta.1` 已通过一次真实网络冒烟；`v0.6.0-beta.3` 又对 TinyFish keyless 单独冒烟一次并确认零凭据。这些只验证端点可用性，不代表质量排名或长期成功率。离线语法检查可用 `node --check extensions/web-search/tests/smoke.mjs`，不触网；任何离线测试都不代表真实系统 Keychain 写入已验证。本地依赖 `jiti` 与 `typebox`，Pi 自带这两个包，指向本机 Pi 安装即可：
+普通冒烟脚本（smoke）会强制 `PI_WEB_SEARCH_ALLOW_BILLABLE=false` 并清除旧别名；`--billable` 还要求当前配置已明确授权且不存在路由冲突，运行时仍匿名优先，仅允许在匿名失败后计费回退，可能产生费用且不会打印密钥值。四家匿名通道及 `auto` 在 `v0.5.0-beta.1` 已通过一次真实网络冒烟；`v0.6.0-beta.3` 又对 TinyFish keyless 单独冒烟一次并确认零凭据。这些只验证端点可用性，不代表质量排名或长期成功率。`web_fetch` 冒烟脚本（`node extensions/web-fetch/tests/smoke.mjs`）访问若干公开网页并验证 11 类 SSRF 目标被拦截，不读取任何密钥。离线语法检查可用 `node --check extensions/web-search/tests/smoke.mjs`，不触网；任何离线测试都不代表真实系统 Keychain 写入已验证。本地依赖 `jiti` 与 `typebox`，Pi 自带这两个包，指向本机 Pi 安装即可：
 
 ```bash
 mkdir -p node_modules/@earendil-works
@@ -526,13 +542,15 @@ CI（`.github/workflows/ci.yml`）固定安装 `@earendil-works/pi-coding-agent@
 - Tavily 与 Firecrawl 的额度查询只用于判断“本次是否付得起”，不代表免费额度；Exa、Parallel、SerpApi 没有可用余额接口，只依据历史冷却
 - 额度状态持久化只保存作用域标识与冷却元数据；本地请求计数无法覆盖同一账户的其他客户端，也不替代服务商侧的账单与硬性费用上限
 - 搜索结果质量由后端决定；当前首个可用结果即返回，不实施 quality-first 或质量不足后的跨 provider 决策
-- 当前只有 `web_search`，没有网页正文抓取工具（`web_fetch`）
+- `web_fetch` 是规则式 HTML 提取，不执行 JavaScript、不渲染页面；依赖 JS 渲染的站点可能只能拿到导航等少量内容
+- `web_fetch` 不支持 PDF、登录页、Cookie 与验证码，也不解析抓取结果中的内联指令
 
 ## 路线图
 
 - 免费认证层：仅在能验证账户不会超额计费时，才把免费账户密钥纳入免费候选池；当前余额接口不足以证明，暂不启用
 - 质量感知的跨 provider 后备策略；评估 RRF 与 benchmark 前先明确方法和复现条件，目前均未实现
-- `web_fetch`：读取指定 URL 的正文，进一步减少对 `curl` 的依赖
+- `web_fetch` 远程回退暂缓：Jina Reader keyless 会把目标 URL 发送给第三方，默认关闭且需使用者主动开启；本轮不实现，也不把付费抓取服务纳入默认路径
+- `web_fetch` 提取质量优化：按站点类型细化正文容器规则，或评估引入成熟正文提取库；不引入浏览器渲染
 - 结果缓存与进一步的 provider 模块整理；本轮并非完整 MCP 模块迁移
 - TinyFish 认证通道暂缓：其 API Reference 的 Billing 段写「每日 12,000 次后需要钱包正余额，否则 402」，而定价页与公告写「Search 永不扣钱包、$0 余额仍可用」，两处口径矛盾且无法验证。keyless 匿名通道没有账户，因此不存在扣费风险，本轮只接入它。见 [Search API Reference](https://docs.tinyfish.ai/search-api/reference) 与 [Pricing](https://www.tinyfish.ai/pricing)。
 - TinyFish keyless 限额小且可能为共享池：服务端自述 30 请求/分钟、每日 50 次搜索，其他 keyless 客户端会消耗同一额度。它排在匿名候选最后，仅作补充；冷却只能跳过本机已知被限流的时刻，不能反映真实剩余额度。

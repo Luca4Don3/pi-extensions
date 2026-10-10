@@ -184,7 +184,9 @@ export function htmlToMarkdown(html: string): ExtractionBase {
 	const withLists = listItems(withHeadings);
 	const withLinks = links(withLists);
 	const withInlineCode = inlineCode(withLinks);
-	const markdown = tidy(blockify(withInlineCode));
+	// 最后统一清掉仍未识别的标签（例如 void 元素与 head 残留），此时代码块与表格
+	// 已转成 Markdown，不会被误伤。
+	const markdown = tidy(stripTags(blockify(withInlineCode)));
 	const title = extractTitle(cleaned);
 	return { ...(title === undefined ? {} : { title }), markdown };
 }
