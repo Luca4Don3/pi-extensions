@@ -22,6 +22,10 @@ for (const key of [
 	"PI_WEB_SEARCH_ROUTING",
 	"PI_WEB_SEARCH_ALLOW_BILLABLE",
 	"PI_WEB_SEARCH_ALLOW_PAID",
+	"PI_WEB_SEARCH_FREE_COOLDOWN_MS",
+	"PI_WEB_SEARCH_TIMEOUT_MS",
+	"PI_WEB_SEARCH_RETRIES",
+	"PI_WEB_SEARCH_MAX_RESPONSE_BYTES",
 ]) {
 	delete process.env[key];
 }
@@ -66,9 +70,19 @@ function setup(store = fakeStore(), options = {}) {
 
 /** 注入环境变量，结束后恢复原值（含删除此前不存在的键）。 */
 async function withEnv(vars, fn) {
+	const merged = {
+		PI_WEB_SEARCH_ROUTING: "free-first",
+		PI_WEB_SEARCH_ALLOW_BILLABLE: undefined,
+		PI_WEB_SEARCH_ALLOW_PAID: undefined,
+		PI_WEB_SEARCH_FREE_COOLDOWN_MS: "0",
+		PI_WEB_SEARCH_RETRIES: "0",
+		PI_WEB_SEARCH_TIMEOUT_MS: "25000",
+		PI_WEB_SEARCH_MAX_RESPONSE_BYTES: undefined,
+		...vars,
+	};
 	const saved = {};
-	for (const key of Object.keys(vars)) saved[key] = process.env[key];
-	for (const [key, value] of Object.entries(vars)) {
+	for (const key of Object.keys(merged)) saved[key] = process.env[key];
+	for (const [key, value] of Object.entries(merged)) {
 		if (value === undefined) delete process.env[key];
 		else process.env[key] = String(value);
 	}
@@ -85,7 +99,18 @@ async function withEnv(vars, fn) {
 /** 替换 globalThis.fetch，结束后恢复。 */
 async function withFetch(impl, fn) {
 	const original = globalThis.fetch;
-	globalThis.fetch = impl;
+	const usageCalls = []; // 额度 GET 独立记录并返回 fixture，不交给搜索回调。
+	globalThis.fetch = (url, init) => {
+		const address = String(url);
+		if (init?.method === "GET" && (address === "https://api.tavily.com/usage" || address === "https://api.firecrawl.dev/v2/team/credit-usage")) {
+			usageCalls.push({ url: address, init });
+			const body = address === "https://api.tavily.com/usage"
+				? { key: { usage: 0, limit: 1000 }, account: { plan_usage: 0, plan_limit: 1000, paygo_usage: 0, paygo_limit: 0 } }
+				: { success: true, data: { remainingCredits: 1000 } };
+			return Promise.resolve(new Response(JSON.stringify(body), { headers: { "content-type": "application/json" } }));
+		}
+		return impl(url, init);
+	};
 	try {
 		return await fn();
 	} finally {
@@ -256,7 +281,7 @@ test("auth: Exa key 进入 URL，每次搜索只读一次密钥库", async () =>
 		},
 	});
 	const { tool } = setup(store);
-	await withEnv({ EXA_API_KEY: undefined, PARALLEL_API_KEY: undefined, PI_WEB_SEARCH_RETRIES: "0", PI_WEB_SEARCH_ROUTING: "key-first", PI_WEB_SEARCH_ALLOW_BILLABLE: "true" }, async () => {
+	await withEnv({ EXA_API_KEY: undefined, PARALLEL_API_KEY: undefined, PI_WEB_SEARCH_RETRIES: "0", PI_WEB_SEARCH_ROUTING: "free-first", PI_WEB_SEARCH_ALLOW_BILLABLE: "true" }, async () => {
 		const seen = [];
 		await withFetch(
 			async (url) => {
@@ -267,9 +292,9 @@ test("auth: Exa key 进入 URL，每次搜索只读一次密钥库", async () =>
 				await assert.rejects(tool.execute("a9", EXA_PARAMS, undefined, undefined, {}));
 			},
 		);
-		assert.equal(reads, 1, "provider=exa 只应读取一次密钥库");
-		assert.ok(seen[0].includes(`exaApiKey=${encodeURIComponent(SECRET)}`));
-		assert.ok(!seen[1].includes("exaApiKey"), "免 key 通道不带凭据");
+		assert.equal(reads, 1, "匿名失败后 provider=exa 才解析一次密钥库");
+		assert.ok(!seen[0].includes("exaApiKey"), "匿名阶段不得携带凭据");
+		assert.ok(seen[1].includes(`exaApiKey=${encodeURIComponent(SECRET)}`));
 	});
 });
 
@@ -279,24 +304,20 @@ test("auth: Parallel key 从密钥库进入 Authorization 头", async () => {
 		read: async (backend) => (backend === "parallel" ? { status: "found", value: "parallel-store-key" } : { status: "missing" }),
 	});
 	const { tool } = setup(store);
-	await withEnv({ EXA_API_KEY: undefined, PARALLEL_API_KEY: undefined, PI_WEB_SEARCH_ROUTING: "key-first", PI_WEB_SEARCH_ALLOW_BILLABLE: "true" }, async () => {
+	await withEnv({ EXA_API_KEY: undefined, PARALLEL_API_KEY: undefined, PI_WEB_SEARCH_ROUTING: "free-first", PI_WEB_SEARCH_ALLOW_BILLABLE: "true" }, async () => {
 		const seen = [];
 		await withFetch(
 			async (_url, init) => {
 				seen.push(init?.headers?.authorization);
-				if (init?.headers?.authorization !== undefined) return new Response("nope", { status: 401 });
-				return new Response(
-					JSON.stringify({ result: { content: [{ type: "text", text: "Title: T\nURL: https://example.com/a" }] } }),
-					{ status: 200 },
-				);
+				if (init?.headers?.authorization !== undefined) return new Response("invalid api key", { status: 401 });
+				return new Response("anonymous unavailable", { status: 503 });
 			},
 			async () => {
-				const result = await tool.execute("a10", { query: "q", provider: "parallel" }, undefined, undefined, {});
-				assert.equal(result.details.channel, "free");
+				await assert.rejects(tool.execute("a10", { query: "q", provider: "parallel" }, undefined, undefined, {}), /401/u);
 			},
 		);
-		assert.equal(seen[0], "Bearer parallel-store-key");
-		assert.equal(seen[1], undefined);
+		assert.equal(seen[0], undefined, "先尝试匿名通道");
+		assert.equal(seen[1], "Bearer parallel-store-key");
 	});
 });
 
@@ -324,13 +345,13 @@ test("auth: 网络错误不泄露 key（原文与 URL 编码）", async () => {
 	});
 });
 
-// 12. HTTP / MCP 错误回显 key 时，fallbackReason 与最终 throw 都要脱敏。
-test("auth: HTTP / MCP 回显 key 时 fallbackReason 与最终 throw 均脱敏", async () => {
+// 12. 只有实际读取的 key 才进入错误脱敏范围，HTTP / MCP 回显都不得泄漏。
+test("auth: 匿名失败后读取的 Key 在 HTTP / MCP 回显中均脱敏", async () => {
 	const store = fakeStore({
 		read: async (backend) => (backend === "exa" ? { status: "found", value: SECRET } : { status: "missing" }),
 	});
-	await withEnv({ EXA_API_KEY: undefined, PARALLEL_API_KEY: undefined, PI_WEB_SEARCH_RETRIES: "0", PI_WEB_SEARCH_ROUTING: "key-first", PI_WEB_SEARCH_ALLOW_BILLABLE: "true" }, async () => {
-		// 12a. Key 通道 500 回显 key，free 成功 → details.fallbackReason 不含 key.
+	await withEnv({ EXA_API_KEY: undefined, PARALLEL_API_KEY: undefined, PI_WEB_SEARCH_RETRIES: "0", PI_WEB_SEARCH_ROUTING: "free-first", PI_WEB_SEARCH_ALLOW_BILLABLE: "true" }, async () => {
+		// 12a. 匿名失败后读取 Key；Key 通道 500 回显时最终错误不得泄漏 key。
 		{
 			const { tool } = setup(store);
 			await withFetch(
@@ -338,22 +359,18 @@ test("auth: HTTP / MCP 回显 key 时 fallbackReason 与最终 throw 均脱敏",
 					if (String(url).includes("exaApiKey")) {
 						return new Response(JSON.stringify({ error: { message: `quota exhausted for ${SECRET}` } }), { status: 500 });
 					}
-					return new Response(
-						JSON.stringify({ result: { content: [{ type: "text", text: "Title: T\nURL: https://example.com/a" }] } }),
-						{ status: 200 },
-					);
+					return new Response("anonymous unavailable", { status: 503 });
 				},
 				async () => {
-					const result = await tool.execute("a12a", EXA_PARAMS, undefined, undefined, {});
-					assert.equal(result.details.channel, "free");
-					const serialized = JSON.stringify(result.details);
-					assert.ok(!serialized.includes(SECRET), "details 不应泄露 key");
-					assert.ok(!String(result.details.fallbackReason).includes(SECRET));
-					assert.match(String(result.details.fallbackReason), /\*\*\*/);
+					await assert.rejects(tool.execute("a12a", EXA_PARAMS, undefined, undefined, {}), (error) => {
+						assert.ok(!String(error.message).includes(SECRET), "最终错误不应泄露已读取的 key");
+						assert.match(String(error.message), /\*\*\*/);
+						return true;
+					});
 				},
 			);
 		}
-		// 12b. 两个通道都失败 → 最终 throw 也不含 key（含 MCP isError 回显）。
+		// 12b. 匿名与授权通道都失败 → 最终 throw 不含 MCP isError 回显的 key。
 		{
 			const { tool } = setup(store);
 			await withFetch(
@@ -624,7 +641,7 @@ test("auth-ui: 路由菜单读取插件共享的搜索通道健康状态", async
 			const ctx = fakeCtx({ selections: ["查看路由与冷却状态"] });
 			await authCommand.handler("", ctx);
 			const message = ctx.notes.map((note) => note.message).join("\n");
-			assert.match(message, /exa（免费通道）：冷却剩余约 5 秒/u);
+			assert.match(message, /exa（匿名通道，限流）：冷却剩余约 5 秒/u);
 			assert.ok(!message.includes(SECRET));
 		},
 	);

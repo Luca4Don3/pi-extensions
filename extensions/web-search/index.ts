@@ -8,7 +8,7 @@
  * 设计要点：
  * - 单请求预算可注入（默认 25 秒），外部取消信号会被转发且立即生效。
  * - 响应体既可能是直接 JSON，也可能是 SSE（`data:` 事件块），两种都解析。
- * - 默认匿名顺序为 Parallel → Exa → Tavily → Firecrawl；默认拒绝可能计费的通道。
+ * - 所有匿名通道先于所有 Key 通道；默认禁止计费，所有真实 Key 均按可能计费处理。
  * - 失败按错误类型决策：额度/鉴权直接换通道，限流与 5xx 退避重试，取消立即终止。
  * - 模型可见正文截断到 MAX_TEXT_CHARS，原文落盘供模型按需 read。
  * - Exa / Parallel key 解析顺序：环境变量优先，其次系统密钥库
@@ -21,7 +21,7 @@
 import { mkdir, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { getAgentDir, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { createSecretStore, type SecretStore } from "./credentials.js";
 import {
@@ -33,8 +33,10 @@ import {
 	type Backend,
 } from "./auth.js";
 import { registerAuthCommand } from "./auth-ui.js";
-import { createChannelHealth, type ChannelHealth } from "./channel-health.js";
-import { buildRoutePlan, getRoutingStatus, readRoutingConfig, type Provider, type RoutingStep } from "./routing.js";
+import type { ChannelHealth } from "./channel-health.js";
+import { buildRouteCandidates, getRoutingStatus, readRoutingConfig, type Provider, type RoutingConfig, type RoutingStep } from "./routing.js";
+import { createQuotaManager, type QuotaChannel, type QuotaFailureReason } from "./quota/core.js";
+import { createPrivateQuotaStateStore } from "./quota/state-store.js";
 import {
 	BackendError,
 	errorDetailFrom,
@@ -72,7 +74,7 @@ const SPILL_KEEP_FILES = 20;
 /** 落盘目录名（位于系统临时目录下，不进入任何公开目录）。 */
 const SPILL_DIR_NAME = "pi-web-search";
 /** 归属标识，便于端点侧识别调用方。 */
-const USER_AGENT = "pi-web-search/0.5.0-beta.2";
+const USER_AGENT = "pi-web-search/0.6.0-beta.1";
 
 /** 一次尝试：某个后端的某个通道。 */
 interface RouteStep extends RoutingStep {
@@ -109,7 +111,7 @@ const WebSearchParams = Type.Object({
 	),
 	provider: Type.Optional(
 		Type.Union([Type.Literal("auto"), ...PROVIDER_IDS.map((backend) => Type.Literal(backend))], {
-			description: "Search backend. auto (default) tries anonymous Parallel, Exa, Tavily, then Firecrawl. Key channels require explicit billable authorization.",
+			description: "先按固定顺序尝试所有匿名通道；仅在显式授权后逐个尝试可能计费的 Key 通道。",
 		}),
 	),
 });
@@ -151,8 +153,8 @@ function readIntEnv(name: string, fallback: number, min: number): number {
 
 /** 解析 Retry-After（秒数或 HTTP 日期）；原值用于冷却，重试等待另行限幅。 */
 function parseRetryAfter(value: string | null): number | undefined {
-	if (value === null) return undefined;
-	const seconds = Number(value);
+	if (value === null || value.trim().length === 0) return undefined;
+	const seconds = Number(value.trim());
 	if (Number.isFinite(seconds) && seconds >= 0) return Math.min(Math.ceil(seconds * 1000), Number.MAX_SAFE_INTEGER);
 	const at = Date.parse(value);
 	if (Number.isNaN(at)) return undefined;
@@ -177,6 +179,79 @@ function createAbortError(): DOMException {
 /** 取消状态可在异步等待期间改变，每次检查都重新读取。 */
 function isAborted(signal?: AbortSignal): boolean {
 	return signal?.aborted === true;
+}
+
+/** 可取消等待不遵守信号的状态加载，并始终消费其迟到拒绝。 */
+function waitForAbort<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T> {
+	if (signal === undefined) return promise;
+	if (signal.aborted) {
+		void promise.catch(() => undefined);
+		return Promise.reject(createAbortError());
+	}
+	return new Promise((resolve, reject) => {
+		let settled = false;
+		const finish = (callback: () => void): void => {
+			if (settled) return;
+			settled = true;
+			signal.removeEventListener("abort", onAbort);
+			callback();
+		};
+		const onAbort = (): void => finish(() => reject(createAbortError()));
+		signal.addEventListener("abort", onAbort, { once: true });
+		Promise.resolve(promise).then(
+			(value) => finish(() => resolve(value)),
+			(error) => finish(() => reject(error)),
+		);
+		if (signal.aborted) onAbort();
+	});
+}
+
+class QuotaPreflightError extends BackendError {
+	constructor(readonly reason: string) {
+		super("额度预检未通过，未发送搜索请求", "quota_preflight");
+	}
+}
+
+/** 额度预检失败原因映射为固定中文诊断；不含任何凭据或上游原文。 */
+function quotaPreflightMessage(reason: string): string {
+	switch (reason) {
+		case "cooldown":
+			return "额度通道冷却中，未发送搜索请求";
+		case "insufficient_credits":
+			return "当前余额不足以支付本次搜索，未发送搜索请求";
+		case "authorization_required":
+			return "缺少计费授权，未发送搜索请求";
+		case "unsupported_operation":
+			return "该后端没有可估算的额度成本，未发送搜索请求";
+		case "rate_limited":
+			return "额度查询被限流，未发送搜索请求";
+		case "invalid_response":
+			return "额度查询响应不可用，未发送搜索请求";
+		case "lookup_failed":
+			return "额度查询失败，未发送搜索请求";
+		default:
+			return "额度状态未知，未发送搜索请求";
+	}
+}
+
+/** 超时或外部取消时立即返回，并消费不遵守 AbortSignal 的迟到网络结果。 */
+function waitForControllerAbort<T>(promise: Promise<T>, controller: AbortController): Promise<T> {
+	return new Promise((resolve, reject) => {
+		let settled = false;
+		const finish = (callback: () => void): void => {
+			if (settled) return;
+			settled = true;
+			controller.signal.removeEventListener("abort", onAbort);
+			callback();
+		};
+		const onAbort = (): void => finish(() => reject(createAbortError()));
+		controller.signal.addEventListener("abort", onAbort, { once: true });
+		Promise.resolve(promise).then(
+			(value) => finish(() => resolve(value)),
+			(error) => finish(() => reject(error)),
+		);
+		if (controller.signal.aborted) onAbort();
+	});
 }
 
 /** 后端错误信息不再在内部预截断：截断必须发生在脱敏之后（见 safeDiagnostic）。 */
@@ -460,15 +535,56 @@ function renderOutcome(query: string, outcome: SearchOutcome, spill?: SpillResul
 	return `${heading}\n\n${body.slice(0, MAX_TEXT_CHARS)}\n\n[content truncated to ${MAX_TEXT_CHARS} chars${note}]`;
 }
 
+interface QuotaSearchContext {
+	manager: ReturnType<typeof createQuotaManager>;
+	config: RoutingConfig;
+	legacyHealth?: ChannelHealth;
+	persistenceWarnings: Set<string>;
+}
+
+function quotaChannel(channel: RouteStep["channel"]): QuotaChannel {
+	return channel === "free" ? "anonymous" : "key";
+}
+
+async function flushQuotaState(context: QuotaSearchContext, signal?: AbortSignal): Promise<void> {
+	const pending = Promise.resolve().then(() => context.manager.flush());
+	const result = await waitForAbort(pending, signal);
+	if (result.status === "degraded") context.persistenceWarnings.add(result.reason ?? "QUOTA_STATE_IO_UNAVAILABLE");
+}
+
+async function recordQuotaFailure(
+	context: QuotaSearchContext,
+	step: RouteStep,
+	reason: QuotaFailureReason,
+	signal?: AbortSignal,
+	retryAfterMs?: number,
+	managerAlreadyRecorded = false,
+): Promise<void> {
+	const channel = quotaChannel(step.channel);
+	if (!managerAlreadyRecorded) {
+		context.manager.recordFailure(step.backend, channel, reason, {
+			...(step.apiKey === undefined ? {} : { credential: step.apiKey }),
+			...(context.config.cooldownOverrideMs === undefined ? {} : { cooldownMs: context.config.cooldownOverrideMs }),
+			...(retryAfterMs === undefined ? {} : { retryAfterMs }),
+		});
+	}
+	context.legacyHealth?.recordFailure(step.backend, step.channel, reason, {
+		cooldownMs: context.config.cooldownOverrideMs ?? context.config.freeCooldownMs,
+		...(retryAfterMs === undefined ? {} : { retryAfterMs }),
+	});
+	await flushQuotaState(context, signal);
+}
+
 /**
- * 在单个通道上执行搜索：限流 / 5xx / 网络抖动按指数退避重试，
- * 其余错误立即抛出交给路由层决定换通道还是换后端。
+ * 在单个通道上执行搜索：每个已 dispatch 请求单独预留额度；限流立即冷却，
+ * 仅网络、5xx 按指数退避重试，其余错误交给路由层。
  */
 async function searchChannel(
 	step: RouteStep,
 	query: string,
 	numResults: number,
 	maxResponseBytes: number,
+	quotaContext: QuotaSearchContext,
 	signal?: AbortSignal,
 ): Promise<{ text: string; sources: WebSource[]; attempts: number }> {
 	// 每次调用时读取，便于测试注入（PI_WEB_SEARCH_TIMEOUT_MS / PI_WEB_SEARCH_RETRIES）。
@@ -509,6 +625,8 @@ async function searchChannel(
 
 	/** 执行一次请求；失败一律以带分类的 BackendError 抛出。 */
 	const attempt = async (): Promise<{ text: string; sources: WebSource[] }> => {
+		let reservation: { dispatch(): boolean; release(): boolean; settle(actualCost?: number): boolean } | undefined;
+		let dispatched = false;
 		// 一个控制器同时承担调用方取消与超时预算：预算耗尽算超时，调用方取消按取消处理。
 		const controller = new AbortController();
 		let timedOut = false;
@@ -534,12 +652,72 @@ async function searchChannel(
 							headers,
 							body: JSON.stringify(payload),
 						};
-			const response = await fetch(request.url, {
+			const credential = channel === "key" ? step.apiKey : undefined;
+			const cooldownOverride = quotaContext.config.cooldownOverrideMs;
+			const activeCooldown = quotaContext.manager.getCooldown(
+				backend,
+				quotaChannel(channel),
+				credential,
+				cooldownOverride,
+			);
+			if (activeCooldown !== undefined) throw new QuotaPreflightError("cooldown");
+			if (channel === "key" && (backend === "tavily" || backend === "firecrawl")) {
+				if (credential === undefined) throw new QuotaPreflightError("authorization_required");
+				const balance = await quotaContext.manager.lookupBalance({
+					backend,
+					channel: "key",
+					credential,
+					allowBillable: true,
+					signal: controller.signal,
+					maxResponseBytes,
+					...(quotaContext.config.cooldownOverrideMs === undefined ? {} : { cooldownOverrideMs: quotaContext.config.cooldownOverrideMs }),
+				});
+				if (isAborted(signal)) throw createAbortError();
+				if (timedOut) throw new BackendError(`${backend} timed out before dispatch`, "timeout");
+				if (balance.state === "unknown") {
+					if (balance.reason === "rate_limited") {
+						await recordQuotaFailure(quotaContext, step, "rate_limited", signal, balance.retryAfterMs, true);
+					}
+					throw new QuotaPreflightError(balance.reason);
+				}
+				if (balance.remaining === 0) {
+					await recordQuotaFailure(quotaContext, step, "quota_exhausted", signal, undefined, true);
+					throw new QuotaPreflightError("insufficient_credits");
+				}
+				const result = quotaContext.manager.reserve({
+					backend,
+					channel: "key",
+					credential,
+					allowBillable: true,
+					operation: "search",
+					maxResults: numResults,
+					...(quotaContext.config.cooldownOverrideMs === undefined ? {} : { cooldownOverrideMs: quotaContext.config.cooldownOverrideMs }),
+				});
+				if (result.status === "denied") {
+					// 单次搜索预估开销高于余额不等于额度耗尽：不据此刻冷却，避免阻断更省额度的后续搜索。
+					throw new QuotaPreflightError(result.reason);
+				}
+				reservation = result.reservation;
+			}
+			if (isAborted(signal)) throw createAbortError();
+			if (timedOut) throw new BackendError(`${backend} timed out before dispatch`, "timeout");
+			const finalCooldown = quotaContext.manager.getCooldown(
+				backend,
+				quotaChannel(channel),
+				credential,
+				quotaContext.config.cooldownOverrideMs,
+			);
+			if (finalCooldown !== undefined) throw new QuotaPreflightError("cooldown");
+			if (reservation !== undefined && !reservation.dispatch()) throw new QuotaPreflightError("unknown_balance");
+			dispatched = true;
+			const pendingFetch = Promise.resolve().then(() => fetch(request.url, {
 				method: request.method,
 				headers: request.headers,
 				body: request.body,
 				signal: controller.signal,
-			});
+			}));
+			void pendingFetch.catch(() => undefined);
+			const response = await waitForControllerAbort(pendingFetch, controller);
 			if (!response.ok) {
 				let detail = "";
 				try {
@@ -550,7 +728,7 @@ async function searchChannel(
 					if (isAborted(signal)) throw createAbortError();
 					if (timedOut) throw error;
 					if (error instanceof BackendError && error.kind === "response_too_large") throw error;
-					// 普通正文读取或 JSON 解析失败时，仍以已知 HTTP 状态码分类。
+					// 正文超限优先于状态分类；普通读取或解析失败仍按已知状态码分类。
 				}
 				const kind = apiHttpKind(backend, response.status, detail);
 				const retryAfterMs = kind === "rate_limited" ? parseRetryAfter(response.headers.get("retry-after")) : undefined;
@@ -579,24 +757,41 @@ async function searchChannel(
 			return { text, sources };
 		} catch (error) {
 			if (isAborted(signal)) throw createAbortError();
-			if (timedOut) throw new BackendError(`${backend} timed out after ${timeoutMs}ms`, "timeout");
-			if (error instanceof BackendError) throw error;
-			// fetch 网络层错误（DNS、连接重置等）值得重试。
-			throw new BackendError(`${backend} request failed: ${String(error)}`, "network_error");
+			const failure = timedOut
+				? new BackendError(`${backend} timed out after ${timeoutMs}ms`, "timeout")
+				: error instanceof BackendError
+					? error
+					: new BackendError(`${backend} request failed: ${String(error)}`, "network_error");
+			if (dispatched) {
+				failure.attempts = 1;
+				if (failure.kind === "rate_limited") {
+					await recordQuotaFailure(quotaContext, step, "rate_limited", signal, failure.retryAfterMs);
+				} else if (failure.kind === "quota_exhausted") {
+					await recordQuotaFailure(quotaContext, step, "quota_exhausted", signal);
+				}
+			}
+			throw failure;
 		} finally {
 			clearTimeout(timer);
 			signal?.removeEventListener("abort", onAbort);
+			if (reservation !== undefined) {
+				if (dispatched) reservation.settle();
+				else reservation.release();
+			}
 		}
 	};
 
+	let attempts = 0;
 	for (let round = 0; ; round++) {
 		try {
 			const result = await attempt();
-			return { ...result, attempts: round + 1 };
+			return { ...result, attempts: attempts + 1 };
 		} catch (error) {
 			if (isAborted(signal)) throw createAbortError();
-			if (error instanceof BackendError) error.attempts = round + 1;
-			if (!(error instanceof BackendError) || !error.retryable || round >= retries) throw error;
+			const dispatchedAttempts = error instanceof BackendError ? error.attempts : 0;
+			attempts += dispatchedAttempts;
+			if (error instanceof BackendError) error.attempts = attempts;
+			if (!(error instanceof BackendError) || !error.retryable || error.kind === "rate_limited" || round >= retries) throw error;
 			// 退避等待可被取消打断；Retry-After 影响退避但等待最多 5 秒。
 			await sleep(Math.min(RETRY_MAX_WAIT_MS, Math.max(RETRY_BASE_MS * 2 ** round, error.retryAfterMs ?? 0)), signal);
 		}
@@ -607,21 +802,36 @@ async function searchChannel(
 export interface WebSearchOptions {
 	/** 系统密钥库；默认按平台选择（macOS Keychain / Linux secret-tool）。测试注入 fake，不触碰真实密钥库。 */
 	credentialStore?: SecretStore;
-	/** 可注入的进程内通道冷却状态；用于测试或与认证状态界面共享。 */
+	/** 可注入的旧式通道冷却状态；仅显式注入时与额度管理器双写兼容状态。 */
 	channelHealth?: ChannelHealth;
+	/** 可注入额度管理器；默认无注入的生产实例使用 Pi 私有配置目录持久化。 */
+	quotaManager?: ReturnType<typeof createQuotaManager>;
+	/** 与注入的旧式冷却状态共享测试时钟；不注入时使用真实时间。 */
+	quotaClock?: () => number;
 }
 
 /** 注册 `web_search` 工具与 `/web-search-auth` 命令。 */
 export default function piWebSearch(pi: ExtensionAPI, options: WebSearchOptions = {}): void {
 	const store: SecretStore = options.credentialStore ?? createSecretStore();
-	const channelHealth = options.channelHealth ?? createChannelHealth();
-	registerAuthCommand(pi, store, () => getRoutingStatus(readRoutingConfig(), channelHealth.snapshot().channels));
+	const channelHealth = options.channelHealth;
+	const injectedTestBoundary = options.credentialStore !== undefined || options.channelHealth !== undefined;
+	const quotaManager = options.quotaManager ?? createQuotaManager(injectedTestBoundary
+		? { ...(options.quotaClock === undefined ? {} : { clock: options.quotaClock }) }
+		: {
+			stateStore: createPrivateQuotaStateStore(join(getAgentDir(), "config", "web-search")),
+			...(options.quotaClock === undefined ? {} : { clock: options.quotaClock }),
+		});
+	registerAuthCommand(pi, store, () => getRoutingStatus(
+		readRoutingConfig(),
+		channelHealth?.snapshot().channels ?? [],
+		quotaManager.snapshot(),
+	));
 
 	pi.registerTool({
 		name: "web_search",
 		label: "Web Search",
 		description:
-			"Search the web via anonymous Parallel, Exa, Tavily, or Firecrawl by default. Configured keys and SerpApi require explicit billable authorization. Returns citable page content and source URLs for current events, documentation, and facts beyond the training data.",
+			"先尝试匿名搜索；所有已配置 API Key 均按可能计费处理，额度预检不代表免费。只有显式授权后才使用 Key 通道；返回可引用来源。",
 		parameters: WebSearchParams,
 		annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
 		async execute(_toolCallId, params, signal) {
@@ -634,32 +844,48 @@ export default function piWebSearch(pi: ExtensionAPI, options: WebSearchOptions 
 			if (provider !== "auto" && !isProviderId(provider)) throw new Error("未知的搜索后端");
 			const numResults = params.maxResults ?? DEFAULT_NUM_RESULTS;
 			const config = readRoutingConfig();
-			// 没有明确计费授权时，不读取任何密钥环境变量或系统密钥库。
+			// 未授权计费时绝不读取密钥环境变量或系统密钥库；授权时在路由前一次解析，
+			// 保证本工具所有对外文本与落盘内容都能抹掉本次已读取的凭据。
 			const keys = config.allowBillable
 				? await resolvePlanKeys(provider, store, signal)
 				: emptyPlanKeys();
 			if (isAborted(signal)) throw createAbortError();
-			const routes: RouteStep[] = buildRoutePlan(provider, keys, config).map((step) => ({
-				...step,
-				...(step.channel === "key" ? { apiKey: keys[step.backend] } : {}),
-			}));
-			// 本次请求涉及的全部 key，用于把所有对外错误文本中的凭据抹掉。
+			const candidates = buildRouteCandidates(provider, config);
+			await waitForAbort(Promise.resolve().then(() => quotaManager.initialize()), signal);
 			const secrets = BACKENDS.map((backend) => keys[backend]);
-			const failures: { label: string; kind: SearchErrorKind | "unknown" | "cooldown"; message: string }[] = [];
+			interface SearchFailure {
+				label: string;
+				kind: SearchErrorKind | "unknown" | "cooldown" | "missing_key";
+				/** 原始诊断；只在最终对外输出时按已读取凭据统一脱敏。 */
+				message: string;
+			}
+			const failures: SearchFailure[] = [];
+			const persistenceWarnings = new Set<string>();
+			const quotaContext: QuotaSearchContext = {
+				manager: quotaManager,
+				config,
+				persistenceWarnings,
+				...(channelHealth === undefined ? {} : { legacyHealth: channelHealth }),
+			};
 			let attemptCount = 0;
 
-			for (const step of routes) {
+			for (const candidate of candidates) {
 				if (isAborted(signal)) throw createAbortError();
-				if (config.freeCooldownMs > 0) {
-					const cooldown = channelHealth.getCooldown(step.backend, step.channel);
+				if (channelHealth !== undefined && config.freeCooldownMs > 0) {
+					const cooldown = channelHealth.getCooldown(candidate.backend, candidate.channel);
 					if (cooldown !== undefined) {
 						failures.push({
-							label: stepLabel(step),
+							label: stepLabel(candidate),
 							kind: "cooldown",
 							message: `通道正在冷却，剩余约 ${Math.ceil(cooldown.remainingMs / 1000)} 秒；本次未发送网络请求`,
 						});
 						continue;
 					}
+				}
+				let step: RouteStep = { ...candidate, ...(candidate.channel === "key" ? { apiKey: keys[candidate.backend] } : {}) };
+				if (candidate.channel === "key" && typeof step.apiKey !== "string") {
+					failures.push({ label: stepLabel(candidate), kind: "missing_key", message: "未配置密钥，已跳过且未发送请求" });
+					continue;
 				}
 				try {
 					if (isAborted(signal)) throw createAbortError();
@@ -668,6 +894,7 @@ export default function piWebSearch(pi: ExtensionAPI, options: WebSearchOptions 
 						query,
 						numResults,
 						maxResponseBytes,
+						quotaContext,
 						signal,
 					);
 					attemptCount += attempts;
@@ -688,14 +915,18 @@ export default function piWebSearch(pi: ExtensionAPI, options: WebSearchOptions 
 					const spill = outcome.truncated ? await spillFullText(text) : undefined;
 					// 取消贯穿整个生命周期：取消时不改变任何通道健康状态。
 					if (isAborted(signal)) throw createAbortError();
-					channelHealth.recordSuccess(step.backend, step.channel);
-					const fallbackReason =
-						failures.length > 0
-							? safeDiagnostic(
-									failures.map((failure) => `${failure.label}[${failure.kind}]: ${failure.message}`).join(" | "),
-									secrets,
-								)
-							: undefined;
+					quotaManager.recordSuccess(step.backend, quotaChannel(step.channel), step.apiKey);
+					channelHealth?.recordSuccess(step.backend, step.channel);
+					await flushQuotaState(quotaContext, signal);
+					if (isAborted(signal)) throw createAbortError();
+					const quotaSnapshot = quotaManager.snapshot();
+					if (quotaSnapshot.persistence === "degraded") {
+						persistenceWarnings.add(quotaSnapshot.persistenceReason ?? "QUOTA_STATE_IO_UNAVAILABLE");
+					}
+					// 每条失败在入队时已按本次读取的凭据脱敏并截断，这里直接拼接。
+					const fallbackReason = failures.length > 0
+						? failures.map((failure) => `${failure.label}[${failure.kind}]: ${failure.message}`).join(" | ")
+						: undefined;
 					return {
 						content: [{ type: "text" as const, text: renderOutcome(safeQuery, outcome, spill) }],
 						details: {
@@ -708,37 +939,33 @@ export default function piWebSearch(pi: ExtensionAPI, options: WebSearchOptions 
 							sources,
 							truncated: outcome.truncated,
 							attemptCount,
+							quotaPersistence: quotaSnapshot.persistence,
+							...(persistenceWarnings.size > 0 ? { quotaWarning: `额度状态写入退化：${[...persistenceWarnings].join(", ")}` } : {}),
 							...(fallbackReason !== undefined ? { fallbackReason } : {}),
 							...(spill !== undefined ? { fullTextPath: spill.path, fullTextComplete: spill.complete } : {}),
 						},
 					};
 				} catch (error) {
 					if (isAborted(signal)) throw createAbortError();
-					attemptCount += error instanceof BackendError ? error.attempts : 1;
-					if (error instanceof BackendError && config.freeCooldownMs > 0) {
-						if (error.kind === "rate_limited" || (error.kind === "quota_exhausted" && step.channel === "free")) {
-							channelHealth.recordFailure(
-								step.backend,
-								step.channel,
-								error.kind === "rate_limited" ? "rate_limited" : "quota_exhausted",
-								{
-									cooldownMs: config.freeCooldownMs,
-									...(error.kind === "rate_limited" && error.retryAfterMs !== undefined
-										? { retryAfterMs: error.retryAfterMs }
-										: {}),
-								},
-							);
-						}
-					}
+					attemptCount += error instanceof BackendError ? error.attempts : 0;
 					failures.push({
 						label: stepLabel(step),
 						kind: error instanceof BackendError ? error.kind : "unknown",
-						message: safeDiagnostic(error, secrets),
+						// 密钥已在授权时一次解析，这里按已读取凭据脱敏后再截断，避免越过截断边界泄露凭据。
+						message: error instanceof QuotaPreflightError ? quotaPreflightMessage(error.reason) : safeDiagnostic(error, secrets),
 					});
 				}
 			}
+			const quotaSnapshot = quotaManager.snapshot();
+			if (quotaSnapshot.persistence === "degraded") {
+				persistenceWarnings.add(quotaSnapshot.persistenceReason ?? "QUOTA_STATE_IO_UNAVAILABLE");
+			}
+			const warning = persistenceWarnings.size > 0
+				? ` | 额度状态持久化警告：${[...persistenceWarnings].join(", ")}`
+				: "";
 			throw new Error(
-				`web_search failed — ${failures.map((failure) => `${failure.label}[${failure.kind}]: ${failure.message}`).join(" | ")}${config.allowBillable ? "" : " | 可能计费通道未获授权，未尝试"}`,
+				// 每条诊断在写入时已按本次读取的凭据脱敏并截断；这里不再二次截断，避免把脱敏标记挤出窗口。
+				`web_search failed — ${failures.map((failure) => `${failure.label}[${failure.kind}]: ${failure.message}`).join(" | ")}${config.allowBillable ? "" : " | 可能计费通道未获授权，未尝试"}${warning}`,
 			);
 		},
 	});

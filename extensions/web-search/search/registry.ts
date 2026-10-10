@@ -4,7 +4,8 @@ export const PROVIDER_IDS = ["exa", "parallel", "tavily", "firecrawl", "serpapi"
 export type ProviderId = (typeof PROVIDER_IDS)[number];
 export type AccessTier = "anonymous" | "free-key" | "billable";
 
-export const ANONYMOUS_PROVIDER_ORDER = ["parallel", "exa", "tavily", "firecrawl"] as const;
+export const ANONYMOUS_PROVIDER_ORDER = ["exa", "tavily", "parallel", "firecrawl"] as const;
+export const BILLABLE_PROVIDER_ORDER = ["exa", "tavily", "parallel", "firecrawl", "serpapi"] as const;
 
 export const PROVIDERS: Readonly<
 	Record<

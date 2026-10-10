@@ -10,7 +10,7 @@
 
 | 插件 | 目录 | 安装 | 作用 |
 | --- | --- | --- | --- |
-| Web Search | `extensions/web-search/` | `pi install ~/pi-extensions/extensions/web-search` | 原生 `web_search` 工具：Parallel → Exa → Tavily → Firecrawl 匿名路由；SerpApi 保留为需显式授权的密钥后端 |
+| Web Search | `extensions/web-search/` | `pi install ~/pi-extensions/extensions/web-search` | 原生 `web_search` 工具：Exa → Tavily → Parallel → Firecrawl 匿名路由与额度预检；SerpApi 保留为需显式授权的密钥后端 |
 | Subagent | `extensions/subagent/` | `pi install ~/pi-extensions/extensions/subagent` | 把任务委派给独立上下文的子 agent（single / parallel / chain） |
 | Chinese Prompt | `extensions/chinese-prompt/` | `pi install ~/pi-extensions/extensions/chinese-prompt` | 注入中文强约束 system prompt，推理与输出全程简体中文 |
 | OpenCode Fallback | `extensions/opencode-fallback/` | `pi install ~/pi-extensions/extensions/opencode-fallback` | GPT/Grok/Muse/Claude 固定走代理，其余模型直连优先、失败回退 |
@@ -31,6 +31,7 @@ pi-extensions/
 │   │   ├── auth-ui.ts            # /web-search-auth 菜单
 │   │   ├── credentials.ts        # Keychain / secret-tool 访问层
 │   │   ├── channel-health.ts     # 后端与通道独立冷却状态
+│   │   ├── quota/                 # 额度预检、成本估算与私有状态持久化
 │   │   ├── routing.ts            # 路由与环境变量校验
 │   │   ├── search-api.ts         # REST provider 兼容分发层
 │   │   ├── masked-input.ts       # 终端掩码输入
@@ -289,15 +290,16 @@ Pi 的内置工具只有 `read` / `bash` / `edit` / `write` / `grep` / `find` / 
 
 > **与 npm 上同名包 `pi-web-search` 的区别**：本扩展直接连接 Exa / Parallel 的远程模型上下文协议（Model Context Protocol，MCP）端点，并通过原生 REST 接口调用 Tavily、Firecrawl 与 SerpApi。本扩展不发布到 npm，只通过上面的 GitHub 安装方式分发。
 
-## 状态：v0.5.0-beta.2
+## 状态：v0.6.0-beta.1
 
-本轮仅修复 HTTP 响应资源消耗风险：五家服务的成功与错误响应统一受流式字节上限约束。匿名顺序、计费授权、重试与冷却策略不变；不新增引擎、质量评分、结果融合或 `web_fetch`。
+本轮新增混合额度管理（Quota Manager）与按原因区分的持久冷却，并把匿名候选顺序调整为 **Exa → Tavily → Parallel → Firecrawl**；计费候选顺序独立维护，Exa 仍排第一。仍然不新增搜索 provider、不做质量评分或结果融合，也不添加 `web_fetch`。
 
 `web_search` 工具名、Pi 安装方式和 `/web-search-auth` 命令保持不变。既有功能说明：
 
-- 默认匿名候选顺序为 **Parallel → Exa → Tavily → Firecrawl**；依次尝试并在首个可用结果处返回。该顺序是本项目的路由候选顺序，不是服务质量排行榜。
-- SerpApi（不是 Serper）仍作为第五个、仅密钥的 provider；所有密钥通道都按可能计费处理，默认关闭。
-- `search/registry.ts` 集中维护 provider ID、环境变量名和匿名能力；REST 适配已拆分为 `search/providers/tavily.ts`、`firecrawl.ts`、`serpapi.ts`，共用 `search/protocol.ts`。这不表示 MCP 已整体迁移，也不表示已完成质量检查、quality-first、RRF、benchmark 或 Key fingerprint。
+- 默认匿名候选顺序为 **Exa → Tavily → Parallel → Firecrawl**；依次尝试并在首个可用结果处返回。该顺序是本项目的路由候选顺序，不是服务质量排行榜。
+- SerpApi（不是 Serper）仍作为第五个、仅密钥的 provider；所有密钥通道都按可能计费处理，默认关闭。授权后的计费候选顺序为 **Exa → Tavily → Parallel → Firecrawl → SerpApi**，与匿名顺序互相独立，便于以后各自调整。
+- 授权计费与 `PI_WEB_SEARCH_ROUTING=key-first` 同时设置会显式报错并提示改用 `free-first`；未授权时 `key-first` 仅保留匿名兼容。免费通道永远先于密钥通道尝试。
+- `search/registry.ts` 集中维护 provider ID、环境变量名、匿名顺序与计费顺序；REST 适配已拆分为 `search/providers/tavily.ts`、`firecrawl.ts`、`serpapi.ts`，共用 `search/protocol.ts`。这不表示 MCP 已整体迁移，也不表示已完成质量检查、quality-first、RRF、benchmark 或 Key fingerprint。
 - `/web-search-auth` 覆盖五个 provider。四家匿名通道及 `auto` 已通过真实网络冒烟；实际 Pi `1.1.0` 终端已通过掩码输入、模拟密钥写入、共享冷却展示与跳过验收。真实系统密钥库的写入、更新及删除仍未实测。
 - HTTP 成功不等于搜索成功：失败标记、额度提示、非法结果结构或无有效来源不会作为结果返回。相关性、数量不足与新鲜度的质量策略留待下一轮；当前仍在首个结构有效的结果处返回。
 
@@ -306,8 +308,9 @@ Pi 的内置工具只有 `read` / `bash` / `edit` / `write` / `grep` / `find` / 
 ## 特性
 
 - 原生 `web_search` 工具，模型可直接调用，无需再拼 `curl` 命令
-- Parallel、Exa、Tavily 与 Firecrawl 提供匿名通道；SerpApi 仅有密钥通道。默认匿名顺序为 Parallel → Exa → Tavily → Firecrawl
+- Parallel、Exa、Tavily 与 Firecrawl 提供匿名通道；SerpApi 仅有密钥通道。默认匿名顺序为 Exa → Tavily → Parallel → Firecrawl
 - 计费通道默认禁用；即使环境或系统密钥库中已有密钥，也不会因此获得授权
+- 额度预检：Tavily 与 Firecrawl 官方余额接口只回答“当前账户还有多少积分”，不证明账户免费；所有已配置密钥一律视为可能计费
 - 系统密钥库由 `/web-search-auth` 菜单管理；环境变量优先，不修改 shell 启动文件
 - 同时解析直接 JSON 与服务端发送事件（Server-Sent Events，SSE）数据帧
 - 单请求预算默认 25 秒；密钥库读取、请求、读体和退避可中断，切换与落盘前后检查取消；在途文件操作须完成后才返回取消
@@ -348,15 +351,15 @@ Pi 的内置工具只有 `read` / `bash` / `edit` / `write` / `grep` / `find` / 
 | `TAVILY_API_KEY` | 空 | Tavily 计费通道凭据；获授权后使用 Bearer 头。匿名请求使用 `X-Tavily-Access-Mode: keyless`，两种认证方式不混用；见 [Tavily keyless 文档](https://docs.tavily.com/documentation/keyless) |
 | `FIRECRAWL_API_KEY` | 空 | Firecrawl 计费通道凭据；获授权后使用 Bearer 头。匿名搜索不发送 `Authorization`；请求 `https://api.firecrawl.dev/v2/search`，仅传 `sources: ["web"]`，不使用 `scrapeOptions` 或 `categories`；本轮不启用 dev mode |
 | `SERPAPI_API_KEY` | 空 | SerpApi 计费凭据；获授权后以 `api_key` 参数请求 `https://serpapi.com/search.json`，解析 Google `organic_results`；不是 Serper |
-| `PI_WEB_SEARCH_ROUTING` | `free-first` | 接受 `free-first` 或 `key-first`；非法值报错。`key-first` 只改变顺序，不授予计费授权 |
+| `PI_WEB_SEARCH_ROUTING` | `free-first` | 免费优先；未授权时兼容 `key-first`，仍仅使用匿名通道。已授权时 `key-first` 与免费优先冲突，必须迁移为 `free-first`；非法值报错 |
 | `PI_WEB_SEARCH_ALLOW_BILLABLE` | `false` | 只接受严格的 `true` 或 `false`；只有显式 `true` 才授权可能计费的密钥通道 |
 | `PI_WEB_SEARCH_ALLOW_PAID` | 未设置 | 旧开关兼容别名，只接受严格的 `true` 或 `false`；单独显式设为 `true` 仍可授权。与新开关同时设置且取值不同会报错；非法值报错 |
-| `PI_WEB_SEARCH_FREE_COOLDOWN_MS` | `1800000` | 默认冷却 30 分钟；接受 `0` 至 `86400000` 的安全整数，`0` 禁用冷却，非法值报错 |
+| `PI_WEB_SEARCH_FREE_COOLDOWN_MS` | 未设置 | 显式设置时作为固定冷却覆盖全部通道；接受 `0` 至 `86400000` 的安全整数，`0` 禁用冷却，非法值报错。未设置时按原因阶梯退避（见下） |
 | `PI_WEB_SEARCH_MAX_RESPONSE_BYTES` | `5242880` | 解压后响应体上限，默认 5 MiB；只接受十进制正整数 `1` 至 `20971520`（20 MiB），首尾空白允许，非法配置在读取凭据或请求前报错 |
 | `PI_WEB_SEARCH_TIMEOUT_MS` | `25000` | 单次请求预算，最小 `100` 毫秒 |
 | `PI_WEB_SEARCH_RETRIES` | `1` | 可重试错误的重试次数，`0` 表示不重试；单次退避等待最多 5 秒 |
 
-默认拒绝所有密钥通道时，搜索不会读取任何 provider 密钥环境变量或系统密钥库。所有已配置密钥均按可能计费处理；本轮不推断余额或免费额度，也不构造 `free-key` 通道。Firecrawl 请求与计费说明见[搜索文档](https://docs.firecrawl.dev/features/search)和[计费文档](https://docs.firecrawl.dev/billing)。
+默认拒绝所有密钥通道时，搜索不会读取任何 provider 密钥环境变量或系统密钥库。所有已配置密钥均按可能计费处理；本轮只查询余额，不从余额推断免费资格，也不构造 `free-key` 通道。Firecrawl 请求与计费说明见[搜索文档](https://docs.firecrawl.dev/features/search)和[计费文档](https://docs.firecrawl.dev/billing)。
 
 ## 认证（`/web-search-auth`）
 
@@ -372,32 +375,57 @@ Pi 的内置工具只有 `read` / `bash` / `edit` / `write` / `grep` / `find` / 
 
 - **查看状态**：报告 Exa、Parallel、Tavily、Firecrawl、SerpApi 五个后端的密钥来源，并区分未配置与系统密钥库不可用。
 - **添加或修改密钥**：仅在终端交互界面（Terminal UI，TUI）且 `ctx.ui.custom` 可用时显示自绘掩码输入；接受 1–4096 个非空白美国信息交换标准代码（American Standard Code for Information Interchange，ASCII）可打印字符（printable ASCII）。超长、空白或控制字符输入（含粘贴）整体拒绝，不截断，也不使用明文输入回退。取消确认或输入均不会写入。
-- **查看路由与冷却状态**：显示路由策略、密钥通道开关及各后端 / 通道的剩余冷却时间。
+- **查看路由与冷却状态**：显示路由策略、密钥通道开关、各后端 / 通道的剩余冷却与下次探测时间、额度状态持久化情况；不发起任何余额查询，也不展示凭据指纹。
 - **查看配置说明**：为当前平台提供不含密钥值的安全说明，不要求把密钥写进命令或参数。
 - **删除系统密钥库中的密钥**：选择后需二次确认；取消不会写入或删除任何凭据。
 
 macOS 写入实现使用静态 Swift 适配器与系统安全框架，密钥经标准输入传递；实现包含写入后读回验证，但真实系统 Keychain 写入尚未实测。Linux 写入同样经标准输入传递并在完成后读回比对。菜单的掩码组件依赖 Pi 自带的 `@earendil-works/pi-tui`，无需单独安装。
 
-> 未显式允许计费时，搜索不读取密钥环境变量或系统密钥库；授权后才解析所需凭据。密钥仅在内存和请求所需位置使用，不进入 `details`、session 或落盘内容。对外错误文本（含 URL 编码形式）和结果回显都会脱敏。
+> 未显式允许计费时，搜索不读取密钥环境变量或系统密钥库；授权后才在路由前一次解析全部所需凭据。密钥仅在内存和请求所需位置使用，不进入 `details`、session 或落盘内容。对外错误文本（含 URL 编码形式）和结果回显都会脱敏。
 
 ## 搜索路由
 
-默认 `free-first` 模式下，未显式授权计费时，自动路由只走匿名通道，顺序为：
+未显式授权计费时，自动路由只走匿名通道；已授权时同样先尝试完全部匿名通道，才进入计费候选。两类顺序互相独立维护：
 
 ```text
-Parallel → Exa → Tavily → Firecrawl
+匿名候选：Exa → Tavily → Parallel → Firecrawl
+计费候选：Exa → Tavily → Parallel → Firecrawl → SerpApi
 ```
 
-到首个可用结果即返回。显式 provider 只选择该 provider；SerpApi 没有匿名通道。启用 `PI_WEB_SEARCH_ALLOW_BILLABLE=true` 后，`free-first` 会先尝试匿名候选，再依 provider registry 顺序尝试已配置的计费密钥；`key-first` 只调整尝试顺序，不会自行授予授权。只要新开关与旧别名同时设置且值不一致，或任一开关不是严格的 `true` / `false`，配置就会报错。密钥存在与否不能推断余额或免费额度；本轮不提供 `free-key` 分类。
+到首个可用结果即返回。显式 provider 只选择该 provider；SerpApi 没有匿名通道。授权后仍先用匿名通道；只有匿名候选都不可用，才按计费候选顺序逐个尝试已配置密钥。启用 `PI_WEB_SEARCH_ALLOW_BILLABLE=true` 时如果再设置 `PI_WEB_SEARCH_ROUTING=key-first`，会直接报错并提示改用 `free-first`，而不是静默降低免费优先级。新开关与旧别名同时设置且取值不同，或任一开关不是严格的 `true` / `false`，同样报错。密钥存在与否不能推断余额或免费资格；本轮仍不提供 `free-key` 分类。
 
-冷却状态按 provider 与通道分别保存在进程内存，重启后重置。Exa 匿名 MCP 响应中精确额度提示 `You've hit Exa's free MCP rate limit` 会归为额度耗尽，不会作为结果返回；额度判断只依据搜索响应，不额外探测余额。HTTP 429 在原有重试结束后按 `Retry-After` 或默认冷却进入冷却，硬上限 24 小时。原有重试默认 1 次，单次退避等待最多 5 秒；取消立即终止且不记录为失败，普通网络错误不触发冷却。
+### 额度预检
+
+在发送任何密钥搜索前，授权工具会按后端类型判断：
+
+| 后端 | 是否查询余额 | 依据 |
+| --- | --- | --- |
+| Tavily | 是 | `GET https://api.tavily.com/usage`，取 `key.usage/limit` 与账户计划 + 按量余额的最小可用量 |
+| Firecrawl | 是 | `GET https://api.firecrawl.dev/v2/team/credit-usage`，取 `data.remainingCredits` |
+| Exa、Parallel、SerpApi | 否 | 没有可用的公开余额接口，只依据历史冷却状态 |
+
+查询结果缓存 5 分钟，失败短缓存 30 秒，同凭据并发只发起一次查询。单次搜索预估成本：Tavily 基础搜索（basic）固定 1 积分；Firecrawl `sources: ["web"]` 每开始的 10 条结果 2 积分。余额不足或额度未知时不发送搜索请求，并记为 `quota_preflight` 失败，不计入搜索尝试次数。正余额仅不足以支付一次较昂贵请求时，不记录额度耗尽冷却，后续较便宜请求仍可执行；已知零余额或额度接口明确限流会记录对应冷却。请求一旦发出就按预估成本记账，超时、取消、正文超限都不返还，保守降低超额风险。
+
+重要边界：`key.limit` 为 `null` 只表示该 Key 没有单独上限，账户仍按计划与按量余额计算；两个接口都没有字段能证明账户是免费计划或已关闭按量计费。因此**余额大于零不等于免费**，所有密钥通道仍按可能计费处理。也没有名为 reset 的字段，冷却到期不代表额度已恢复。
+
+### 冷却与额度状态
+
+冷却按服务商、通道和凭据分别隔离，使用带本地随机盐的哈希消息认证码（HMAC）标识作用域；进程内即时生效，并在 Pi 配置目录 `config/web-search/` 下持久化（目录 `0700`、文件 `0600`，保存随机盐、作用域标识与冷却元数据，不保存密钥、查询内容或账户标识）。重启后已冷却通道仍被跳过；再次成功会清除历史。持久化失败时搜索继续，只在 `details.quotaWarning` 暴露固定诊断。
+
+- 临时限流：优先 `Retry-After`（支持秒与 HTTP 日期，上限 24 小时），否则 1、2、5、10、30 分钟递进。
+- 额度耗尽：优先服务商明确的重置时间；当前适配器没有此证据，因此按 30 分钟、1 小时、2 小时、4 小时作为下一探测间隔，不等于额度恢复时间。
+- HTTP 429 只发送一次搜索即切换通道并冷却，不再对同一通道短暂重试；服务端错误与可重试网络错误仍按原规则重试。
+- 同一实例内并发搜索按顺序原子预留；跨进程或同一账户被其他客户端使用时，本地预留不构成全局硬上限，需要在服务商侧设置费用上限。
+
+Exa 匿名 MCP 响应中精确额度提示 `You've hit Exa's free MCP rate limit` 会归为额度耗尽，不会作为结果返回。原有重试默认 1 次，单次退避等待最多 5 秒；取消立即终止且不记录为失败，普通网络错误不触发冷却。
 
 额度提示可能带注册链接，因此必须在提取来源前识别，不能因为存在链接就认定为搜索成功。当前 Exa 规则依赖已知提示的正文开头；若正常正文恰以完全相同的提示开头，仍可能误判。此边界尚未消除，需要以真实响应夹具继续收紧，而不是将额度识别移到「无链接」判断之后。
 
 | 失败类型 | 处理 |
 | --- | --- |
-| 额度耗尽、鉴权失败 | 不重试，尝试下一路由通道；匿名额度耗尽按配置冷却 |
-| HTTP 429 | 按原重试规则处理，随后根据 `Retry-After` 或默认值冷却 |
+| `quota_preflight` | 冷却、余额不足或额度未知时跳过搜索，不计入搜索尝试次数；已知零余额或查询限流会记录对应冷却 |
+| 额度耗尽、鉴权失败 | 不重试，尝试下一路由通道；额度耗尽记录冷却，鉴权失效冷却暂未实现 |
+| HTTP 429 | 有界正文未超限时，只发送一次搜索，切换通道并按 `Retry-After` 或阶梯冷却；明确额度耗尽则记录耗尽冷却 |
 | 服务端错误、可重试网络错误 | 按 `PI_WEB_SEARCH_RETRIES` 重试，之后尝试下一通道 |
 | 超时、协议错误、无可用结果 | 不重试，尝试下一通道 |
 | `response_too_large` | 立即中止底层请求并取消读取；不重试当前通道、不记录冷却，按原路由尝试下一通道 |
@@ -471,7 +499,7 @@ node extensions/web-search/tests/smoke.mjs
 node extensions/web-search/tests/smoke.mjs --billable
 ```
 
-普通 smoke 会强制 `PI_WEB_SEARCH_ALLOW_BILLABLE=false` 并清除旧别名；`--billable` 还要求当前路由配置已明确授权，运行时采用密钥优先，可能产生费用且不会打印密钥值。四家匿名通道及 `auto` 已通过一次真实网络冒烟；这只验证端点可用性，不代表质量排名或长期成功率。离线语法检查可用 `node --check extensions/web-search/tests/smoke.mjs`，不触网；任何离线测试都不代表真实系统 Keychain 写入已验证。本地依赖 `jiti` 与 `typebox`，Pi 自带这两个包，指向本机 Pi 安装即可：
+普通冒烟脚本（smoke）会强制 `PI_WEB_SEARCH_ALLOW_BILLABLE=false` 并清除旧别名；`--billable` 还要求当前配置已明确授权且不存在路由冲突，运行时仍匿名优先，仅允许在匿名失败后计费回退，可能产生费用且不会打印密钥值。四家匿名通道及 `auto` 在 `v0.5.0-beta.1` 已通过一次真实网络冒烟，本轮只做离线验证；这只验证当时端点可用性，不代表质量排名或长期成功率。离线语法检查可用 `node --check extensions/web-search/tests/smoke.mjs`，不触网；任何离线测试都不代表真实系统 Keychain 写入已验证。本地依赖 `jiti` 与 `typebox`，Pi 自带这两个包，指向本机 Pi 安装即可：
 
 ```bash
 mkdir -p node_modules/@earendil-works
@@ -489,17 +517,21 @@ CI（`.github/workflows/ci.yml`）固定安装 `@earendil-works/pi-coding-agent@
 ## 限制与注意
 
 - 依赖 Exa / Parallel 的公开 MCP 端点及其使用条款，非官方集成，端点与配额可能随时变化
-- 匿名通道有速率与额度限制；已配置 Key 一律视为可能计费，不能据此推断余额或免费额度
+- 匿名通道有速率与额度限制；已配置 Key 一律视为可能计费，余额接口不能证明账户免费
+- Tavily 与 Firecrawl 的额度查询只用于判断“本次是否付得起”，不代表免费额度；Exa、Parallel、SerpApi 没有可用余额接口，只依据历史冷却
+- 额度状态持久化只保存作用域标识与冷却元数据；本地请求计数无法覆盖同一账户的其他客户端，也不替代服务商侧的账单与硬性费用上限
 - 搜索结果质量由后端决定；当前首个可用结果即返回，不实施 quality-first 或质量不足后的跨 provider 决策
 - 当前只有 `web_search`，没有网页正文抓取工具（`web_fetch`）
 
 ## 路线图
 
+- 免费认证层：仅在能验证账户不会超额计费时，才把免费账户密钥纳入免费候选池；当前余额接口不足以证明，暂不启用
 - 质量感知的跨 provider 后备策略；评估 RRF 与 benchmark 前先明确方法和复现条件，目前均未实现
 - `web_fetch`：读取指定 URL 的正文，进一步减少对 `curl` 的依赖
 - 结果缓存与进一步的 provider 模块整理；本轮并非完整 MCP 模块迁移
 - TinyFish 搜索认证通道暂缓：官方参考说明免费额度为每日 12,000 次，但超量可能由 wallet 自动收费；本地计数无法覆盖其他进程或外部持有的 Key，无法保证全局额度，因此本轮不自动创建该认证通道。见 [TinyFish Search API 文档](https://docs.tinyfish.ai/search-api/reference)。
 - 认证失效冷却：针对 401 / 403 等失效密钥，避免重复请求；429 通道冷却已实现
+- 每日 / 每月预算与费用上限提示，以及真实系统密钥库与实际账户的端到端验证
 
 ## License
 

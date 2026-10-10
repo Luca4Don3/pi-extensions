@@ -143,12 +143,24 @@ function reportRouting(ctx: ExtensionCommandContext, readStatus: RoutingStatusRe
 	try {
 		const status = readStatus();
 		const lines = [
-			`路由：${status.strategy === "free-first" ? "免费优先" : "密钥优先"}；密钥通道：${status.allowBillable ? "已明确授权（可能产生费用）" : "已禁用"}。`,
-			`免费通道默认冷却：${status.freeCooldownMs / 1000} 秒；仅存于本进程内存。`,
+			`路由：${status.strategy === "free-first" ? "匿名优先" : "密钥优先（仅未授权兼容模式）"}；密钥通道：${status.allowBillable ? "已明确授权（可能产生费用）" : "已禁用"}。`,
+			`冷却兼容配置值：${status.freeCooldownMs / 1000} 秒；未显式覆盖时按限流与额度耗尽分别退避。`,
 		];
-		if (status.channels.length === 0) lines.push("当前没有正在冷却的通道。");
-		for (const channel of status.channels) {
-			lines.push(`${channel.backend}（${channel.channel === "free" ? "免费" : "密钥"}通道）：冷却剩余约 ${Math.ceil(channel.remainingMs / 1000)} 秒。`);
+		if (status.quota === undefined || status.quota.persistence === "not_initialized") {
+			lines.push("额度状态尚未载入；查看此菜单不会触发磁盘读取或真实额度查询。");
+		} else if (status.quota.persistence === "persistent") {
+			lines.push("额度状态：本地私有存储可用，仅展示本实例已载入的冷却快照。");
+		} else if (status.quota.persistence === "memory_only") {
+			lines.push("额度状态：仅保存在本进程内存，重启后不保留。");
+		} else {
+			lines.push(`额度状态：持久化退化为内存；原因：${status.quota.persistenceReason ?? "QUOTA_STATE_IO_UNAVAILABLE"}。`);
+		}
+		const quotaCooldowns = status.quota?.cooldowns ?? [];
+		if (status.channels.length === 0 && quotaCooldowns.length === 0) lines.push("当前没有正在冷却的通道。");
+		for (const channel of [...status.channels, ...quotaCooldowns]) {
+			const reason = channel.reason === "rate_limited" ? "限流" : channel.reason === "quota_exhausted" ? "额度耗尽" : "冷却";
+			const nextProbe = channel.nextProbeAt === undefined ? "" : `；建议下次探测时间 ${new Date(channel.nextProbeAt).toLocaleString()}（不代表额度恢复）`;
+			lines.push(`${channel.backend}（${channel.channel === "free" ? "匿名" : "密钥"}通道，${reason}）：冷却剩余约 ${Math.ceil(channel.remainingMs / 1000)} 秒${nextProbe}。`);
 		}
 		notify(ctx, lines.join("\n"));
 	} catch {

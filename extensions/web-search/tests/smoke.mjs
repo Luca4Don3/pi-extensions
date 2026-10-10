@@ -21,7 +21,7 @@ const registry = await jiti.import(fileURLToPath(new URL("../search/registry.ts"
 const { readRoutingConfig } = routingModule;
 const { ANONYMOUS_PROVIDER_ORDER, PROVIDER_IDS, PROVIDERS } = registry;
 
-// 计费模式必须先由当前环境配置授权，再由 CLI 单独确认；key-first 仅用于这次显式冒烟。
+// 计费模式必须由当前环境授权并由 CLI 单独确认；即便授权，也始终匿名优先。
 if (billableOptIn) {
 	const configuredRouting = readRoutingConfig(process.env);
 	if (!configuredRouting.allowBillable) {
@@ -29,12 +29,13 @@ if (billableOptIn) {
 	}
 	process.env.PI_WEB_SEARCH_ALLOW_BILLABLE = "true";
 	delete process.env.PI_WEB_SEARCH_ALLOW_PAID;
-	process.env.PI_WEB_SEARCH_ROUTING = "key-first";
-	console.log("[安全提示] 已显式启用 --billable 与计费路由授权；密钥优先搜索可能产生费用，不会输出密钥值。");
+	process.env.PI_WEB_SEARCH_ROUTING = "free-first";
+	console.log("[安全提示] 已显式授权计费回退；允许付费回退，不保证命中付费，且本脚本会访问真实服务商。");
 } else {
-	// 覆盖本机既有授权，确保默认运行绝不进入计费路由。
+	// 覆盖本机既有授权与策略，确保默认仅匿名搜索且不访问真实密钥库。
 	process.env.PI_WEB_SEARCH_ALLOW_BILLABLE = "false";
 	delete process.env.PI_WEB_SEARCH_ALLOW_PAID;
+	process.env.PI_WEB_SEARCH_ROUTING = "free-first";
 	console.log("[安全模式] 默认仅匿名搜索；计费通道已禁用，系统密钥库由不可用模拟器替代。");
 }
 const routingConfig = readRoutingConfig(process.env);
