@@ -61,6 +61,9 @@ function notify(ctx: ExtensionCommandContext, message: string, type: "info" | "w
 /** 单条状态文案；不包含 key 内容。 */
 function statusLine(status: BackendStatus, store: SecretStore): string {
 	const name = status.backend;
+	if (status.state === "credential_free") {
+		return `${name}：零凭据匿名通道，无需也不读取密钥`;
+	}
 	if (status.state === "configured") {
 		if (status.source === "env") return `${name}：已配置（环境变量 ${envVarName(status.backend)}，优先于系统密钥库）`;
 		const label = store.kind === "secret-tool" ? "Linux Secret Service" : "macOS Keychain";
@@ -80,6 +83,7 @@ function summarize(statuses: BackendStatus[]): string {
 		.map((status) => {
 			if (status.state === "configured") return `${status.backend}=已配置`;
 			if (status.state === "not_configured") return `${status.backend}=未配置`;
+			if (status.state === "credential_free") return `${status.backend}=零凭据`;
 			return `${status.backend}=不可用`;
 		})
 		.join(" · ");

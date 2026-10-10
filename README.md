@@ -365,7 +365,9 @@ Pi 的内置工具只有 `read` / `bash` / `edit` / `write` / `grep` / `find` / 
 
 ## 认证（`/web-search-auth`）
 
-五个后端均遵循「环境变量优先，系统密钥库其次」。环境变量不会被菜单修改，也不会写入 shell 启动文件（shell startup file）。
+需要密钥的后端均遵循「环境变量优先，系统密钥库其次」。环境变量不会被菜单修改，也不会写入 shell 启动文件（shell startup file）。
+
+TinyFish 的 keyless 通道零凭据：`/web-search-auth` 的「查看状态」会显示「零凭据匿名通道，无需也不读取密钥」，并且**不会**读取 `TINYFISH_API_KEY` 环境变量或系统密钥库；它也不出现在「添加 / 修改 / 删除密钥」菜单里。即使配置了 `TINYFISH_API_KEY`，搜索时也不会读取它。
 
 | 平台 | 系统密钥库 | 写入方式 |
 | --- | --- | --- |
@@ -534,6 +536,7 @@ CI（`.github/workflows/ci.yml`）固定安装 `@earendil-works/pi-coding-agent@
 - 结果缓存与进一步的 provider 模块整理；本轮并非完整 MCP 模块迁移
 - TinyFish 认证通道暂缓：其 API Reference 的 Billing 段写「每日 12,000 次后需要钱包正余额，否则 402」，而定价页与公告写「Search 永不扣钱包、$0 余额仍可用」，两处口径矛盾且无法验证。keyless 匿名通道没有账户，因此不存在扣费风险，本轮只接入它。见 [Search API Reference](https://docs.tinyfish.ai/search-api/reference) 与 [Pricing](https://www.tinyfish.ai/pricing)。
 - TinyFish keyless 限额小且可能为共享池：服务端自述 30 请求/分钟、每日 50 次搜索，其他 keyless 客户端会消耗同一额度。它排在匿名候选最后，仅作补充；冷却只能跳过本机已知被限流的时刻，不能反映真实剩余额度。
+- TinyFish 每日额度耗尽后的确切响应文本未经实测（不为观测而打满 50 次）。已锁定的行为是：402、429，以及正文含 quota / credit exhausted 特征的 JSON-RPC 错误或 MCP `isError`，都会分别归入额度耗尽或限流并进入冷却，同一通道不重试。若实测发现专属错误码，再补精确规则。
 - 认证失效冷却：针对 401 / 403 等失效密钥，避免重复请求；429 通道冷却已实现
 - 每日 / 每月预算与费用上限提示，以及真实系统密钥库与实际账户的端到端验证
 
