@@ -11,11 +11,27 @@ const credentials = await jiti.import(fileURLToPath(new URL("../credentials.ts",
 const auth = await jiti.import(fileURLToPath(new URL("../auth.ts", import.meta.url)));
 const loaded = await jiti.import(fileURLToPath(new URL("../index.ts", import.meta.url)));
 for (const backend of auth.BACKENDS) delete process.env[auth.envVarName(backend)];
-for (const name of ["PI_WEB_SEARCH_ALLOW_PAID", "PI_WEB_SEARCH_ROUTING", "PI_WEB_SEARCH_FREE_COOLDOWN_MS"]) delete process.env[name];
+for (const name of ["PI_WEB_SEARCH_ALLOW_BILLABLE", "PI_WEB_SEARCH_ALLOW_PAID", "PI_WEB_SEARCH_ROUTING", "PI_WEB_SEARCH_FREE_COOLDOWN_MS"]) delete process.env[name];
 const SECRET = "abort_test_SECRET_must_not_escape";
 
 function isFixedAbortError(error) {
 	return error instanceof DOMException && error.name === "AbortError" && error.message === "操作已取消";
+}
+
+async function withEnv(vars, fn) {
+	const saved = Object.fromEntries(Object.keys(vars).map((key) => [key, process.env[key]]));
+	for (const [key, value] of Object.entries(vars)) {
+		if (value === undefined) delete process.env[key];
+		else process.env[key] = String(value);
+	}
+	try {
+		return await fn();
+	} finally {
+		for (const [key, value] of Object.entries(saved)) {
+			if (value === undefined) delete process.env[key];
+			else process.env[key] = value;
+		}
+	}
 }
 
 async function waitUntil(check, timeoutMs = 2_000) {
@@ -127,18 +143,20 @@ test("不可中断的 fake read 也能令 resolvePlanKeys 快速拒绝且不泄�
 			return { status: "unavailable", reason: "不应执行" };
 		},
 	};
-	const pending = auth.resolvePlanKeys("auto", store, controller.signal);
-	assert.equal(reads, 4);
-	const rejected = assert.rejects(pending, (error) => {
-		assert.ok(isFixedAbortError(error));
-		assert.ok(!String(error).includes(SECRET));
-		return true;
+	await withEnv({ PI_WEB_SEARCH_ALLOW_BILLABLE: "true" }, async () => {
+		const pending = auth.resolvePlanKeys("auto", store, controller.signal);
+		assert.equal(reads, 5);
+		const rejected = assert.rejects(pending, (error) => {
+			assert.ok(isFixedAbortError(error));
+			assert.ok(!String(error).includes(SECRET));
+			return true;
+		});
+		controller.abort(new Error(`敏感取消原因 ${SECRET}`));
+		await assertFast(rejected);
+		for (const resolve of deferred) resolve({ status: "found", value: SECRET });
+		await new Promise((resolve) => setImmediate(resolve));
+		assert.equal(otherOperations, 0);
 	});
-	controller.abort(new Error(`敏感取消原因 ${SECRET}`));
-	await assertFast(rejected);
-	for (const resolve of deferred) resolve({ status: "found", value: SECRET });
-	await new Promise((resolve) => setImmediate(resolve));
-	assert.equal(otherOperations, 0);
 });
 
 test("搜索在密钥库等待期间取消，立即拒绝且不发网络请求", async () => {
@@ -159,11 +177,13 @@ test("搜索在密钥库等待期间取消，立即拒绝且不发网络请求",
 	let requests = 0;
 	globalThis.fetch = async () => { requests++; throw new Error("不应发请求"); };
 	try {
-		const pending = tool.execute("cancel", { query: "取消验收", provider: "exa" }, controller.signal);
-		assert.equal(reads, 1);
-		controller.abort();
-		await assertFast(assert.rejects(pending, (error) => error.name === "AbortError"));
-		assert.equal(requests, 0);
+		await withEnv({ PI_WEB_SEARCH_ALLOW_BILLABLE: "true" }, async () => {
+			const pending = tool.execute("cancel", { query: "取消验收", provider: "exa" }, controller.signal);
+			assert.equal(reads, 1);
+			controller.abort();
+			await assertFast(assert.rejects(pending, (error) => error.name === "AbortError"));
+			assert.equal(requests, 0);
+		});
 	} finally {
 		globalThis.fetch = originalFetch;
 	}
@@ -180,8 +200,10 @@ test("凭据读取同步触发取消后，迟到拒绝仍被消费", async () =>
 		write: async () => ({ status: "unavailable", reason: "不应执行" }),
 		clear: async () => ({ status: "missing" }),
 	};
-	await assert.rejects(auth.resolvePlanKeys("auto", store, controller.signal), isFixedAbortError);
-	await new Promise((resolve) => setImmediate(resolve));
+	await withEnv({ PI_WEB_SEARCH_ALLOW_BILLABLE: "true" }, async () => {
+		await assert.rejects(auth.resolvePlanKeys("auto", store, controller.signal), isFixedAbortError);
+		await new Promise((resolve) => setImmediate(resolve));
+	});
 });
 
 test("读取异常在取消时转换为固定 AbortError，不暴露异常中的凭据", async () => {
@@ -195,9 +217,11 @@ test("读取异常在取消时转换为固定 AbortError，不暴露异常中的
 		async write() { return { status: "unavailable", reason: "不应执行" }; },
 		async clear() { return { status: "unavailable", reason: "不应执行" }; },
 	};
-	await assert.rejects(auth.resolveBackendKey("exa", store, controller.signal), (error) => {
-		assert.ok(isFixedAbortError(error));
-		assert.ok(!String(error).includes(SECRET));
-		return true;
+	await withEnv({ PI_WEB_SEARCH_ALLOW_BILLABLE: "true" }, async () => {
+		await assert.rejects(auth.resolveBackendKey("exa", store, controller.signal), (error) => {
+			assert.ok(isFixedAbortError(error));
+			assert.ok(!String(error).includes(SECRET));
+			return true;
+		});
 	});
 });

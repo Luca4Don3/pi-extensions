@@ -6,7 +6,7 @@ import { createJiti } from "jiti";
 
 const jiti = createJiti(import.meta.url);
 const credentials = await jiti.import(fileURLToPath(new URL("../credentials.ts", import.meta.url)));
-const BACKENDS = ["exa", "parallel", "tavily", "serpapi"];
+const BACKENDS = ["exa", "parallel", "tavily", "firecrawl", "serpapi"];
 const SECRET = "fake_token_NEVER_OUTPUT_123";
 
 function makeMacRunner() {
@@ -52,7 +52,7 @@ function makeLinuxRunner() {
 	return { run, calls };
 }
 
-test("写入四个后端：凭据只经 stdin，写后重读验证且结果不含凭据", async () => {
+test("写入五个后端：凭据只经 stdin，写后重读验证且结果不含凭据", async () => {
 	const mac = makeMacRunner();
 	const macStore = new credentials.MacKeychainStore(mac.run, "test-account");
 	for (const backend of BACKENDS) {
@@ -61,7 +61,7 @@ test("写入四个后端：凭据只经 stdin，写后重读验证且结果不�
 		assert.equal(Object.hasOwn(result, "value"), false);
 	}
 	const swiftCalls = mac.calls.filter((call) => call.bin === "/usr/bin/swift");
-	assert.equal(swiftCalls.length, 4);
+	assert.equal(swiftCalls.length, BACKENDS.length);
 	for (const [index, call] of swiftCalls.entries()) {
 		assert.equal(call.args[2], `pi-web-search-${BACKENDS[index]}`);
 	}
@@ -84,7 +84,7 @@ test("写入四个后端：凭据只经 stdin，写后重读验证且结果不�
 		assert.equal(call.stdin === SECRET, true);
 		assert.ok(!call.args.includes(SECRET));
 	}
-	assert.equal(linux.calls.filter((call) => call.args[0] === "lookup").length, 4);
+	assert.equal(linux.calls.filter((call) => call.args[0] === "lookup").length, BACKENDS.length);
 });
 
 test("统一凭据校验拒绝空白、非 ASCII 和超长内容，不隐式截断", async () => {

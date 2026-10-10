@@ -18,7 +18,9 @@ for (const key of [
 	"PARALLEL_API_KEY",
 	"TAVILY_API_KEY",
 	"SERPAPI_API_KEY",
+	"FIRECRAWL_API_KEY",
 	"PI_WEB_SEARCH_ROUTING",
+	"PI_WEB_SEARCH_ALLOW_BILLABLE",
 	"PI_WEB_SEARCH_ALLOW_PAID",
 ]) {
 	delete process.env[key];
@@ -113,8 +115,9 @@ const EXA_PARAMS = { query: "q", provider: "exa" };
 // 1. 环境变量优先于系统密钥库。
 test("auth: 环境变量优先于系统密钥库", async () => {
 	const store = fakeStore({ read: async () => ({ status: "found", value: "from-store" }) });
-	await withEnv({ EXA_API_KEY: "from-env" }, async () => {
+	await withEnv({ EXA_API_KEY: "from-env", FIRECRAWL_API_KEY: "firecrawl-from-env", PI_WEB_SEARCH_ALLOW_BILLABLE: "true" }, async () => {
 		assert.equal(await auth.resolveBackendKey("exa", store), "from-env");
+		assert.equal(await auth.resolveBackendKey("firecrawl", store), "firecrawl-from-env");
 		const status = await auth.probeBackendStatus("exa", store);
 		assert.equal(status.state, "configured");
 		assert.equal(status.source, "env");
@@ -253,7 +256,7 @@ test("auth: Exa key 进入 URL，每次搜索只读一次密钥库", async () =>
 		},
 	});
 	const { tool } = setup(store);
-	await withEnv({ EXA_API_KEY: undefined, PARALLEL_API_KEY: undefined, PI_WEB_SEARCH_RETRIES: "0", PI_WEB_SEARCH_ROUTING: "key-first" }, async () => {
+	await withEnv({ EXA_API_KEY: undefined, PARALLEL_API_KEY: undefined, PI_WEB_SEARCH_RETRIES: "0", PI_WEB_SEARCH_ROUTING: "key-first", PI_WEB_SEARCH_ALLOW_BILLABLE: "true" }, async () => {
 		const seen = [];
 		await withFetch(
 			async (url) => {
@@ -276,7 +279,7 @@ test("auth: Parallel key 从密钥库进入 Authorization 头", async () => {
 		read: async (backend) => (backend === "parallel" ? { status: "found", value: "parallel-store-key" } : { status: "missing" }),
 	});
 	const { tool } = setup(store);
-	await withEnv({ EXA_API_KEY: undefined, PARALLEL_API_KEY: undefined, PI_WEB_SEARCH_ROUTING: "key-first" }, async () => {
+	await withEnv({ EXA_API_KEY: undefined, PARALLEL_API_KEY: undefined, PI_WEB_SEARCH_ROUTING: "key-first", PI_WEB_SEARCH_ALLOW_BILLABLE: "true" }, async () => {
 		const seen = [];
 		await withFetch(
 			async (_url, init) => {
@@ -303,7 +306,7 @@ test("auth: 网络错误不泄露 key（原文与 URL 编码）", async () => {
 		read: async (backend) => (backend === "exa" ? { status: "found", value: SPECIAL_SECRET } : { status: "missing" }),
 	});
 	const { tool } = setup(store);
-	await withEnv({ EXA_API_KEY: undefined, PARALLEL_API_KEY: undefined, PI_WEB_SEARCH_RETRIES: "0" }, async () => {
+	await withEnv({ EXA_API_KEY: undefined, PARALLEL_API_KEY: undefined, PI_WEB_SEARCH_RETRIES: "0", PI_WEB_SEARCH_ALLOW_BILLABLE: "true" }, async () => {
 		await withFetch(
 			async (url) => {
 				throw new TypeError(`request to ${String(url)} failed (raw=${SPECIAL_SECRET})`);
@@ -326,7 +329,7 @@ test("auth: HTTP / MCP 回显 key 时 fallbackReason 与最终 throw 均脱敏",
 	const store = fakeStore({
 		read: async (backend) => (backend === "exa" ? { status: "found", value: SECRET } : { status: "missing" }),
 	});
-	await withEnv({ EXA_API_KEY: undefined, PARALLEL_API_KEY: undefined, PI_WEB_SEARCH_RETRIES: "0", PI_WEB_SEARCH_ROUTING: "key-first" }, async () => {
+	await withEnv({ EXA_API_KEY: undefined, PARALLEL_API_KEY: undefined, PI_WEB_SEARCH_RETRIES: "0", PI_WEB_SEARCH_ROUTING: "key-first", PI_WEB_SEARCH_ALLOW_BILLABLE: "true" }, async () => {
 		// 12a. Key 通道 500 回显 key，free 成功 → details.fallbackReason 不含 key.
 		{
 			const { tool } = setup(store);
@@ -403,6 +406,7 @@ test("auth-ui: 状态报告区分 configured 与 unavailable", async () => {
 	const text = ctx.notes.map((note) => note.message).join("\n");
 	assert.match(text, /exa：已配置/);
 	assert.match(text, /parallel：系统密钥库不可用/);
+	assert.match(text, /firecrawl：系统密钥库不可用/);
 	assert.match(text, /锁定/);
 });
 
@@ -470,7 +474,7 @@ test("auth: 成功 MCP 200 回显 key 时 content / details / spill 均脱敏", 
 	const { tool } = setup(store);
 	const leaked = `raw=${SPECIAL_SECRET} url=${encodeURIComponent(SPECIAL_SECRET)}`;
 	const body = `Title: T\nURL: https://example.com/a\nHighlights:\n${"y".repeat(30000)} ${leaked}`;
-	await withEnv({ EXA_API_KEY: undefined, PARALLEL_API_KEY: undefined, PI_WEB_SEARCH_RETRIES: "0" }, async () => {
+	await withEnv({ EXA_API_KEY: undefined, PARALLEL_API_KEY: undefined, PI_WEB_SEARCH_RETRIES: "0", PI_WEB_SEARCH_ALLOW_BILLABLE: "true" }, async () => {
 		await withFetch(
 			() =>
 				new Response(
@@ -501,7 +505,7 @@ test("auth: 长错误 key 跨原 300 字符边界无部分泄露", async () => {
 	const { tool } = setup(store);
 	// key 起始于约第 294 字符，正好跨过旧的 300 字符预截断边界。
 	const detail = `${"x".repeat(280)}${longSecret}`;
-	await withEnv({ EXA_API_KEY: undefined, PARALLEL_API_KEY: undefined, PI_WEB_SEARCH_RETRIES: "0" }, async () => {
+	await withEnv({ EXA_API_KEY: undefined, PARALLEL_API_KEY: undefined, PI_WEB_SEARCH_RETRIES: "0", PI_WEB_SEARCH_ALLOW_BILLABLE: "true" }, async () => {
 		await withFetch(
 			() => new Response(JSON.stringify({ error: { message: detail } }), { status: 500 }),
 			async () => {
@@ -562,7 +566,7 @@ test("auth-ui: 状态与说明各合并为单条通知并复用已 probe 状态"
 		const statusCtx = fakeCtx({ selections: ["查看状态"] });
 		await authCommand.handler("", statusCtx);
 		assert.equal(statusCtx.notes.length, 1, "状态应合并为单条通知");
-		assert.equal(reads, 4, "四个后端各 probe 一次，选择「查看状态」不应重复 probe 密钥库");
+		assert.equal(reads, 5, "五个后端各 probe 一次，选择「查看状态」不应重复 probe 密钥库");
 		const guideCtx = fakeCtx({ selections: ["查看配置说明"] });
 		await authCommand.handler("", guideCtx);
 		assert.equal(guideCtx.notes.length, 1, "说明应合并为单条通知");
@@ -604,8 +608,9 @@ test("auth-ui: 路由菜单读取插件共享的搜索通道健康状态", async
 			PARALLEL_API_KEY: undefined,
 			TAVILY_API_KEY: undefined,
 			SERPAPI_API_KEY: undefined,
+			FIRECRAWL_API_KEY: undefined,
 			PI_WEB_SEARCH_ROUTING: "free-first",
-			PI_WEB_SEARCH_ALLOW_PAID: "true",
+			PI_WEB_SEARCH_ALLOW_BILLABLE: "false",
 			PI_WEB_SEARCH_FREE_COOLDOWN_MS: "5000",
 			PI_WEB_SEARCH_RETRIES: "0",
 		},

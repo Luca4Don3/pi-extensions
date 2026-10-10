@@ -92,7 +92,7 @@ async function reportStatus(
 ): Promise<void> {
 	const statuses = probed ?? (await Promise.all(BACKENDS.map((backend) => probeBackendStatus(backend, store))));
 	const lines = statuses.map((status) => statusLine(status, store));
-	lines.push("Exa / Parallel 具备免 key 通道，实时冷却状态见「查看路由与冷却状态」；Tavily / SerpApi 必须配置密钥。");
+	lines.push("Exa / Parallel / Tavily / Firecrawl 具备匿名通道，实时冷却状态另行查看；SerpApi 需要密钥和显式计费授权。");
 	const hasUnavailable = statuses.some((status) => status.state === "unavailable");
 	notify(ctx, lines.join("\n"), hasUnavailable ? "warning" : "info");
 }
@@ -101,7 +101,8 @@ async function reportStatus(
 async function showGuides(ctx: ExtensionCommandContext, store: SecretStore): Promise<void> {
 	const sections = BACKENDS.map((backend) => configGuide(backend, store.kind).lines.join("\n"));
 	sections.push(`环境变量同样有效且优先：${BACKENDS.map(envVarName).join(" / ")}。`);
-	sections.push("Tavily / SerpApi 必须配置密钥，没有免 key 通道。");
+	sections.push("四家服务支持匿名搜索；SerpApi 需要密钥。配置密钥不代表允许计费，默认禁止认证搜索。");
+	sections.push("只有显式设置 PI_WEB_SEARCH_ALLOW_BILLABLE=true 才授权可能收费的通道；旧开关 PI_WEB_SEARCH_ALLOW_PAID 为兼容别名，两者冲突会报错。");
 	notify(ctx, sections.join("\n\n"));
 }
 
@@ -142,7 +143,7 @@ function reportRouting(ctx: ExtensionCommandContext, readStatus: RoutingStatusRe
 	try {
 		const status = readStatus();
 		const lines = [
-			`路由：${status.strategy === "free-first" ? "免费优先" : "密钥优先"}；密钥通道：${status.allowPaid ? "允许（可能产生费用）" : "已禁用"}。`,
+			`路由：${status.strategy === "free-first" ? "免费优先" : "密钥优先"}；密钥通道：${status.allowBillable ? "已明确授权（可能产生费用）" : "已禁用"}。`,
 			`免费通道默认冷却：${status.freeCooldownMs / 1000} 秒；仅存于本进程内存。`,
 		];
 		if (status.channels.length === 0) lines.push("当前没有正在冷却的通道。");
@@ -151,7 +152,7 @@ function reportRouting(ctx: ExtensionCommandContext, readStatus: RoutingStatusRe
 		}
 		notify(ctx, lines.join("\n"));
 	} catch {
-		notify(ctx, "路由配置无效，请检查 PI_WEB_SEARCH_ROUTING、PI_WEB_SEARCH_ALLOW_PAID 与 PI_WEB_SEARCH_FREE_COOLDOWN_MS。", "error");
+		notify(ctx, "路由配置无效，请检查 PI_WEB_SEARCH_ROUTING、PI_WEB_SEARCH_ALLOW_BILLABLE、兼容开关 PI_WEB_SEARCH_ALLOW_PAID 与 PI_WEB_SEARCH_FREE_COOLDOWN_MS。", "error");
 	}
 }
 

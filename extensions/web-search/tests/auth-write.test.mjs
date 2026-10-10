@@ -11,7 +11,9 @@ const ENV_KEYS = [
 	"PARALLEL_API_KEY",
 	"TAVILY_API_KEY",
 	"SERPAPI_API_KEY",
+	"FIRECRAWL_API_KEY",
 	"PI_WEB_SEARCH_ROUTING",
+	"PI_WEB_SEARCH_ALLOW_BILLABLE",
 	"PI_WEB_SEARCH_ALLOW_PAID",
 ];
 for (const key of ENV_KEYS) delete process.env[key];
@@ -21,7 +23,7 @@ const loaded = await jiti.import(fileURLToPath(new URL("../index.ts", import.met
 const plugin = loaded.default ?? loaded;
 
 const SECRET = "write_test_FAKE_SECRET_987";
-const BACKENDS = ["exa", "parallel", "tavily", "serpapi"];
+const BACKENDS = ["exa", "parallel", "tavily", "firecrawl", "serpapi"];
 
 async function withEnv(vars, fn) {
 	const merged = { ...Object.fromEntries(ENV_KEYS.map((key) => [key, undefined])), ...vars };
@@ -195,7 +197,7 @@ test("写入：rpc 模式即使 hasUI=true 也不调用 custom 或普通 input",
 	assert.match(ctx.notes.at(-1).message, /不支持安全掩码输入/u);
 });
 
-test("写入：四个 backend 均可经真实掩码组件写入", async () => {
+test("写入：五个 backend 均可经真实掩码组件写入", async () => {
 	const writes = [];
 	const store = fakeStore({ write: async (backend, value) => (writes.push({ backend, value }), { status: "written" }) });
 	for (const backend of BACKENDS) {

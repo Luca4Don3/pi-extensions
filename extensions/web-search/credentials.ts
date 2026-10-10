@@ -20,9 +20,10 @@
 import { spawn } from "node:child_process";
 import { userInfo } from "node:os";
 import { fileURLToPath } from "node:url";
+import type { ProviderId } from "./search/registry.js";
 
-/** 支持凭据配置的后端标识。 */
-export type SecretBackend = "exa" | "parallel" | "tavily" | "serpapi";
+/** 与搜索注册表保持一致的凭据后端标识。 */
+export type SecretBackend = ProviderId;
 
 /** 凭据最长长度；仅接受非空、无空白的 ASCII 可打印 token。 */
 export const MAX_SECRET_CHARS = 4096;

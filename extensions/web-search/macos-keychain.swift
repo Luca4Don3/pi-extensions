@@ -14,6 +14,7 @@ func main() -> Never {
         "pi-web-search-exa",
         "pi-web-search-parallel",
         "pi-web-search-tavily",
+        "pi-web-search-firecrawl",
         "pi-web-search-serpapi",
     ]
     guard !account.isEmpty, allowedServices.contains(service) else { exit(2) }

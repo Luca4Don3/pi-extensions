@@ -2,13 +2,13 @@
  * Pi Web Search 扩展
  *
  * 通过 JSON-RPC 2.0 直连 Exa / Parallel 的远程 MCP 端点，并直连 Tavily /
- * SerpApi 的原生 HTTP 接口，为 Pi 提供统一的 `web_search` 工具。
- * Exa / Parallel 默认免 key；Tavily / SerpApi 只在配置密钥后参与路由。
+ * Firecrawl / SerpApi 的原生 HTTP 接口，为 Pi 提供统一的 `web_search` 工具。
+ * 四个匿名通道默认启用；任何密钥通道都需要显式计费授权。
  *
  * 设计要点：
  * - 单请求预算可注入（默认 25 秒），外部取消信号会被转发且立即生效。
  * - 响应体既可能是直接 JSON，也可能是 SSE（`data:` 事件块），两种都解析。
- * - 默认先尝试免费通道；可用 PI_WEB_SEARCH_ROUTING=key-first 保留旧的 Key 优先顺序。
+ * - 默认匿名顺序为 Parallel → Exa → Tavily → Firecrawl；默认拒绝可能计费的通道。
  * - 失败按错误类型决策：额度/鉴权直接换通道，限流与 5xx 退避重试，取消立即终止。
  * - 模型可见正文截断到 MAX_TEXT_CHARS，原文落盘供模型按需 read。
  * - Exa / Parallel key 解析顺序：环境变量优先，其次系统密钥库
@@ -26,6 +26,7 @@ import { Type } from "typebox";
 import { createSecretStore, type SecretStore } from "./credentials.js";
 import {
 	BACKENDS,
+	emptyPlanKeys,
 	resolvePlanKeys,
 	redactSecrets,
 	safeDiagnostic,
@@ -42,7 +43,8 @@ import {
 	type SearchErrorKind,
 	type WebSource,
 } from "./search-core.js";
-import { apiHttpKind, buildApiRequest, parseApiResponse, type RequestSpec } from "./search-api.js";
+import { apiHttpKind, buildApiRequest, isApiBackend, parseApiResponse, type RequestSpec } from "./search-api.js";
+import { getProviderMetadata, isProviderId, PROVIDER_IDS } from "./search/registry.js";
 
 export type { WebSource };
 
@@ -69,7 +71,7 @@ const SPILL_KEEP_FILES = 20;
 /** 落盘目录名（位于系统临时目录下，不进入任何公开目录）。 */
 const SPILL_DIR_NAME = "pi-web-search";
 /** 归属标识，便于端点侧识别调用方。 */
-const USER_AGENT = "pi-web-search/0.4.0-beta.2";
+const USER_AGENT = "pi-web-search/0.5.0-beta.1";
 
 /** 一次尝试：某个后端的某个通道。 */
 interface RouteStep extends RoutingStep {
@@ -105,8 +107,8 @@ const WebSearchParams = Type.Object({
 		}),
 	),
 	provider: Type.Optional(
-		Type.Union([Type.Literal("auto"), Type.Literal("exa"), Type.Literal("parallel"), Type.Literal("tavily"), Type.Literal("serpapi")], {
-			description: "Search backend. auto (default) tries Exa, Parallel, then configured Tavily and SerpApi.",
+		Type.Union([Type.Literal("auto"), ...PROVIDER_IDS.map((backend) => Type.Literal(backend))], {
+			description: "Search backend. auto (default) tries anonymous Parallel, Exa, Tavily, then Firecrawl. Key channels require explicit billable authorization.",
 		}),
 	),
 });
@@ -444,7 +446,7 @@ function renderParallel(sources: WebSource[], text: string): string {
 
 /** 渲染模型可见正文；所有分支共用同一个字符上限。 */
 function renderOutcome(query: string, outcome: SearchOutcome, spill?: SpillResult): string {
-	const label = { exa: "Exa", parallel: "Parallel", tavily: "Tavily", serpapi: "SerpApi" }[outcome.backend];
+	const label = getProviderMetadata(outcome.backend).label;
 	const heading = `[${label}] search: ${query}`;
 	const body = outcome.backend === "exa" ? outcome.text : renderParallel(outcome.sources, outcome.text);
 	if (body.length <= MAX_TEXT_CHARS) return `${heading}\n\n${body}`;
@@ -520,13 +522,10 @@ async function searchChannel(
 		signal?.addEventListener("abort", onAbort, { once: true });
 
 		try {
-			if ((backend === "tavily" || backend === "serpapi") && (step.apiKey === undefined || step.apiKey.length === 0)) {
-				throw new BackendError(`${backend} 未配置密钥`, "invalid_key");
-			}
-			// Tavily / SerpApi 使用原生接口，Exa / Parallel 继续使用 MCP 信封。
+			// 原生接口通过适配器表分发，Exa / Parallel 保持原有 MCP 信封。
 			const request: RequestSpec =
-				backend === "tavily" || backend === "serpapi"
-					? buildApiRequest(backend, query, numResults, step.apiKey ?? "")
+				isApiBackend(backend)
+					? buildApiRequest(backend, query, numResults, step.apiKey, channel)
 					: {
 							url: backend === "exa" ? exaEndpoint(step) : PARALLEL_MCP_URL,
 							method: "POST",
@@ -552,7 +551,7 @@ async function searchChannel(
 				throw new BackendError(`${backend} HTTP ${response.status}${detail}`, kind, retryAfterMs);
 			}
 			const body = await response.text();
-			if (backend === "tavily" || backend === "serpapi") {
+			if (isApiBackend(backend)) {
 				const sources = parseApiResponse(backend, body, numResults);
 				return { text: renderParallel(sources, ""), sources };
 			}
@@ -561,7 +560,11 @@ async function searchChannel(
 			if (backend === "exa" && channel === "free" && isExaFreeRateLimitNotice(text)) {
 				throw new BackendError(text.trim(), "quota_exhausted");
 			}
-			return { text, sources: extractSources(text) };
+			const sources = extractSources(text);
+			if (sources.length === 0) {
+				throw new BackendError(`${backend} 未返回可用的搜索来源`, "protocol_error");
+			}
+			return { text, sources };
 		} catch (error) {
 			if (isAborted(signal)) throw createAbortError();
 			if (timedOut) throw new BackendError(`${backend} timed out after ${timeoutMs}ms`, "timeout");
@@ -606,7 +609,7 @@ export default function piWebSearch(pi: ExtensionAPI, options: WebSearchOptions 
 		name: "web_search",
 		label: "Web Search",
 		description:
-			"Search the web via Exa, Parallel, Tavily, or SerpApi. Exa and Parallel work without keys; Tavily and SerpApi require configured keys. Returns citable page content and source URLs for current events, documentation, and facts beyond the training data.",
+			"Search the web via anonymous Parallel, Exa, Tavily, or Firecrawl by default. Configured keys and SerpApi require explicit billable authorization. Returns citable page content and source URLs for current events, documentation, and facts beyond the training data.",
 		parameters: WebSearchParams,
 		annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
 		async execute(_toolCallId, params, signal) {
@@ -615,12 +618,13 @@ export default function piWebSearch(pi: ExtensionAPI, options: WebSearchOptions 
 			if (isAborted(signal)) throw createAbortError();
 
 			const provider = params.provider ?? "auto";
+			if (provider !== "auto" && !isProviderId(provider)) throw new Error("未知的搜索后端");
 			const numResults = params.maxResults ?? DEFAULT_NUM_RESULTS;
 			const config = readRoutingConfig();
-			// 禁用付费路由时不读取任何 key 环境变量，也不访问 SecretStore。
-			const keys: Record<Backend, string | undefined> = config.allowPaid
+			// 没有明确计费授权时，不读取任何密钥环境变量或系统密钥库。
+			const keys = config.allowBillable
 				? await resolvePlanKeys(provider, store, signal)
-				: { exa: undefined, parallel: undefined, tavily: undefined, serpapi: undefined };
+				: emptyPlanKeys();
 			if (isAborted(signal)) throw createAbortError();
 			const routes: RouteStep[] = buildRoutePlan(provider, keys, config).map((step) => ({
 				...step,
@@ -678,6 +682,7 @@ export default function piWebSearch(pi: ExtensionAPI, options: WebSearchOptions 
 						details: {
 							provider: step.backend,
 							channel: step.channel,
+							accessTier: step.channel === "free" ? "anonymous" : "billable",
 							query: safeQuery,
 							numResults,
 							sourceCount: sources.length,
@@ -714,7 +719,7 @@ export default function piWebSearch(pi: ExtensionAPI, options: WebSearchOptions 
 				}
 			}
 			throw new Error(
-				`web_search failed — ${failures.map((failure) => `${failure.label}[${failure.kind}]: ${failure.message}`).join(" | ")}`,
+				`web_search failed — ${failures.map((failure) => `${failure.label}[${failure.kind}]: ${failure.message}`).join(" | ")}${config.allowBillable ? "" : " | 可能计费通道未获授权，未尝试"}`,
 			);
 		},
 	});
