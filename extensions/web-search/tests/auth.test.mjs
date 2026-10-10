@@ -583,7 +583,8 @@ test("auth-ui: 状态与说明各合并为单条通知并复用已 probe 状态"
 		const statusCtx = fakeCtx({ selections: ["查看状态"] });
 		await authCommand.handler("", statusCtx);
 		assert.equal(statusCtx.notes.length, 1, "状态应合并为单条通知");
-		assert.equal(reads, 6, "全部后端各 probe 一次，选择「查看状态」不应重复 probe 密钥库");
+		assert.equal(reads, 5, "仅可能计费后端各 probe 一次；零凭据的 TinyFish 不读密钥库，选择「查看状态」也不重复 probe");
+		assert.match(statusCtx.notes[0].message, /tinyfish：零凭据匿名通道，无需也不读取密钥/u);
 		const guideCtx = fakeCtx({ selections: ["查看配置说明"] });
 		await authCommand.handler("", guideCtx);
 		assert.equal(guideCtx.notes.length, 1, "说明应合并为单条通知");

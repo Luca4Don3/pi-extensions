@@ -35,8 +35,8 @@ export type AuthSource = "env" | "keychain" | "secret-tool";
 /** 单个后端的认证状态。 */
 export interface BackendStatus {
 	backend: Backend;
-	/** configured：已配置；not_configured：密钥库可用但无条目；unavailable：密钥库不可用。 */
-	state: "configured" | "not_configured" | "unavailable";
+	/** configured：已配置；not_configured：密钥库可用但无条目；credential_free：零凭据通道，无需密钥；unavailable：密钥库不可用。 */
+	state: "configured" | "not_configured" | "credential_free" | "unavailable";
 	/** 仅在 configured 时给出凭据来源。 */
 	source?: AuthSource;
 	/** 仅在 unavailable 时给出不含敏感信息的诊断原因。 */
@@ -158,6 +158,9 @@ export async function resolvePlanKeys(
 
 /** 查询单个后端的认证状态；不抛错，密钥库失败归入 unavailable。 */
 export async function probeBackendStatus(backend: Backend, store: SecretStore): Promise<BackendStatus> {
+	// 零凭据通道（如 TinyFish keyless）既不读密钥环境变量也不读密钥库，
+	// 否则「查看状态」本身就会变成一次未经授权的凭据访问。
+	if (!supportsKeyChannel(backend)) return { backend, state: "credential_free" };
 	const fromEnv = envKey(backend);
 	if (fromEnv !== undefined) return { backend, state: "configured", source: "env" };
 	let result: Awaited<ReturnType<SecretStore["read"]>>;

@@ -170,6 +170,78 @@ test("keyless 500 按服务端错误重试一次", async () => {
 	});
 });
 
+/**
+ * keyless 每日额度耗尽时的确切响应文本未经实测（不想为观测而打满 50 次请求），
+ * 因此这里只锁定通用的分类与冷却路径：状态码（402 / 429）与正文特征（quota / credit
+ * exhausted）都能分别归入额度耗尽或限流，并进入冷却，避免在额度耗尽后反复请求。
+ */
+test("keyless 额度耗尽的各种形态均被分类并进入冷却，不重试", async () => {
+	const cases = [
+		{
+			label: "HTTP 402 需钱包余额",
+			response: () => new Response(JSON.stringify({ error: { code: "INSUFFICIENT_CREDITS", message: "insufficient credits" } }), { status: 402 }),
+			kind: /quota_exhausted/u,
+			reason: "quota_exhausted",
+		},
+		{
+			label: "HTTP 402 每日免费额度用尽",
+			response: () => new Response(JSON.stringify({ error: { code: "FREE_ALLOWANCE_EXHAUSTED", message: "free allowance exhausted" } }), { status: 402 }),
+			kind: /quota_exhausted/u,
+			reason: "quota_exhausted",
+		},
+		{
+			label: "HTTP 429 限流",
+			response: () => new Response("rate limited", { status: 429, headers: { "retry-after": "30" } }),
+			kind: /rate_limited/u,
+			reason: "rate_limited",
+		},
+		{
+			label: "JSON-RPC 错误含额度用尽特征",
+			response: () => new Response(JSON.stringify({ jsonrpc: "2.0", id: 1, error: { code: -32000, message: "daily search quota exhausted" } }), { status: 200 }),
+			kind: /quota_exhausted/u,
+			reason: "quota_exhausted",
+		},
+		{
+			label: "MCP isError 含积分用尽特征",
+			response: () => new Response(JSON.stringify({ jsonrpc: "2.0", id: 1, result: { isError: true, content: [{ type: "text", text: "no remaining credits for keyless search" }] } }), { status: 200 }),
+			kind: /quota_exhausted/u,
+			reason: "quota_exhausted",
+		},
+	];
+	for (const testCase of cases) {
+		const reads = [];
+		const store = fakeStore(reads);
+		const tool = setup(store);
+		await withEnv({ PI_WEB_SEARCH_RETRIES: "2", PI_WEB_SEARCH_ALLOW_BILLABLE: "true", TINYFISH_API_KEY: fakeKey("tinyfish") }, async () => {
+			let requests = 0;
+			await withFetch(() => (requests++, testCase.response()), async () => {
+				await assert.rejects(tool.execute(`tinyfish-${testCase.reason}`, { query: "额度耗尽", provider: "tinyfish" }), testCase.kind);
+				assert.equal(requests, 1, `${testCase.label}：不得重试同一通道`);
+			});
+			// 冷却生效：后续执行直接跳过，不再发请求。
+			await withFetch(() => { requests++; return testCase.response(); }, async () => {
+				await assert.rejects(tool.execute(`tinyfish-cooled-${testCase.reason}`, { query: "冷却中", provider: "tinyfish" }), /quota_preflight/u);
+				assert.equal(requests, 1, `${testCase.label}：冷却期内不得发出新请求`);
+			});
+		});
+		assert.deepEqual(reads, [], "零凭据通道在任何错误形态下都不得读取密钥库");
+	}
+});
+
+test("keyless 无凭据状态不读取密钥环境变量或密钥库", async () => {
+	const reads = [];
+	const store = fakeStore(reads);
+	const tool = setup(store);
+	await withEnv({ TINYFISH_API_KEY: fakeKey("tinyfish") }, async (envReads) => {
+		const { probeBackendStatus, KEY_BACKENDS } = await jiti.import(fileURLToPath(new URL("../auth.ts", import.meta.url)));
+		const status = await probeBackendStatus("tinyfish", store.store);
+		assert.equal(status.state, "credential_free");
+		assert.equal(envReads.TINYFISH_API_KEY, 0, "零凭据后端的状态探测不得读取密钥环境变量");
+		assert.deepEqual(reads, [], "零凭据后端的状态探测不得读取密钥库");
+		assert.ok(!KEY_BACKENDS.includes("tinyfish"));
+	});
+});
+
 test("keyless 响应体超过上限时不返回部分结果，也不记录冷却", async () => {
 	const tool = setup(fakeStore());
 	await withEnv({ PI_WEB_SEARCH_MAX_RESPONSE_BYTES: "32", PI_WEB_SEARCH_RETRIES: "1", PI_WEB_SEARCH_FREE_COOLDOWN_MS: "60000" }, async () => {
