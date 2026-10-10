@@ -21,14 +21,18 @@
 pi-extensions/
 ├── extensions/
 │   ├── web-search/
-│   │   ├── index.ts              # 扩展入口
+│   │   ├── index.ts              # 扩展入口与搜索路由
 │   │   ├── auth.ts               # 凭据解析 / 状态 / 脱敏
 │   │   ├── auth-ui.ts            # /web-search-auth 菜单
 │   │   ├── credentials.ts        # Keychain / secret-tool 访问层
+│   │   ├── channel-health.ts     # 后端与通道独立冷却状态
+│   │   ├── routing.ts            # 路由与环境变量校验
+│   │   ├── search-api.ts         # Tavily / SerpApi 接口适配
+│   │   ├── masked-input.ts       # 终端掩码输入
+│   │   ├── macos-keychain.swift  # macOS 安全框架（Security Framework）写入适配器
 │   │   ├── package.json          # 让该插件可被单独安装
 │   │   └── tests/
-│   │       ├── mock.test.mjs     # 离线测试（CI 跑这个）
-│   │       ├── auth.test.mjs     # 认证离线测试
+│   │       ├── *.test.mjs        # 离线测试
 │   │       └── smoke.mjs         # 真实网络冒烟
 │   ├── subagent/
 │   │   ├── index.ts              # 工具入口
@@ -278,32 +282,31 @@ Pi 的内置工具只有 `read` / `bash` / `edit` / `write` / `grep` / `find` / 
 
 **不依赖 opencode、DSH 或任何额外服务端进程**，也不需要 DeepSeek 官方 API key。只要 Pi 能联网就能用。
 
-> **与 npm 上同名包 `pi-web-search` 的区别**：那个包（作者 ttttmr）走各家 provider 的**服务端原生搜索**能力，需要对应 provider 的 API key；本扩展直连 Exa / Parallel 的公开 MCP 端点，**无需任何 key，也不挑 provider**。本扩展不发布到 npm，只通过上面的 GitHub 安装方式分发。
+> **与 npm 上同名包 `pi-web-search` 的区别**：那个包走各家 provider 的服务端原生搜索能力；本扩展直接连接 Exa / Parallel 的远程模型上下文协议（Model Context Protocol，MCP）端点，也可配置 Tavily / SerpApi 密钥使用其原生接口。本扩展不发布到 npm，只通过上面的 GitHub 安装方式分发。
 
-## 状态：v0.4.0-beta.1
+## 状态：v0.4.0-beta.2
 
-已在 **Pi 1.1.0** 上验证，本版本明确承诺：
+提供原生 `web_search` 工具，兼容 Pi 扩展调用方式。此版本支持四个搜索后端，路由、认证和安全输入行为如下：
 
-- Pi 1.1.0 真实会话兼容，模型可自主调用 `web_search`，工具名与参数保持稳定
-- 路由：Exa Key → Exa Free → Parallel Key → Parallel Free → Tavily Key → SerpApi Key（未配置密钥的后端自动跳过）
-- 额度耗尽（402 / quota 文本）与鉴权失败（401/403）不重试，直接降级到免费通道
-- 限流（429）尊重上游 `Retry-After`，5xx 与网络抖动按指数退避重试
-- 取消贯穿完整生命周期：请求、响应体读取、退避等待、故障切换、落盘
-- MCP `result.isError` 被识别为失败，不会把错误文本当成搜索结果
-- `/web-search-auth` 菜单管理凭据：macOS Keychain / Linux secret-tool，环境变量优先，错误文本统一脱敏
+- 自动路由默认免费优先：先尝试 Exa / Parallel 免费通道，再尝试已配置密钥的 Exa / Parallel、Tavily 与 SerpApi 通道。
+- 密钥优先模式会先试每个 Exa / Parallel 后端的密钥通道再试免费通道；显式指定 `provider` 时只选择该后端。
+- Exa 免费端点的特定额度提示会作为额度耗尽处理，不会作为搜索结果返回；429、冷却和退避规则见下文。
+- `/web-search-auth` 支持状态、路由与冷却查看、配置说明、安全添加或修改、确认删除；输入仅在终端掩码界面进行。
+- 请求与错误处理会脱敏密钥；取消不会记录为通道失败。
 
-**暂不承诺**：匿名端点的无限额度、所有模型（仅在作者本地的一个模型上实测过）、长期运行稳定性。
+已在 Pi `1.1.0` 实际终端验证掩码输入、认证菜单与冷却共享（使用模拟密钥库与网络），并通过 Exa / Parallel 免费通道及自动路由的真实网络冒烟测试。离线自动化测试使用网络与密钥库假实现；本轮未进行真实系统密钥库端到端（end-to-end，E2E）验证，真实验证待用户受控确认。
+
+**暂不承诺**：匿名端点的无限额度、所有模型上的效果、长期运行稳定性。
 
 ## 特性
 
 - 原生 `web_search` 工具，模型可直接调用，无需再拼 `curl` 命令
-- 双后端：Exa（`mcp.exa.ai`）与 Parallel（`search.parallel.ai`）的远程 MCP 端点，默认免 key
-- **Key 优先、失败降级**：配了 key 先走认证通道，额度耗尽或鉴权失败自动改用免费通道，不浪费付费额度
-- **凭据可托管给系统密钥库**：`/web-search-auth` 菜单查看状态、生成安全配置命令、删除条目；环境变量优先，macOS Keychain / Linux secret-tool 次之
-- `provider: "auto"` 依次尝试 Exa 与 Parallel 的全部可用通道
-- 同时解析直接 JSON 与 SSE 事件块（同一事件的多行 `data:` 拼接）
-- 单请求预算可注入（默认 25 秒），取消信号贯穿请求、读体、退避、切换与落盘
-- 失败分类：额度、限流、鉴权、服务端、网络、超时、取消、协议错误各自决策
+- Exa（`mcp.exa.ai`）与 Parallel（`search.parallel.ai`）提供免费通道；Tavily 与 SerpApi 使用需配置密钥的原生接口
+- 默认免费优先，但免费通道失败后仍可能使用已配置密钥；可通过 `PI_WEB_SEARCH_ALLOW_PAID=false` 禁用全部密钥通道
+- 系统密钥库由 `/web-search-auth` 菜单管理；环境变量优先，不修改 shell 启动文件
+- 同时解析直接 JSON 与服务端发送事件（Server-Sent Events，SSE）数据帧
+- 单请求预算默认 25 秒；密钥库读取、请求、读体和退避可中断，切换与落盘前后检查取消；在途文件操作须完成后才返回取消
+- 失败分类分别处理额度、限流、鉴权、服务端、网络、超时、取消与协议错误
 - 模型可见正文截断到 24 000 字符，结构化来源与路由信息完整保留在 `details`
 
 ## 用法
@@ -314,7 +317,7 @@ Pi 的内置工具只有 `read` / `bash` / `edit` / `write` / `grep` / `find` / 
 | --- | --- | --- |
 | `query` | string，必填 | 搜索词。建议描述理想页面，而不是堆关键词 |
 | `maxResults` | integer，可选 | 结果条数，默认 `8`，上限 `20` |
-| `provider` | `auto` \| `exa` \| `parallel`，可选 | 默认 `auto`：依次尝试 Exa 与 Parallel 的可用通道 |
+| `provider` | `auto` \| `exa` \| `parallel` \| `tavily` \| `serpapi`，可选 | 默认 `auto`；显式指定时只尝试该后端可用的通道 |
 
 调用示例：
 
@@ -338,75 +341,75 @@ Pi 的内置工具只有 `read` / `bash` / `edit` / `write` / `grep` / `find` / 
 | `PARALLEL_API_KEY` | 空 | 以 `Authorization: Bearer` 头附加到 Parallel 端点；优先于系统密钥库 |
 | `TAVILY_API_KEY` | 空 | Tavily 没有免 key 通道；以 `Authorization: Bearer` 头调用 `https://api.tavily.com/search`，固定使用 basic 搜索（1 积分） |
 | `SERPAPI_API_KEY` | 空 | SerpApi 没有免 key 通道；以 `api_key` 查询参数调用 `https://serpapi.com/search.json`，结果来自 Google organic_results |
+| `PI_WEB_SEARCH_ROUTING` | `free-first` | 只接受 `free-first` 或 `key-first`；非法值明确报错 |
+| `PI_WEB_SEARCH_ALLOW_PAID` | `true` | 只接受 `true` 或 `false`；设为 `false` 后跳过全部密钥通道，搜索也不读取环境变量或系统密钥库中的密钥 |
+| `PI_WEB_SEARCH_FREE_COOLDOWN_MS` | `1800000` | 默认冷却 30 分钟；接受 `0` 至 `86400000` 的安全整数，`0` 禁用冷却，非法值明确报错 |
 | `PI_WEB_SEARCH_TIMEOUT_MS` | `25000` | 单请求预算，最小 `100` |
 | `PI_WEB_SEARCH_RETRIES` | `1` | 可重试错误的最大重试次数，`0` 表示不重试 |
 
-两个端点默认免 key；填 key 只是为了更高额度。
+Exa / Parallel 提供免费通道；Tavily / SerpApi 必须配置密钥。
 
 ## 认证（`/web-search-auth`）
 
-两个后端都遵循「环境变量优先，系统密钥库其次」：
+四个后端均遵循「环境变量优先，系统密钥库其次」。环境变量不会被菜单修改，也不会写入 shell 启动文件（shell startup file）。
 
-| 平台 | 系统密钥库 | 配置方式 |
+| 平台 | 系统密钥库 | 写入方式 |
 | --- | --- | --- |
-| macOS | Keychain | `security add-generic-password` |
-| Linux | Secret Service（`secret-tool`） | `secret-tool store` |
-| 其它 | 无 | 用外部 secret manager（1Password CLI、Vault、sops、direnv 等）注入进程环境变量，或直接用免 key 通道 |
+| macOS | Keychain | 静态 `macos-keychain.swift` 通过标准输入（standard input）调用安全框架（Security Framework）；`security` 命令仅用于读取和删除 |
+| Linux | Secret Service（`secret-tool`） | 密钥通过标准输入交给 `secret-tool`，写入后重新读取验证 |
+| 其它 | 无 | 可通过外部密钥管理工具向进程注入环境变量；不会退化为明文文件 |
 
-在 Pi 里执行 `/web-search-auth` 打开 select 菜单：
+在 Pi 里执行 `/web-search-auth` 打开菜单：
 
-- **查看状态**：分别报告 exa / parallel 的凭据来源，并区分「未配置」与「系统密钥库不可用」。密钥库读取失败不会阻断搜索，仍会退到免 key 通道。
-- **查看配置说明**：输出安全的终端命令，key 只从命令的交互提示读取，**绝不放进命令参数**：
+- **查看状态**：报告 Exa、Parallel、Tavily、SerpApi 四个后端的密钥来源，并区分未配置与系统密钥库不可用。
+- **添加或修改密钥**：仅在终端交互界面（Terminal UI，TUI）且 `ctx.ui.custom` 可用时显示自绘掩码输入；接受 1–4096 个非空白美国信息交换标准代码（American Standard Code for Information Interchange，ASCII）可打印字符（printable ASCII）。超长、空白或控制字符输入（含粘贴）整体拒绝，不截断，也不使用明文输入回退。取消确认或输入均不会写入。
+- **查看路由与冷却状态**：显示路由策略、密钥通道开关及各后端 / 通道的剩余冷却时间。
+- **查看配置说明**：为当前平台提供不含密钥值的安全说明，不要求把密钥写进命令或参数。
+- **删除系统密钥库中的密钥**：选择后需二次确认；取消不会写入或删除任何凭据。
 
-  ```bash
-  # macOS
-  security add-generic-password -U -a "$USER" -s "pi-web-search-exa" -w
-  # Linux
-  secret-tool store --label="Pi web search: exa" service pi-web-search provider exa
-  ```
+macOS 写入由静态 Swift 适配器使用系统安全框架完成，密钥经标准输入传递；缺少 Swift 命令行工具、密钥库写入失败或写入后读回验证失败时会明确报错。Linux 写入同样经标准输入传递并在完成后读回比对。菜单的掩码组件依赖 Pi 自带的 `@earendil-works/pi-tui`，无需单独安装。
 
-- **删除系统密钥库中的密钥**：二次确认后删除对应后端的条目；成功、未找到、失败都有明确诊断。
-
-设计上不在 Pi 的输入框里接收 key（也不使用自定义掩码输入框），密钥写入完全交给系统自带命令，避免 key 进入 Pi 会话、日志或 shell 历史（关键是 `-w` / `store` 后不要跟任何 key 参数）。
-
-> 环境变量始终优先于系统密钥库；每次 `web_search` 只为用到的后端各解析一次凭据，key 仅存在于内存，不进入 `details`、session 或落盘内容；所有对外错误文本（含 URL 编码形式）都会脱敏。
+> 搜索时环境变量优先；每次只读取本次路由需要的密钥，密钥仅在内存和请求所需位置使用，不进入 `details`、session 或落盘内容。所有对外错误文本（含 URL 编码形式）都会脱敏。
 
 ## 搜索路由
 
-一次 `web_search` 会按下面的顺序尝试，成功即停止：
+自动路由默认采用 `free-first`；密钥通道只会尝试已配置密钥的后端：
 
 ```text
-Exa Key  →  Exa Free  →  Parallel Key  →  Parallel Free  →  Tavily Key  →  SerpApi Key
+Exa Free → Parallel Free → Exa Key → Parallel Key → Tavily Key → SerpApi Key
 ```
 
-没配 key 的后端会跳过对应的 Key 通道。每一步的失败原因决定下一步：
+`key-first` 会按后端顺序优先尝试 Exa Key、Exa Free、Parallel Key、Parallel Free，再尝试 Tavily Key 与 SerpApi Key。显式设置 `provider` 时只选择该后端；`free-first` 下该后端按 Free → Key 尝试，`key-first` 下按 Key → Free 尝试。免费优先只表示通道顺序，不保证永远不会使用已配置的付费密钥；只有 `PI_WEB_SEARCH_ALLOW_PAID=false` 才会禁用所有 Key 通道。
+
+`PI_WEB_SEARCH_ROUTING`、`PI_WEB_SEARCH_ALLOW_PAID` 与 `PI_WEB_SEARCH_FREE_COOLDOWN_MS` 均会严格校验，非法值明确报错。设 `PI_WEB_SEARCH_ALLOW_PAID=false` 时，搜索会跳过全部 Key 通道，并且不读取环境变量或系统密钥库中的任何密钥。免费冷却默认 30 分钟；可设为 `0` 禁用，允许范围为 `0`–`86400000` 的安全整数。
+
+冷却状态按后端与通道独立保存在进程内存，进程重启后重置。Exa 免费 MCP 响应中的精确额度提示 `You've hit Exa's free MCP rate limit` 会分类为 `quota_exhausted`，不会作为搜索结果返回，并使对应通道按配置冷却（默认 30 分钟）。超文本传输协议（Hypertext Transfer Protocol，HTTP）429 在重试结束后会使对应通道进入冷却（冷却未禁用时）：优先采用 `Retry-After`，否则采用配置的默认冷却时长；冷却硬上限为 24 小时。单次重试等待最长 5 秒。普通网络错误不会触发冷却；用户取消不会记作通道失败。
 
 | 失败类型 | 判定 | 处理 |
 | --- | --- | --- |
-| 额度耗尽 | 402，或错误文本含 quota / credit / balance / insufficient | 不重试，换通道 |
-| 鉴权失败 | 401 / 403 | 不重试，换通道 |
-| 限流 | 429，或错误文本含 rate limit | 尊重 `Retry-After`，退避重试后换通道 |
-| 服务端错误 | 5xx | 退避重试后换通道 |
-| 网络抖动 | fetch 抛错（DNS、连接重置等） | 退避重试后换通道 |
-| 超时 | 超过 `PI_WEB_SEARCH_TIMEOUT_MS` | 不重试，换通道 |
-| 取消 | 调用方中断 | 立即终止，不再发起任何请求 |
-| 协议错误 | 其他 4xx、MCP 错误成员、`result.isError`、无可用结果 | 不重试，换通道 |
+| 额度耗尽 | 402、额度错误；Exa 免费端点的上述精确提示也归此类 | 不重试，尝试下一通道；免费通道额度耗尽时按配置冷却 |
+| 鉴权失败 | 401 / 403 | 不重试，尝试下一通道 |
+| 限流 | HTTP 429 或限流错误 | 重试结束后按 `Retry-After` 或默认值冷却，冷却最长 24 小时 |
+| 服务端错误 | 5xx | 按配置重试，之后尝试下一通道 |
+| 网络错误 | DNS、连接重置等普通网络故障 | 按配置重试，之后尝试下一通道；不记录冷却 |
+| 超时 | 超过 `PI_WEB_SEARCH_TIMEOUT_MS` | 不重试，尝试下一通道 |
+| 取消 | 调用方中断 | 立即终止，不再发请求，也不记录冷却 |
+| 协议错误 | 其他 4xx、MCP 错误成员、`result.isError`、无可用结果 | 不重试，尝试下一通道 |
 
-额度判断完全依赖真实搜索的返回，不会额外发请求探测余额。
+额度判断完全依赖真实搜索响应，不会额外发请求探测余额。
 
 ## 工作原理
 
 ```text
 模型
   → web_search 工具（本扩展注册）
-  → JSON-RPC 2.0 tools/call
-  → Exa:      https://mcp.exa.ai/mcp              工具 web_search_exa
-     或 Parallel: https://search.parallel.ai/mcp  工具 web_search
+  → Exa / Parallel：JSON-RPC 2.0 tools/call，连接远程 MCP 端点
+  → Tavily / SerpApi：连接各自的原生搜索接口
   → 响应体：直接 JSON 或 SSE 的 data: 帧
   → 归一化为 { content: 正文, sources: [{url,title,snippet,publishedAt}] }
 ```
 
-Exa 返回的正文本身已是大模型友好的文本布局（`Title:` / `URL:` / `Highlights:`），扩展直接透传并额外抽取结构化来源。Parallel 返回 JSON，扩展转成带链接的 Markdown 列表。
+Exa 返回的正文采用大模型友好的文本布局（`Title:` / `URL:` / `Highlights:`），扩展直接透传并额外抽取结构化来源。Parallel、Tavily 与 SerpApi 的响应会归一化为带链接的搜索结果。
 
 ## 结果结构
 
@@ -414,7 +417,7 @@ Exa 返回的正文本身已是大模型友好的文本布局（`Title:` / `URL:
 
 | 字段 | 说明 |
 | --- | --- |
-| `provider` | 实际命中的后端：`exa` / `parallel` |
+| `provider` | 实际命中的后端：`exa` / `parallel` / `tavily` / `serpapi` |
 | `channel` | 实际命中的通道：`key` / `free` |
 | `sourceCount` | 结构化来源条数（不超过 `maxResults`） |
 | `sources` | `[{ url, title, snippet, publishedAt }]` |
@@ -440,14 +443,14 @@ Exa 返回的正文本身已是大模型友好的文本布局（`Title:` / `URL:
 以下测试覆盖仓库内**所有**插件：
 
 ```bash
-# 离线测试（83 例）：web-search 27 + web-search auth 23 + opencode-fallback 17 + subagent 16
+# 离线自动化测试（使用网络与密钥库假实现）
 node --test extensions/*/tests/*.test.mjs
 
 # 真实网络冒烟（会调用 Exa / Parallel，仅 web-search）
 node extensions/web-search/tests/smoke.mjs
 ```
 
-本地依赖 `jiti` 与 `typebox`，Pi 自带这两个包，指向本机 Pi 安装即可：
+离线测试不代表真实系统密钥库端到端验证；真实验证待用户受控确认。本地依赖 `jiti` 与 `typebox`，Pi 自带这两个包，指向本机 Pi 安装即可：
 
 ```bash
 mkdir -p node_modules/@earendil-works
@@ -471,7 +474,7 @@ CI（`.github/workflows/ci.yml`）固定安装 `@earendil-works/pi-coding-agent@
 
 ## 路线图
 
-- Key 冷却：避免重复请求已确认不可用的认证通道
+- 认证失效冷却：针对 401 / 403 等失效密钥，避免重复请求；429 通道冷却已实现
 - `web_fetch`：读取指定 URL 的正文，进一步减少对 `curl` 的依赖
 - 结果缓存：减少重复查询
 - 更多后端的可插拔注册

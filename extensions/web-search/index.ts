@@ -69,7 +69,7 @@ const SPILL_KEEP_FILES = 20;
 /** 落盘目录名（位于系统临时目录下，不进入任何公开目录）。 */
 const SPILL_DIR_NAME = "pi-web-search";
 /** 归属标识，便于端点侧识别调用方。 */
-const USER_AGENT = "pi-web-search/0.4.0-beta.1";
+const USER_AGENT = "pi-web-search/0.4.0-beta.2";
 
 /** 一次尝试：某个后端的某个通道。 */
 interface RouteStep extends RoutingStep {
