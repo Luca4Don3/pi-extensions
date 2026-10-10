@@ -121,21 +121,31 @@ async function ensureDirectory(directory: string): Promise<void> {
 	const root = parse(absolute).root;
 	let current = root;
 	const parts = absolute.slice(root.length).split(sep).filter(Boolean);
-	for (const part of parts.slice(0, -1)) {
+	if (parts.length === 0) throw new Error(SAFE_UNAVAILABLE);
+	for (const part of parts) {
 		current = join(current, part);
-		const stat = await lstat(current);
+		let wasMissing = false;
+		let stat;
+		try {
+			stat = await lstat(current);
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+			wasMissing = true;
+			// 逐级创建并检查，不使用递归 mkdir 跟随未知的祖先符号链接。
+			try {
+				await mkdir(current, { mode: 0o700 });
+			} catch (createError) {
+				if ((createError as NodeJS.ErrnoException).code !== "EEXIST") throw createError;
+			}
+			stat = await lstat(current);
+		}
 		if (stat.isSymbolicLink() || !stat.isDirectory()) throw new Error(SAFE_UNAVAILABLE);
+		if (wasMissing || current === absolute) {
+			if (process.getuid !== undefined && stat.uid !== process.getuid()) throw new Error(SAFE_UNAVAILABLE);
+			// 不修改已有目录权限；新建的每一级和状态目录都必须私有。
+			if ((stat.mode & 0o077) !== 0) throw new Error(SAFE_UNAVAILABLE);
+		}
 	}
-	try {
-		await mkdir(absolute, { mode: 0o700 });
-	} catch (error) {
-		if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-	}
-	const stat = await lstat(absolute);
-	if (stat.isSymbolicLink() || !stat.isDirectory()) throw new Error(SAFE_UNAVAILABLE);
-	if (process.getuid !== undefined && stat.uid !== process.getuid()) throw new Error(SAFE_UNAVAILABLE);
-	// 已有目录权限不自动修改；只有新建时由 mkdir 请求 0700，umask 只会进一步收紧。
-	if ((stat.mode & 0o077) !== 0) throw new Error(SAFE_UNAVAILABLE);
 }
 
 async function readPrivateFile(path: string, maxBytes: number): Promise<Buffer | undefined> {

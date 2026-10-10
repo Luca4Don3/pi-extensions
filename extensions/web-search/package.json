@@ -1,6 +1,6 @@
 {
   "name": "@luca4don3/pi-extension-web-search",
-  "version": "0.6.0-beta.1",
+  "version": "0.6.0-beta.2",
   "private": true,
   "description": "Standalone entry for the web-search extension of the pi-extensions collection.",
   "type": "module",

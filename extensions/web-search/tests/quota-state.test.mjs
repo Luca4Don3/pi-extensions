@@ -1,6 +1,6 @@
 /** 私有状态仓库测试：全部文件仅创建在项目 .temp/quota-validation，测试结束不删除。 */
 import assert from "node:assert/strict";
-import { chmodSync, mkdirSync, readFileSync, readdirSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync, readdirSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { randomBytes } from "node:crypto";
 import { join } from "node:path";
 import test from "node:test";
@@ -17,6 +17,8 @@ const ROOT = fileURLToPath(new URL("../../../.temp/quota-validation/", import.me
 const salt = randomBytes(32).toString("base64");
 
 function testDir(label) {
+	// 干净检出时夹具根目录不存在，测试自己建立，不依赖手工验收产物。
+	mkdirSync(ROOT, { recursive: true, mode: 0o700 });
 	return join(ROOT, `quota-state-${label}-${Date.now()}-${randomBytes(6).toString("hex")}`);
 }
 
@@ -48,6 +50,44 @@ test("私有状态原子写入 0700/0600；内容只含盐、scope hash 与冷�
 	assert.ok(!content.includes("accountID"));
 	assert.ok(!content.includes("rawerror"));
 	assert.ok(!JSON.stringify(manager.snapshot()).match(/[a-f0-9]{64}/u));
+});
+
+test("首次运行逐级创建配置父目录，均为私有权限且不修改已有祖先", async () => {
+	const root = testDir("fresh-config");
+	mkdirSync(root, { mode: 0o755 });
+	const originalMode = statSync(root).mode;
+	const config = join(root, "agent", "config");
+	const directory = join(config, "web-search");
+	assert.equal(existsSync(join(root, "agent")), false);
+	const manager = await managerAt(directory);
+	manager.recordFailure("exa", "anonymous", "rate_limited");
+	assert.equal((await manager.flush()).status, "persisted");
+	for (const created of [join(root, "agent"), config, directory]) {
+		assert.equal(statSync(created).mode & 0o777, 0o700);
+	}
+	assert.equal(statSync(root).mode, originalMode, "不修改已有祖先权限");
+	const restored = await managerAt(directory);
+	assert.equal(restored.getCooldown("exa", "anonymous").reason, "rate_limited");
+});
+
+test("拒绝符号链接祖先，不在链接目标下创建新的配置目录", async () => {
+	const target = testDir("ancestor-target");
+	mkdirSync(target, { mode: 0o700 });
+	const link = testDir("ancestor-link");
+	symlinkSync(target, link, "dir");
+	const manager = await managerAt(join(link, "config", "web-search"));
+	assert.equal(manager.snapshot().persistence, "degraded");
+	assert.equal((await manager.flush()).status, "degraded");
+	assert.equal(existsSync(join(target, "config")), false);
+});
+
+test("拒绝非目录祖先，保留已有文件原样", async () => {
+	const path = testDir("ancestor-file");
+	writeFileSync(path, "FAKE_EXISTING_CONFIGURATION", { mode: 0o600 });
+	const manager = await managerAt(join(path, "config", "web-search"));
+	assert.equal(manager.snapshot().persistence, "degraded");
+	assert.equal((await manager.flush()).status, "degraded");
+	assert.equal(readFileSync(path, "utf8"), "FAKE_EXISTING_CONFIGURATION");
 });
 
 test("并行仓库更新按 scope 原子合并，不覆盖不同 scope", async () => {

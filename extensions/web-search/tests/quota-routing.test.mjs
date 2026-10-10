@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp } from "node:fs/promises";
+import { mkdir, mkdtemp } from "node:fs/promises";
 import { join } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
@@ -382,6 +382,7 @@ test("密钥轮换隔离冷却 scope，公开快照不泄漏 Key 或 HMAC scope"
 });
 
 test("Pi 重启共享临时私有存储后直接跳过已冷却 Key，不展示 HMAC 标识", async () => {
+	await mkdir(PRIVATE_TEST_ROOT, { recursive: true, mode: 0o700 });
 	const directory = await mkdtemp(join(PRIVATE_TEST_ROOT, "quota-routing-private-"));
 	{
 		const token = fakeKey("tavily");
