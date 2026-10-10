@@ -281,16 +281,18 @@ test("9. 不可重试：Exa 400 只请求一次", async () => {
 	});
 });
 
-test("10. auto 默认禁止计费：四匿名通道均失败时保留完整错误", async () => {
+test("10. auto 默认禁止计费：全部匿名通道均失败时保留完整错误", async () => {
 	await withEnv({ PI_WEB_SEARCH_RETRIES: "0" }, async () => {
 		await withFetch(
 			() => Promise.resolve(new Response(JSON.stringify({ error: { message: "boom" } }), { status: 503 })),
 			async (getCalls) => {
 				await assert.rejects(tool.execute("t10", { query: "both" }), (error) => {
-					for (const backend of ["parallel", "exa", "tavily", "firecrawl"]) assert.match(error.message, new RegExp(backend));
+					for (const backend of ["exa", "tavily", "parallel", "firecrawl", "tinyfish"]) {
+						assert.match(error.message, new RegExp(backend));
+					}
 					return true;
 				});
-				assert.equal(getCalls(), 4, "无授权时只尝试四个匿名通道，不应吞掉失败或访问计费通道");
+				assert.equal(getCalls(), 5, "无授权时只尝试匿名通道，不应吞掉失败或访问计费通道");
 			},
 		);
 	});
@@ -443,14 +445,22 @@ test("20. 全部匿名优先，随后按计费顺序尝试已配置 Key", async 
 					const address = String(url);
 					const isExaCall = address.includes("mcp.exa.ai");
 					const hasKey = isExaCall ? address.includes("exaApiKey") : Boolean(init?.headers?.authorization);
-					const backend = isExaCall ? "exa" : address.includes("api.tavily.com") ? "tavily" : address.includes("firecrawl.dev") ? "firecrawl" : "parallel";
+					const backend = isExaCall
+						? "exa"
+						: address.includes("api.tavily.com")
+							? "tavily"
+							: address.includes("firecrawl.dev")
+								? "firecrawl"
+								: address.includes("agent.tinyfish.ai")
+									? "tinyfish"
+									: "parallel";
 					seen.push(hasKey ? `${backend}(key)` : backend);
 					if (hasKey && backend === "parallel") return okResponse(jsonEnvelope(PARALLEL_INNER));
 					return new Response("anonymous/key unavailable", { status: 503 });
 				},
 				async () => {
 					const result = await tool.execute("t20", { query: "x" }, undefined, undefined, {});
-					assert.deepEqual(seen, ["exa", "tavily", "parallel", "firecrawl", "exa(key)", "parallel(key)"]);
+					assert.deepEqual(seen, ["exa", "tavily", "parallel", "firecrawl", "tinyfish", "exa(key)", "parallel(key)"]);
 					assert.equal(result.details.provider, "parallel");
 					assert.equal(result.details.channel, "key");
 				},
@@ -589,12 +599,13 @@ test("28. auto free-first：四匿名优先，再按计费顺序尝试密钥", a
 				else if (String(url).includes("search.parallel.ai")) order.push(init.headers.authorization ? "parallel(key)" : "parallel");
 				else if (String(url).includes("api.tavily.com")) order.push(init.headers.authorization ? "tavily(key)" : "tavily");
 				else if (String(url).includes("firecrawl.dev")) order.push(init.headers.authorization ? "firecrawl(key)" : "firecrawl");
+				else if (String(url).includes("agent.tinyfish.ai")) order.push(init.headers["X-TinyFish-Access-Mode"] === "keyless" ? "tinyfish" : "other");
 				else order.push("serpapi(key)");
 				return new Response("failure", { status: 500 });
 			},
 			async () => {
 				await assert.rejects(tool.execute("t28", { query: "x" }));
-				assert.deepEqual(order, ["exa", "tavily", "parallel", "firecrawl", "exa(key)", "tavily(key)", "parallel(key)", "firecrawl(key)", "serpapi(key)"]);
+				assert.deepEqual(order, ["exa", "tavily", "parallel", "firecrawl", "tinyfish", "exa(key)", "tavily(key)", "parallel(key)", "firecrawl(key)", "serpapi(key)"]);
 			},
 		);
 	});

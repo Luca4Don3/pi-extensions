@@ -284,15 +284,16 @@ test("auto free-first：按匿名顺序失败后再按计费顺序尝试五家�
 					if (call.url.includes("search.parallel.ai")) return call.init.headers.authorization ? "parallel(key)" : "parallel";
 					if (call.url.includes("api.tavily.com")) return call.init.headers.authorization ? "tavily(key)" : "tavily";
 					if (call.url.includes("firecrawl.dev")) return call.init.headers.authorization ? "firecrawl(key)" : "firecrawl";
+					if (call.url.includes("agent.tinyfish.ai")) return call.init.headers["X-TinyFish-Access-Mode"] === "keyless" ? "tinyfish" : "other";
 					return "serpapi(key)";
 				});
-				assert.deepEqual(order, ["exa", "tavily", "parallel", "firecrawl", "exa(key)", "tavily(key)", "parallel(key)", "firecrawl(key)", "serpapi(key)"]);
+				assert.deepEqual(order, ["exa", "tavily", "parallel", "firecrawl", "tinyfish", "exa(key)", "tavily(key)", "parallel(key)", "firecrawl(key)", "serpapi(key)"]);
 			},
 		),
 	);
 });
 
-test("auto 默认禁止计费：未配置密钥时仍尝试四家匿名通道", async () => {
+test("auto 默认禁止计费：未配置密钥时仍尝试全部匿名通道", async () => {
 	const { store } = fakeStore({});
 	const tool = setup(store);
 	await withEnv({}, () =>
@@ -305,9 +306,10 @@ test("auto 默认禁止计费：未配置密钥时仍尝试四家匿名通道", 
 					if (call.url.includes("api.tavily.com")) return "tavily";
 					if (call.url.includes("search.parallel.ai")) return "parallel";
 					if (call.url.includes("firecrawl.dev")) return "firecrawl";
-					return "serpapi";
+					if (call.url.includes("agent.tinyfish.ai")) return "tinyfish";
+					return "other";
 				});
-				assert.deepEqual(order, ["exa", "tavily", "parallel", "firecrawl"]);
+				assert.deepEqual(order, ["exa", "tavily", "parallel", "firecrawl", "tinyfish"]);
 			},
 		),
 	);

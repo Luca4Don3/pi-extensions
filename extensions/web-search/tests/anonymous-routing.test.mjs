@@ -128,17 +128,17 @@ test("授权也先尝试匿名：匿名成功后不进入密钥通道，也不�
 		assert.equal(result.details.accessTier, "anonymous");
 		assert.equal(result.details.attemptCount, 4);
 		// 授权时为统一脱敏会解析全部密钥，但匿名成功前不得读取密钥库，也不得请求任何额度接口。
-		assert.equal(keyReads(), 5);
+		assert.equal(keyReads(), 5, "零凭据的 TinyFish 不进入密钥解析集合");
 		assert.equal(reads(), 0);
 		assert.equal(calls.usageCalls.length, 0);
 	});
 });
 
-test("全部匿名失败时明确拒绝计费，不因五家已配置密钥而越权", async () => {
+test("全部匿名失败时明确拒绝计费，不因已配置密钥而越权", async () => {
 	const { tool, reads } = setup();
 	await controlled({}, failed, async ({ calls, keyReads }) => {
 		await assert.rejects(tool.execute("no-billing", { query: "技术查询" }), /可能计费通道未获授权，未尝试/u);
-		assert.equal(calls.length, 4);
+		assert.equal(calls.length, 5);
 		assertAnonymous(calls);
 		assert.equal(reads(), 0);
 		assert.equal(keyReads(), 0);
@@ -161,13 +161,13 @@ test("指定 Tavily 或 Firecrawl 只调用该服务的匿名通道", async () =
 	}
 });
 
-test("只有明确授权后，才在四匿名失败之后尝试已配置密钥", async () => {
+test("只有明确授权后，才在全部匿名失败之后尝试已配置密钥", async () => {
 	const { tool } = setup();
 	await controlled({ PI_WEB_SEARCH_ALLOW_BILLABLE: "true" }, (url) => url.includes("exaApiKey=") ? mcpResponse() : failed(), async ({ calls, keyReads }) => {
 		const result = await tool.execute("authorized", { query: "技术查询" });
-		assert.equal(calls.length, 5);
-		assertAnonymous(calls.slice(0, 4));
-		assert.equal(new URL(calls[4].url).searchParams.get("exaApiKey"), keyFor("exa"));
+		assert.equal(calls.length, 6);
+		assertAnonymous(calls.slice(0, 5));
+		assert.equal(new URL(calls[5].url).searchParams.get("exaApiKey"), keyFor("exa"));
 		assert.equal(result.details.channel, "key");
 		assert.equal(result.details.accessTier, "billable");
 		assert.equal(keyReads(), 5, "授权时每个后端只解析一次密钥；匿名成功后不进入密钥通道");

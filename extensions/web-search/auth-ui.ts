@@ -12,6 +12,7 @@
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import {
 	BACKENDS,
+	KEY_BACKENDS,
 	configGuide,
 	envVarName,
 	hasFreeChannel,
@@ -92,16 +93,16 @@ async function reportStatus(
 ): Promise<void> {
 	const statuses = probed ?? (await Promise.all(BACKENDS.map((backend) => probeBackendStatus(backend, store))));
 	const lines = statuses.map((status) => statusLine(status, store));
-	lines.push("Exa / Parallel / Tavily / Firecrawl 具备匿名通道，实时冷却状态另行查看；SerpApi 需要密钥和显式计费授权。");
+	lines.push("Exa / Tavily / Parallel / Firecrawl 具备匿名通道，TinyFish 仅有零凭据 keyless 匿名通道；SerpApi 需要密钥和显式计费授权。");
 	const hasUnavailable = statuses.some((status) => status.state === "unavailable");
 	notify(ctx, lines.join("\n"), hasUnavailable ? "warning" : "info");
 }
 
 /** 展示安全配置说明（合并为单条通知）。 */
 async function showGuides(ctx: ExtensionCommandContext, store: SecretStore): Promise<void> {
-	const sections = BACKENDS.map((backend) => configGuide(backend, store.kind).lines.join("\n"));
-	sections.push(`环境变量同样有效且优先：${BACKENDS.map(envVarName).join(" / ")}。`);
-	sections.push("四家服务支持匿名搜索；SerpApi 需要密钥。配置密钥不代表允许计费，默认禁止认证搜索。");
+	const sections = KEY_BACKENDS.map((backend) => configGuide(backend, store.kind).lines.join("\n"));
+	sections.push(`环境变量同样有效且优先：${KEY_BACKENDS.map(envVarName).join(" / ")}。`);
+	sections.push("四家服务支持匿名搜索；TinyFish 仅有零凭据 keyless 匿名通道，无需也不读取密钥；SerpApi 需要密钥。配置密钥不代表允许计费，默认禁止认证搜索。");
 	sections.push("只有显式设置 PI_WEB_SEARCH_ALLOW_BILLABLE=true 才授权可能收费的通道；旧开关 PI_WEB_SEARCH_ALLOW_PAID 为兼容别名，两者冲突会报错。");
 	notify(ctx, sections.join("\n\n"));
 }
@@ -112,7 +113,7 @@ async function deleteStoredKey(ctx: ExtensionCommandContext, store: SecretStore)
 		notify(ctx, "当前平台没有系统密钥库，无需删除；如通过环境变量注入，请在对应的外部 secret manager 中撤销。", "warning");
 		return;
 	}
-	const selected = await ctx.ui.select("选择要删除的后端", [...BACKENDS]);
+	const selected = await ctx.ui.select("选择要删除的后端", [...KEY_BACKENDS]);
 	// 运行时验证选择值：非白名单（取消、自定义输入等）一律视为取消，绝不误删。
 	if (!isBackend(selected)) {
 		notify(ctx, "已取消，未删除任何凭据。");
@@ -178,7 +179,7 @@ async function writeStoredKey(ctx: ExtensionCommandContext, store: SecretStore):
 		notify(ctx, "当前平台没有支持的系统密钥库，不能保存密钥；不会退化为明文文件。", "warning");
 		return;
 	}
-	const selected = await ctx.ui.select("选择要添加或修改密钥的后端", [...BACKENDS]);
+	const selected = await ctx.ui.select("选择要添加或修改密钥的后端", [...KEY_BACKENDS]);
 	if (!isBackend(selected)) {
 		notify(ctx, "已取消，未写入任何凭据。");
 		return;

@@ -10,7 +10,7 @@
 
 | 插件 | 目录 | 安装 | 作用 |
 | --- | --- | --- | --- |
-| Web Search | `extensions/web-search/` | `pi install ~/pi-extensions/extensions/web-search` | 原生 `web_search` 工具：Exa → Tavily → Parallel → Firecrawl 匿名路由与额度预检；SerpApi 保留为需显式授权的密钥后端 |
+| Web Search | `extensions/web-search/` | `pi install ~/pi-extensions/extensions/web-search` | 原生 `web_search` 工具：Exa → Tavily → Parallel → Firecrawl → TinyFish 匿名路由与额度预检；SerpApi 保留为需显式授权的密钥后端 |
 | Subagent | `extensions/subagent/` | `pi install ~/pi-extensions/extensions/subagent` | 把任务委派给独立上下文的子 agent（single / parallel / chain） |
 | Chinese Prompt | `extensions/chinese-prompt/` | `pi install ~/pi-extensions/extensions/chinese-prompt` | 注入中文强约束 system prompt，推理与输出全程简体中文 |
 | OpenCode Fallback | `extensions/opencode-fallback/` | `pi install ~/pi-extensions/extensions/opencode-fallback` | GPT/Grok/Muse/Claude 固定走代理，其余模型直连优先、失败回退 |
@@ -290,14 +290,16 @@ Pi 的内置工具只有 `read` / `bash` / `edit` / `write` / `grep` / `find` / 
 
 > **与 npm 上同名包 `pi-web-search` 的区别**：本扩展直接连接 Exa / Parallel 的远程模型上下文协议（Model Context Protocol，MCP）端点，并通过原生 REST 接口调用 Tavily、Firecrawl 与 SerpApi。本扩展不发布到 npm，只通过上面的 GitHub 安装方式分发。
 
-## 状态：v0.6.0-beta.2
+## 状态：v0.6.0-beta.3
 
-本轮新增混合额度管理（Quota Manager）与按原因区分的持久冷却，并把匿名候选顺序调整为 **Exa → Tavily → Parallel → Firecrawl**；计费候选顺序独立维护，Exa 仍排第一。仍然不新增搜索 provider、不做质量评分或结果融合，也不添加 `web_fetch`。
+本轮新增混合额度管理（Quota Manager）与按原因区分的持久冷却，并把匿名候选顺序调整为 **Exa → Tavily → Parallel → Firecrawl → TinyFish（keyless）**；计费候选顺序独立维护，Exa 仍排第一。仍然不新增搜索 provider、不做质量评分或结果融合，也不添加 `web_fetch`。
+
+**TinyFish 只接入零凭据 keyless 匿名通道。** 该通道位于 MCP 端点，不需要任何 API Key 或 OAuth，服务端自述限额为 30 请求/分钟、每日 50 次搜索。官方文档对其认证通道「超出每日额度后是否扣减钱包余额」的说法相互矛盾且无法验证，因此本轮不实现认证通道，也不把配置 `TINYFISH_API_KEY` 视为免费。
 
 `web_search` 工具名、Pi 安装方式和 `/web-search-auth` 命令保持不变。既有功能说明：
 
-- 默认匿名候选顺序为 **Exa → Tavily → Parallel → Firecrawl**；依次尝试并在首个可用结果处返回。该顺序是本项目的路由候选顺序，不是服务质量排行榜。
-- SerpApi（不是 Serper）仍作为第五个、仅密钥的 provider；所有密钥通道都按可能计费处理，默认关闭。授权后的计费候选顺序为 **Exa → Tavily → Parallel → Firecrawl → SerpApi**，与匿名顺序互相独立，便于以后各自调整。
+- 默认匿名候选顺序为 **Exa → Tavily → Parallel → Firecrawl → TinyFish（keyless）**；依次尝试并在首个可用结果处返回。该顺序是本项目的路由候选顺序，不是服务质量排行榜。
+- SerpApi（不是 Serper）仍是仅密钥的 provider；所有密钥通道都按可能计费处理，默认关闭。授权后的计费候选顺序为 **Exa → Tavily → Parallel → Firecrawl → SerpApi**，与匿名顺序互相独立，便于以后各自调整；TinyFish 只出现在匿名顺序中。
 - 授权计费与 `PI_WEB_SEARCH_ROUTING=key-first` 同时设置会显式报错并提示改用 `free-first`；未授权时 `key-first` 仅保留匿名兼容。免费通道永远先于密钥通道尝试。
 - `search/registry.ts` 集中维护 provider ID、环境变量名、匿名顺序与计费顺序；REST 适配已拆分为 `search/providers/tavily.ts`、`firecrawl.ts`、`serpapi.ts`，共用 `search/protocol.ts`。这不表示 MCP 已整体迁移，也不表示已完成质量检查、quality-first、RRF、benchmark 或 Key fingerprint。
 - `/web-search-auth` 覆盖五个 provider。四家匿名通道及 `auto` 已通过真实网络冒烟；实际 Pi `1.1.0` 终端已通过掩码输入、模拟密钥写入、共享冷却展示与跳过验收。真实系统密钥库的写入、更新及删除仍未实测。
@@ -308,7 +310,7 @@ Pi 的内置工具只有 `read` / `bash` / `edit` / `write` / `grep` / `find` / 
 ## 特性
 
 - 原生 `web_search` 工具，模型可直接调用，无需再拼 `curl` 命令
-- Parallel、Exa、Tavily 与 Firecrawl 提供匿名通道；SerpApi 仅有密钥通道。默认匿名顺序为 Exa → Tavily → Parallel → Firecrawl
+- Exa、Tavily、Parallel、Firecrawl 提供匿名通道，TinyFish 提供零凭据 keyless 匿名通道；SerpApi 仅有密钥通道。默认匿名顺序为 Exa → Tavily → Parallel → Firecrawl → TinyFish
 - 计费通道默认禁用；即使环境或系统密钥库中已有密钥，也不会因此获得授权
 - 额度预检：Tavily 与 Firecrawl 官方余额接口只回答“当前账户还有多少积分”，不证明账户免费；所有已配置密钥一律视为可能计费
 - 系统密钥库由 `/web-search-auth` 菜单管理；环境变量优先，不修改 shell 启动文件
@@ -388,7 +390,7 @@ macOS 写入实现使用静态 Swift 适配器与系统安全框架，密钥经�
 未显式授权计费时，自动路由只走匿名通道；已授权时同样先尝试完全部匿名通道，才进入计费候选。两类顺序互相独立维护：
 
 ```text
-匿名候选：Exa → Tavily → Parallel → Firecrawl
+匿名候选：Exa → Tavily → Parallel → Firecrawl → TinyFish（keyless）
 计费候选：Exa → Tavily → Parallel → Firecrawl → SerpApi
 ```
 
@@ -403,6 +405,7 @@ macOS 写入实现使用静态 Swift 适配器与系统安全框架，密钥经�
 | Tavily | 是 | `GET https://api.tavily.com/usage`，取 `key.usage/limit` 与账户计划 + 按量余额的最小可用量 |
 | Firecrawl | 是 | `GET https://api.firecrawl.dev/v2/team/credit-usage`，取 `data.remainingCredits` |
 | Exa、Parallel、SerpApi | 否 | 没有可用的公开余额接口，只依据历史冷却状态 |
+| TinyFish | 否 | keyless 匿名通道没有账户与余额概念；限额由服务端强制，只依据历史冷却状态 |
 
 查询结果缓存 5 分钟，失败短缓存 30 秒，同凭据并发只发起一次查询。单次搜索预估成本：Tavily 基础搜索（basic）固定 1 积分；Firecrawl `sources: ["web"]` 每开始的 10 条结果 2 积分。余额不足或额度未知时不发送搜索请求，并记为 `quota_preflight` 失败，不计入搜索尝试次数。正余额仅不足以支付一次较昂贵请求时，不记录额度耗尽冷却，后续较便宜请求仍可执行；已知零余额或额度接口明确限流会记录对应冷却。请求一旦发出就按预估成本记账，超时、取消、正文超限都不返还，保守降低超额风险。
 
@@ -492,14 +495,14 @@ Exa 返回的正文采用大模型友好的文本布局（`Title:` / `URL:` / `H
 # 离线自动化测试（使用网络与密钥库假实现）
 node --test extensions/*/tests/*.test.mjs
 
-# 四匿名 provider 与 auto 的真实网络冒烟（默认强制匿名、不读密钥、不访问真实密钥库）
+# 全部匿名 provider 与 auto 的真实网络冒烟（默认强制匿名、不读密钥、不访问真实密钥库）
 node extensions/web-search/tests/smoke.mjs
 
 # 仅当环境路由配置已显式允许计费时才可运行；可能产生费用，不要把密钥放入命令参数
 node extensions/web-search/tests/smoke.mjs --billable
 ```
 
-普通冒烟脚本（smoke）会强制 `PI_WEB_SEARCH_ALLOW_BILLABLE=false` 并清除旧别名；`--billable` 还要求当前配置已明确授权且不存在路由冲突，运行时仍匿名优先，仅允许在匿名失败后计费回退，可能产生费用且不会打印密钥值。四家匿名通道及 `auto` 在 `v0.5.0-beta.1` 已通过一次真实网络冒烟，本轮只做离线验证；这只验证当时端点可用性，不代表质量排名或长期成功率。离线语法检查可用 `node --check extensions/web-search/tests/smoke.mjs`，不触网；任何离线测试都不代表真实系统 Keychain 写入已验证。本地依赖 `jiti` 与 `typebox`，Pi 自带这两个包，指向本机 Pi 安装即可：
+普通冒烟脚本（smoke）会强制 `PI_WEB_SEARCH_ALLOW_BILLABLE=false` 并清除旧别名；`--billable` 还要求当前配置已明确授权且不存在路由冲突，运行时仍匿名优先，仅允许在匿名失败后计费回退，可能产生费用且不会打印密钥值。四家匿名通道及 `auto` 在 `v0.5.0-beta.1` 已通过一次真实网络冒烟；`v0.6.0-beta.3` 又对 TinyFish keyless 单独冒烟一次并确认零凭据。这些只验证端点可用性，不代表质量排名或长期成功率。离线语法检查可用 `node --check extensions/web-search/tests/smoke.mjs`，不触网；任何离线测试都不代表真实系统 Keychain 写入已验证。本地依赖 `jiti` 与 `typebox`，Pi 自带这两个包，指向本机 Pi 安装即可：
 
 ```bash
 mkdir -p node_modules/@earendil-works
@@ -529,7 +532,8 @@ CI（`.github/workflows/ci.yml`）固定安装 `@earendil-works/pi-coding-agent@
 - 质量感知的跨 provider 后备策略；评估 RRF 与 benchmark 前先明确方法和复现条件，目前均未实现
 - `web_fetch`：读取指定 URL 的正文，进一步减少对 `curl` 的依赖
 - 结果缓存与进一步的 provider 模块整理；本轮并非完整 MCP 模块迁移
-- TinyFish 搜索认证通道暂缓：官方参考说明免费额度为每日 12,000 次，但超量可能由 wallet 自动收费；本地计数无法覆盖其他进程或外部持有的 Key，无法保证全局额度，因此本轮不自动创建该认证通道。见 [TinyFish Search API 文档](https://docs.tinyfish.ai/search-api/reference)。
+- TinyFish 认证通道暂缓：其 API Reference 的 Billing 段写「每日 12,000 次后需要钱包正余额，否则 402」，而定价页与公告写「Search 永不扣钱包、$0 余额仍可用」，两处口径矛盾且无法验证。keyless 匿名通道没有账户，因此不存在扣费风险，本轮只接入它。见 [Search API Reference](https://docs.tinyfish.ai/search-api/reference) 与 [Pricing](https://www.tinyfish.ai/pricing)。
+- TinyFish keyless 限额小且可能为共享池：服务端自述 30 请求/分钟、每日 50 次搜索，其他 keyless 客户端会消耗同一额度。它排在匿名候选最后，仅作补充；冷却只能跳过本机已知被限流的时刻，不能反映真实剩余额度。
 - 认证失效冷却：针对 401 / 403 等失效密钥，避免重复请求；429 通道冷却已实现
 - 每日 / 每月预算与费用上限提示，以及真实系统密钥库与实际账户的端到端验证
 

@@ -58,6 +58,7 @@ test("默认禁用计费；auto 免费优先顺序及指定 provider 限制", ()
 		{ backend: "tavily", channel: "free" },
 		{ backend: "parallel", channel: "free" },
 		{ backend: "firecrawl", channel: "free" },
+		{ backend: "tinyfish", channel: "free" },
 	]);
 	assert.deepEqual(
 		routing.buildRoutePlan("tavily", allKeys, config),
@@ -70,6 +71,7 @@ test("默认禁用计费；auto 免费优先顺序及指定 provider 限制", ()
 		{ backend: "tavily", channel: "free" },
 		{ backend: "parallel", channel: "free" },
 		{ backend: "firecrawl", channel: "free" },
+		{ backend: "tinyfish", channel: "free" },
 		{ backend: "exa", channel: "key" },
 		{ backend: "tavily", channel: "key" },
 		{ backend: "parallel", channel: "key" },
@@ -110,6 +112,7 @@ test("未授权 key-first 保持匿名兼容；授权 key-first 明确要求迁�
 		{ backend: "tavily", channel: "free" },
 		{ backend: "parallel", channel: "free" },
 		{ backend: "firecrawl", channel: "free" },
+		{ backend: "tinyfish", channel: "free" },
 	]);
 	assert.throws(() => routing.buildRoutePlan("serpapi", allKeys, keyFirst), /已被 PI_WEB_SEARCH_ALLOW_BILLABLE=false 禁用/);
 	assert.throws(
