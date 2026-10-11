@@ -71,13 +71,33 @@ test("压缩炸弹：解压后仍受字节上限约束", async () => {
 	});
 });
 
-test("不支持的 content-encoding 按原文处理并明确失败", async () => {
+test("损坏 gzip 与传输中断明确失败且清理解压流", async () => {
+	await withServer((request, response) => {
+		const path = new URL(request.url ?? "/", "http://127.0.0.1").pathname;
+		response.writeHead(200, { "content-type": "text/plain; charset=utf-8", "content-encoding": "gzip" });
+		if (path === "/broken") response.end(Buffer.from("not a gzip stream"));
+		else {
+			response.write(gzipSync("压缩正文").subarray(0, 8));
+			response.destroy();
+		}
+	}, async (base) => {
+		for (const path of ["/broken", "/interrupted"]) {
+			await assert.rejects(client.httpFetch(request(base, path)), (error) => {
+				assert.equal(error.kind, "network_error");
+				return true;
+			});
+		}
+	});
+});
+
+test("不支持的 content-encoding 明确归类为 unsupported_content", async () => {
 	await withServer((request, response) => {
 		response.writeHead(200, { "content-type": "text/plain", "content-encoding": "weird" });
 		response.end("plain body");
 	}, async (base) => {
-		// 未声明解压方式时按原文读，读到的是可用正文而不是乱码。
-		const result = await client.httpFetch(request(base, "/"));
-		assert.equal(result.body, "plain body");
+		await assert.rejects(client.httpFetch(request(base, "/")), (error) => {
+			assert.equal(error.kind, "unsupported_content");
+			return true;
+		});
 	});
 });

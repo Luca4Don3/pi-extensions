@@ -1,11 +1,6 @@
 /**
  * 本地正文提取：HTML → 可读 Markdown，Markdown 与纯文本直通，JSON 取文本字段。
- *
- * 第一版不引入 Readability / jsdom / turndown 这类重型依赖，改用基于规则的轻量提取：
- * - 优先在 `<main>`、`<article>` 或常见正文容器里找内容，找不到再回退到 `<body>`；
- * - 把「保留代码块、标题层级、链接、列表与表格」作为首要目标，避免通用阅读模式
- *   把代码示例整段丢掉。
- * 后续若切换成熟库，只需替换本模块，调用方不受影响。
+ * 使用轻量规则处理静态 HTML，不执行脚本，也不引入重型解析依赖。
  */
 
 import { FetchError } from "../errors.js";
@@ -14,6 +9,7 @@ import type { FetchMode } from "../params.js";
 export interface ExtractionResult {
 	readonly title?: string;
 	readonly markdown: string;
+	readonly truncated: boolean;
 }
 
 const ENTITIES: Record<string, string> = {
@@ -21,12 +17,13 @@ const ENTITIES: Record<string, string> = {
 	"&nbsp;": " ", "&mdash;": "—", "&ndash;": "–", "&hellip;": "…",
 };
 
-/** 只解码常见命名实体与十进制/十六进制数字实体；不引入依赖。 */
+/** 只解码常见命名实体与数字实体一次；不递归解码。 */
 export function decodeEntities(value: string): string {
-	return value
-		.replace(/&(?:amp|lt|gt|quot|apos|nbsp|mdash|ndash|hellip);/giu, (match) => ENTITIES[match.toLowerCase()] ?? match)
-		.replace(/&#x([0-9a-f]+);/giu, (_match, hex: string) => safeCodePoint(Number.parseInt(hex, 16)))
-		.replace(/&#(\d+);/gu, (_match, dec: string) => safeCodePoint(Number.parseInt(dec, 10)));
+	return value.replace(/&(?:amp|lt|gt|quot|apos|nbsp|mdash|ndash|hellip);|&#x([0-9a-f]+);|&#(\d+);/giu, (match, hex?: string, dec?: string) => {
+		if (hex !== undefined) return safeCodePoint(Number.parseInt(hex, 16));
+		if (dec !== undefined) return safeCodePoint(Number.parseInt(dec, 10));
+		return ENTITIES[match.toLowerCase()] ?? match;
+	});
 }
 
 function safeCodePoint(value: number): string {
@@ -38,28 +35,186 @@ function safeCodePoint(value: number): string {
 	}
 }
 
-/** 去掉注释、脚本、样式与模板节点；这些内容不应进入模型上下文。 */
-export function stripNoise(html: string): string {
-	return html
-		.replace(/<!--[\s\S]*?-->/gu, " ")
-		.replace(/<script[\s\S]*?<\/script>/giu, " ")
-		.replace(/<style[\s\S]*?<\/style>/giu, " ")
-		.replace(/<noscript[\s\S]*?<\/noscript>/giu, " ")
-		.replace(/<template[\s\S]*?<\/template>/giu, " ");
+interface ElementRange {
+	readonly start: number;
+	readonly contentStart: number;
+	readonly contentEnd: number;
+	readonly end: number;
+	readonly attributes: string;
 }
 
-/** 常见正文容器；按优先级返回第一个有内容的命中。 */
-const CONTAINER_PATTERNS: RegExp[] = [
-	/<main\b[^>]*>([\s\S]*?)<\/main>/iu,
-	/<article\b[^>]*>([\s\S]*?)<\/article>/iu,
-	/<div\b[^>]*(?:class|id)=["'][^"']*(?:markdown-body|md-content|documentation|docs-content|post-content|article-content|entry-content|content-body)[^"']*["'][^>]*>([\s\S]*?)<\/div>/iu,
-	/<body\b[^>]*>([\s\S]*?)<\/body>/iu,
-];
+interface TagToken {
+	readonly start: number;
+	readonly end: number;
+	readonly closing: boolean;
+	readonly selfClosing: boolean;
+	readonly attributes: string;
+}
 
+function tagEnd(html: string, from: number): number {
+	let quote = "";
+	for (let index = from; index < html.length; index++) {
+		const character = html[index]!;
+		if (quote !== "") {
+			if (character === quote) quote = "";
+		} else if (character === '"' || character === "'") {
+			quote = character;
+		} else if (character === ">") {
+			return index + 1;
+		}
+	}
+	return -1;
+}
+
+/** 从左至右找下一个指定标签；遇到未结束的标签时停止，避免反复回扫坏 HTML。 */
+function findTagToken(html: string, tag: string, from: number): TagToken | undefined {
+	let cursor = from;
+	while (true) {
+		const start = html.indexOf("<", cursor);
+		if (start < 0) return undefined;
+		const closing = html[start + 1] === "/";
+		const nameStart = start + (closing ? 2 : 1);
+		const nameEnd = nameStart + tag.length;
+		if (html.slice(nameStart, nameEnd).toLowerCase() !== tag.toLowerCase()) {
+			cursor = start + 1;
+			continue;
+		}
+		const boundary = html[nameEnd];
+		if (boundary !== undefined && boundary !== " " && boundary !== "\t" && boundary !== "\n" && boundary !== "\r" && boundary !== "\f" && boundary !== "/" && boundary !== ">") {
+			cursor = start + 1;
+			continue;
+		}
+		const end = tagEnd(html, nameEnd);
+		if (end < 0) return undefined;
+		const attributes = closing ? "" : html.slice(nameEnd, end - 1);
+		return { start, end, closing, selfClosing: !closing && attributes.trimEnd().endsWith("/"), attributes };
+	}
+}
+
+function findClosingTag(html: string, tag: string, from: number): TagToken | undefined {
+	let cursor = from;
+	for (let token = findTagToken(html, tag, cursor); token !== undefined; token = findTagToken(html, tag, cursor)) {
+		cursor = token.end;
+		if (token.closing) return token;
+	}
+	return undefined;
+}
+
+/** 单次栈扫描同名标签；嵌套配对正确，未闭合标签不会导致候选逐个重扫全文。 */
+function findElementRange(html: string, tag: string, from = 0, accept?: (attributes: string) => boolean): ElementRange | undefined {
+	const stack: Array<{ start: number; contentStart: number; attributes: string; accepted: boolean }> = [];
+	let best: ElementRange | undefined;
+	let earliestAcceptedStart: number | undefined;
+	let cursor = from;
+	for (let token = findTagToken(html, tag, cursor); token !== undefined; token = findTagToken(html, tag, cursor)) {
+		cursor = token.end;
+		if (token.closing) {
+			const open = stack.pop();
+			if (open?.start === earliestAcceptedStart) earliestAcceptedStart = undefined;
+			if (open?.accepted) {
+				const range = { start: open.start, contentStart: open.contentStart, contentEnd: token.start, end: token.end, attributes: open.attributes };
+				if (best === undefined || range.start < best.start) best = range;
+			}
+		} else if (!token.selfClosing) {
+			const accepted = accept === undefined || accept(token.attributes);
+			stack.push({ start: token.start, contentStart: token.end, attributes: token.attributes, accepted });
+			if (accepted && earliestAcceptedStart === undefined) earliestAcceptedStart = token.start;
+		}
+		if (best !== undefined && (earliestAcceptedStart === undefined || earliestAcceptedStart >= best.start)) return best;
+	}
+	return best;
+}
+
+function removeElements(html: string, tags: readonly string[]): string {
+	for (const tag of tags) {
+		const parts: string[] = [];
+		let cursor = 0;
+		while (cursor < html.length) {
+			const range = findElementRange(html, tag, cursor);
+			if (range === undefined) break;
+			parts.push(html.slice(cursor, range.start), " ");
+			cursor = range.end;
+		}
+		if (cursor === 0) continue;
+		parts.push(html.slice(cursor));
+		html = parts.join("");
+	}
+	return html;
+}
+
+function stripComments(html: string): string {
+	const parts: string[] = [];
+	let cursor = 0;
+	while (true) {
+		const start = html.indexOf("<!--", cursor);
+		if (start < 0) break;
+		const end = html.indexOf("-->", start + 4);
+		if (end < 0) {
+			parts.push(html.slice(cursor, start), " ");
+			return parts.join("");
+		}
+		parts.push(html.slice(cursor, start), " ");
+		cursor = end + 3;
+	}
+	if (cursor === 0) return html;
+	parts.push(html.slice(cursor));
+	return parts.join("");
+}
+
+function removeRawElements(html: string, tag: string): string {
+	const parts: string[] = [];
+	let cursor = 0;
+	let scan = 0;
+	while (scan < html.length) {
+		const opening = findTagToken(html, tag, scan);
+		if (opening === undefined) break;
+		scan = opening.end;
+		if (opening.closing) continue;
+		if (opening.selfClosing) {
+			parts.push(html.slice(cursor, opening.start), " ");
+			cursor = opening.end;
+			continue;
+		}
+		const closing = findClosingTag(html, tag, opening.end);
+		if (closing === undefined) {
+			parts.push(html.slice(cursor, opening.start), " ");
+			return parts.join("");
+		}
+		parts.push(html.slice(cursor, opening.start), " ");
+		cursor = closing.end;
+		scan = cursor;
+	}
+	if (cursor === 0) return html;
+	parts.push(html.slice(cursor));
+	return parts.join("");
+}
+
+/** 逐个剔除活动内容；未闭合脚本等按安全策略丢弃至输入末尾。 */
+export function stripNoise(html: string): string {
+	let cleaned = stripComments(html);
+	for (const tag of ["script", "style", "noscript", "template"]) cleaned = removeRawElements(cleaned, tag);
+	return removeElements(cleaned, ["nav", "aside", "footer", "header"]);
+}
+
+const CONTENT_DIV = /(?:markdown-body|md-content|documentation|docs-content|post-content|article-content|entry-content|content-body)/iu;
+
+/** 依次选择 main、article、常见文档容器与 body；同名嵌套元素会完整配对。 */
 export function pickContainer(html: string): string {
-	for (const pattern of CONTAINER_PATTERNS) {
-		const match = html.match(pattern);
-		if (match?.[1] !== undefined && match[1]!.trim().length > 0) return match[1]!;
+	const candidates: Array<{ tag: string; accept?: (attributes: string) => boolean }> = [
+		{ tag: "main" },
+		{ tag: "article" },
+		{ tag: "div", accept: (attributes) => CONTENT_DIV.test(attributes) },
+		{ tag: "body" },
+	];
+	for (const candidate of candidates) {
+		let from = 0;
+		while (from < html.length) {
+			const range = findElementRange(html, candidate.tag, from, candidate.accept);
+			if (range === undefined) break;
+			const content = html.slice(range.contentStart, range.contentEnd);
+			if (content.trim().length > 0) return content;
+			from = range.end;
+		}
 	}
 	return html;
 }
@@ -71,91 +226,237 @@ export function extractTitle(html: string): string | undefined {
 		const text = decodeEntities(og[1].trim());
 		return text.length > 0 ? text : undefined;
 	}
-	const title = html.match(/<title[^>]*>([\s\S]*?)<\/title>/iu);
-	if (title?.[1] !== undefined) {
-		const text = decodeEntities(title[1].trim());
+	const title = findElementRange(html, "title");
+	if (title !== undefined) {
+		const text = decodeEntities(html.slice(title.contentStart, title.contentEnd).trim());
 		return text.length > 0 ? text : undefined;
 	}
 	return undefined;
 }
 
-/** 去掉所有标签并解码实体。 */
+/** 标签只扫描一次；未结束的标签不反复回扫剩余内容。 */
+function replaceMarkup(html: string, replace: (tag: string) => string): string {
+	const parts: string[] = [];
+	let cursor = 0;
+	for (;;) {
+		const start = html.indexOf("<", cursor);
+		if (start < 0) break;
+		const end = tagEnd(html, start + 1);
+		if (end < 0) break;
+		parts.push(html.slice(cursor, start), replace(html.slice(start, end)));
+		cursor = end;
+	}
+	parts.push(html.slice(cursor));
+	return parts.join("");
+}
+
+function stripMarkupRaw(html: string): string {
+	return replaceMarkup(html, () => " ");
+}
+
+/** 去掉标签并解码实体一次。 */
 export function stripTags(html: string): string {
-	return decodeEntities(html.replace(/<[^>]+>/gu, " "));
+	return decodeEntities(stripMarkupRaw(html));
 }
 
-/** 块级边界转成换行，避免标题、段落与代码块粘连。 */
+/** 块级边界转成换行，避免标题、段落、列表与表格内容粘连。 */
 export function blockify(html: string): string {
-	return html
-		.replace(/<br\s*\/?>/giu, "\n")
-		.replace(/<\/(?:p|div|section|article|main|li|ul|ol|table|thead|tbody|tr|h[1-6]|pre|blockquote)>/giu, "\n")
-		.replace(/<(?:h[1-6]|p|li|tr|pre|blockquote|div|section|ul|ol|dl|dt|dd|figure|figcaption|thead|tbody)\b[^>]*>/giu, "\n");
+	return replaceMarkup(html, (tag) => {
+		const name = /^<\/?([a-z][\w:-]*)\b/iu.exec(tag)?.[1]?.toLowerCase();
+		return name !== undefined && /^(?:br|p|div|section|article|main|li|ul|ol|table|thead|tbody|tr|h[1-6]|pre|blockquote|dl|dt|dd|figure|figcaption|header|footer)$/u.test(name) ? "\n" : tag;
+	});
 }
 
-/** `<pre>` 包成围栏代码块，尽量保留代码原样。 */
+function codeText(html: string): string {
+	const text = replaceMarkup(html, (tag) => /^<br\b/iu.test(tag) ? "\n" : "");
+	return decodeEntities(text);
+}
+
+function chooseFence(code: string): string {
+	const runs = code.match(/`+/gu) ?? [];
+	const longest = runs.reduce((max, run) => Math.max(max, run.length), 0);
+	return "`".repeat(Math.max(3, longest + 1));
+}
+
+function fencedValue(code: string, language = ""): string {
+	const fence = chooseFence(code);
+	return `${fence}${language}\n${code}${code.endsWith("\n") ? "" : "\n"}${fence}`;
+}
+
+function inlineValue(code: string): string {
+	const runs = code.match(/`+/gu) ?? [];
+	const delimiter = "`".repeat(Math.max(1, runs.reduce((max, run) => Math.max(max, run.length), 0) + 1));
+	const pad = code.startsWith("`") || code.endsWith("`") || (code.startsWith(" ") && code.endsWith(" "));
+	return `${delimiter}${pad ? " " : ""}${code}${pad ? " " : ""}${delimiter}`;
+}
+
+interface CodeTokens {
+	readonly html: string;
+	readonly values: ReadonlyMap<string, string>;
+}
+
+function replacePairedElements(html: string, tag: string, replace: (inner: string, attributes: string) => string): string {
+	const parts: string[] = [];
+	let copied = 0;
+	let scan = 0;
+	while (scan < html.length) {
+		const opening = findTagToken(html, tag, scan);
+		if (opening === undefined) break;
+		scan = opening.end;
+		if (opening.closing || opening.selfClosing) continue;
+		const closing = findClosingTag(html, tag, opening.end);
+		if (closing === undefined) break;
+		parts.push(html.slice(copied, opening.start), replace(html.slice(opening.end, closing.start), opening.attributes));
+		copied = closing.end;
+		scan = copied;
+	}
+	parts.push(html.slice(copied));
+	return parts.join("");
+}
+
+function isolateCode(html: string, source: string, asText = false): CodeTokens {
+	let prefix = "\uE000webfetch-code";
+	while (source.includes(prefix)) prefix += "_";
+	const values = new Map<string, string>();
+	let next = 0;
+	const token = (value: string, block: boolean): string => {
+		const key = `${prefix}-${next++}\uE001`;
+		values.set(key, value);
+		return block ? `\n${key}\n` : key;
+	};
+	let result = replacePairedElements(html, "pre", (inner, attributes) => {
+		const value = codeText(inner);
+		if (asText) return token(value, true);
+		const language = /(?:language|lang)-([\w+-]+)/iu.exec(`${attributes} ${inner}`)?.[1] ?? "";
+		return token(fencedValue(value, language), true);
+	});
+	if (!asText) {
+		result = replacePairedElements(result, "code", (inner) => token(inlineValue(codeText(inner)), false));
+	}
+	return { html: result, values };
+}
+
+function restoreTokens(text: string, values: ReadonlyMap<string, string>): string {
+	const first = values.keys().next().value;
+	if (first === undefined) return text;
+	const prefix = first.slice(0, first.lastIndexOf("-") + 1);
+	const tokenPattern = new RegExp(`${prefix}\\d+\\uE001`, "gu");
+	return text.replace(tokenPattern, (token) => values.get(token) ?? token);
+}
+
+/** `<pre>` 转为 Markdown 围栏代码块，保留代码中的空白与实体解码结果。 */
 export function fencedCode(html: string): string {
-	return html.replace(/<pre\b[^>]*>([\s\S]*?)<\/pre>/giu, (_match, inner: string) => {
-		const code = stripTags(inner).replace(/\n{3,}/gu, "\n\n").trim();
-		if (code.length === 0) return "";
-		const language = /(?:language|lang)-([\w+-]+)/iu.exec(inner)?.[1];
-		return `\n\`\`\`${language ?? ""}\n${code}\n\`\`\`\n`;
+	return replacePairedElements(html, "pre", (inner, attributes) => {
+		const code = codeText(inner);
+		const language = /(?:language|lang)-([\w+-]+)/iu.exec(`${attributes} ${inner}`)?.[1] ?? "";
+		return `\n${fencedValue(code, language)}\n`;
 	});
 }
 
-/** 行内代码。 */
+/** 转换 HTML 行内代码，保留代码自身空格、制表符与空行。 */
 export function inlineCode(html: string): string {
-	return html.replace(/<code\b[^>]*>([\s\S]*?)<\/code>/giu, (_match, inner: string) => `\`${stripTags(inner).replace(/\s+/gu, " ").trim()}\``);
+	return replacePairedElements(html, "code", (inner) => inlineValue(codeText(inner)));
 }
 
-/** 链接转 Markdown 链接；非 http(s) 只保留文字。 */
-export function links(html: string): string {
-	return html.replace(/<a\b[^>]*href=["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>/giu, (_match, href: string, inner: string) => {
-		const label = stripTags(inner).replace(/\s+/gu, " ").trim();
+function safeHref(href: string, baseUrl?: URL): string | undefined {
+	const decoded = decodeEntities(href.trim()).replace(/\s/gu, (character) => encodeURIComponent(character));
+	try {
+		const url = baseUrl === undefined ? new URL(decoded) : new URL(decoded, baseUrl);
+		if (url.protocol !== "http:" && url.protocol !== "https:") return undefined;
+		return url.toString().replace(/[()]/gu, (character) => character === "(" ? "%28" : "%29");
+	} catch {
+		return undefined;
+	}
+}
+
+function escapeMarkdownLabel(label: string): string {
+	return label.replace(/[\\[\]`]/gu, (character) => `\\${character}`);
+}
+
+function protectForFinalDecode(value: string): string {
+	return value.replace(/[&<>]/gu, (character) => character === "&" ? "&amp;" : character === "<" ? "&lt;" : "&gt;");
+}
+
+function convertLinks(html: string, baseUrl?: URL, deferFinalDecode = false): string {
+	return replacePairedElements(html, "a", (inner, attributes) => {
+		const hrefMatch = /\bhref\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))/iu.exec(attributes);
+		const rawLabel = stripMarkupRaw(inner).replace(/\s+/gu, " ").trim();
+		const label = escapeMarkdownLabel(decodeEntities(rawLabel));
 		if (label.length === 0) return "";
-		if (!/^https?:\/\//iu.test(href)) return label;
-		return `[${label}](${href})`;
+		const href = hrefMatch?.[1] ?? hrefMatch?.[2] ?? hrefMatch?.[3];
+		const safe = href === undefined ? undefined : safeHref(href, baseUrl);
+		const outputLabel = deferFinalDecode ? protectForFinalDecode(label) : label;
+		if (safe === undefined) return outputLabel;
+		const outputHref = deferFinalDecode ? protectForFinalDecode(safe) : safe;
+		return `[${outputLabel}](${outputHref})`;
 	});
+}
+
+/** 将链接转为 Markdown；仅允许 http(s)，可选地解析相对地址。 */
+export function links(html: string, baseUrl?: URL): string {
+	return convertLinks(html, baseUrl);
+}
+
+function inlineText(html: string): string {
+	return stripMarkupRaw(html).replace(/\s+/gu, " ").trim();
 }
 
 /** 标题转 Markdown 标题，层级最多到 6。 */
 export function headings(html: string): string {
-	return html.replace(/<h([1-6])\b[^>]*>([\s\S]*?)<\/h\1>/giu, (_match, level: string, inner: string) => {
-		const text = stripTags(inner).replace(/\s+/gu, " ").trim();
-		if (text.length === 0) return "";
-		return `\n${"#".repeat(Math.min(6, Number(level)))} ${text}\n`;
-	});
+	for (let level = 1; level <= 6; level++) {
+		html = replacePairedElements(html, `h${level}`, (inner) => {
+			const text = inlineText(inner);
+			return text.length === 0 ? "" : `\n${"#".repeat(level)} ${text}\n`;
+		});
+	}
+	return html;
 }
 
 /** 列表项转 Markdown 列表。 */
 export function listItems(html: string): string {
-	return html.replace(/<li\b[^>]*>([\s\S]*?)<\/li>/giu, (_match, inner: string) => {
-		const text = stripTags(inner).replace(/\s+/gu, " ").trim();
-		return text.length === 0 ? "" : `- ${text}`;
+	return replacePairedElements(html, "li", (inner) => {
+		const text = inlineText(inner);
+		return text.length === 0 ? "" : `\n- ${text}\n`;
 	});
 }
 
-/** 表格转 Markdown 表格。 */
+/** 表格转 Markdown 表格，保留单元格内的行内链接与代码。 */
 export function tables(html: string): string {
-	return html.replace(/<table\b[^>]*>([\s\S]*?)<\/table>/giu, (_match, inner: string) => {
+	return replacePairedElements(html, "table", (inner) => {
 		const rows: string[][] = [];
-		for (const row of inner.matchAll(/<tr\b[^>]*>([\s\S]*?)<\/tr>/giu)) {
+		replacePairedElements(inner, "tr", (row) => {
 			const cells: string[] = [];
-			for (const cell of row[1]!.matchAll(/<t[hd]\b[^>]*>([\s\S]*?)<\/t[hd]>/giu)) {
-				const text = stripTags(cell[1]!).replace(/\s+/gu, " ").trim();
-				if (text.length > 0) cells.push(text);
+			let cursor = 0;
+			let th = findTagToken(row, "th", cursor);
+			let td = findTagToken(row, "td", cursor);
+			for (;;) {
+				const opening = th === undefined ? td : td === undefined || th.start < td.start ? th : td;
+				if (opening === undefined) break;
+				const tag = opening === th ? "th" : "td";
+				cursor = opening.end;
+				if (!opening.closing && !opening.selfClosing) {
+					const closing = findClosingTag(row, tag, cursor);
+					if (closing === undefined) break;
+					cells.push(inlineText(row.slice(opening.end, closing.start)));
+					cursor = closing.end;
+				}
+				if (th !== undefined && th.start < cursor) th = findTagToken(row, "th", cursor);
+				if (td !== undefined && td.start < cursor) td = findTagToken(row, "td", cursor);
 			}
-			if (cells.length > 0) rows.push(cells);
-		}
+			if (cells.some((cell) => cell.length > 0)) rows.push(cells);
+			return "";
+		});
 		if (rows.length === 0) return "";
-		const header = rows[0]!;
-		const body = rows.slice(1);
+		// 不按最宽行补齐全部行，避免稀疏畸形表格扩张为行数乘最大列数。
+		const normalized = rows.map((row) => row.map((cell) => cell.replace(/\|/gu, "\\|")));
+		const width = normalized[0]!.length;
 		const line = (cells: string[]): string => `| ${cells.join(" | ")} |`;
-		const separator = `| ${header.map(() => "---").join(" | ")} |`;
-		return `\n${line(header)}\n${separator}\n${body.map(line).join("\n")}\n`;
+		const separator = `| ${Array.from({ length: width }, () => "---").join(" | ")} |`;
+		return `\n${line(normalized[0]!)}\n${separator}\n${normalized.slice(1).map(line).join("\n")}\n`;
 	});
 }
 
-/** 规整空白：压缩空行、清理行首尾空白。 */
+/** 仅供 HTML/JSON 整理使用；直读 Markdown 与纯文本不会经过此空白压缩。 */
 export function tidy(text: string): string {
 	return text
 		.replace(/\r\n?/gu, "\n")
@@ -168,39 +469,36 @@ export function tidy(text: string): string {
 /** HTML 提取结果可能带标题；其余分支只保证正文。 */
 type ExtractionBase = { markdown: string; title?: string };
 
-/**
- * HTML → Markdown；保留标题、代码块、链接、列表与表格。
- *
- * 顺序很关键：先把代码块与表格整体取出，再把标题 / 列表 / 链接 / 行内代码转成
- * Markdown，最后才把剩余块级边界换成换行。若一开始就 blockify，`</h1>`、`</table>`
- * 这类闭标签会先被破坏，后面的结构化替换就再也匹配不上。
- */
-export function htmlToMarkdown(html: string): ExtractionBase {
+/** HTML → Markdown；代码先隔离，经过其他转换后再恢复，避免解码的 `<T>` 被当作标签。 */
+export function htmlToMarkdown(html: string, baseUrl?: URL): ExtractionBase {
 	const cleaned = stripNoise(html);
-	const container = pickContainer(cleaned);
-	const withCode = fencedCode(container);
-	const withTables = tables(withCode);
+	const title = extractTitle(cleaned);
+	const isolated = isolateCode(pickContainer(cleaned), cleaned);
+	const withLinks = convertLinks(isolated.html, baseUrl, true);
+	const withTables = tables(withLinks);
 	const withHeadings = headings(withTables);
 	const withLists = listItems(withHeadings);
-	const withLinks = links(withLists);
-	const withInlineCode = inlineCode(withLinks);
-	// 最后统一清掉仍未识别的标签（例如 void 元素与 head 残留），此时代码块与表格
-	// 已转成 Markdown，不会被误伤。
-	const markdown = tidy(stripTags(blockify(withInlineCode)));
-	const title = extractTitle(cleaned);
+	const markdown = restoreTokens(tidy(decodeEntities(stripMarkupRaw(blockify(withLists)))), isolated.values);
 	return { ...(title === undefined ? {} : { title }), markdown };
 }
 
-/** Markdown 直通；只做常规空白规整。 */
+function htmlToText(html: string): string {
+	const cleaned = stripNoise(html);
+	const isolated = isolateCode(pickContainer(cleaned), cleaned, true);
+	const flattened = decodeEntities(stripMarkupRaw(blockify(isolated.html)));
+	return restoreTokens(tidy(flattened), isolated.values);
+}
+
+/** Markdown 直读不规整空白，避免损坏代码缩进、制表符与空行。 */
 export function markdownToMarkdown(body: string): ExtractionBase {
-	const markdown = tidy(body);
+	const markdown = body;
 	const heading = body.match(/^\s{0,3}#{1,6}\s+(.+)$/mu);
 	return { ...(heading?.[1] === undefined ? {} : { title: heading[1].trim() }), markdown };
 }
 
-/** 纯文本直通。 */
+/** 纯文本直读不规整空白，保留缩进、制表符、尖括号与空行。 */
 export function textToMarkdown(body: string): ExtractionBase {
-	return { markdown: tidy(body) };
+	return { markdown: body };
 }
 
 /** JSON：取常见文本字段与 http(s) 链接拼成可读正文，不把原始 JSON 整块灌给模型。 */
@@ -251,11 +549,70 @@ function looksLikeHtml(body: string): boolean {
 	return /^\s*<(?:!doctype html|html|head|body|main|article|div|p)\b/iu.test(body);
 }
 
+function safeSlice(value: string, maxLength: number): string {
+	let end = Math.max(0, Math.min(value.length, maxLength));
+	if (end > 0 && end < value.length) {
+		const current = value.charCodeAt(end);
+		const previous = value.charCodeAt(end - 1);
+		if (current >= 0xdc00 && current <= 0xdfff && previous >= 0xd800 && previous <= 0xdbff) end--;
+	}
+	return value.slice(0, end);
+}
+
+interface OpenFence {
+	readonly marker: string;
+	readonly start: number;
+}
+
+function openFenceAtEnd(text: string): OpenFence | undefined {
+	let open: OpenFence | undefined;
+	let lineStart = 0;
+	for (const line of text.split("\n")) {
+		const fence = /^ {0,3}(`{3,}|~{3,})(.*)$/u.exec(line);
+		if (fence !== null) {
+			const marker = fence[1]!;
+			if (open === undefined) {
+				if (!(marker[0] === "`" && fence[2]!.includes("`"))) open = { marker, start: lineStart };
+			} else if (marker[0] === open.marker[0] && marker.length >= open.marker.length && /^[ \t]*$/u.test(fence[2]!)) {
+				open = undefined;
+			}
+		}
+		lineStart += line.length + 1;
+	}
+	return open;
+}
+
+function truncationNotice(maxChars: number): string {
+	const full = "\n\n（正文已截断）";
+	if (maxChars >= full.length) return full;
+	if (maxChars >= 3) return "截断…";
+	return maxChars > 0 ? "…" : "";
+}
+
+function truncateMarkdown(markdown: string, maxChars: number): string {
+	const limit = Math.max(0, maxChars);
+	const notice = truncationNotice(limit);
+	let prefix = safeSlice(markdown, limit - notice.length);
+	for (let attempt = 0; attempt < 8; attempt++) {
+		const open = openFenceAtEnd(prefix);
+		if (open === undefined) return `${prefix}${notice}`;
+		const closing = `${prefix.endsWith("\n") ? "" : "\n"}${open.marker}`;
+		if (prefix.length + closing.length + notice.length <= limit) return `${prefix}${closing}${notice}`;
+		const nextLength = limit - closing.length - notice.length;
+		if (nextLength <= open.start) {
+			prefix = safeSlice(markdown, open.start);
+			return `${safeSlice(prefix, limit - notice.length)}${notice}`;
+		}
+		prefix = safeSlice(markdown, nextLength);
+	}
+	return `${safeSlice(markdown, limit - notice.length)}${notice}`;
+}
+
 /**
- * 按内容类型与模式选择提取路径。
- * 内容类型不受支持、或提取结果为空时明确失败，不把空正文当作成功返回。
+ * 按内容类型与模式选择提取路径。可选 baseUrl 只用于本地链接绝对化，不会触发请求。
+ * 只有内容长度严格大于 maxChars 时才设置 truncated。
  */
-export function extractContent(body: string, contentType: string, mode: FetchMode, maxChars: number): ExtractionResult {
+export function extractContent(body: string, contentType: string, mode: FetchMode, maxChars: number, baseUrl?: URL): ExtractionResult {
 	const { type, subtype } = normalizeContentType(contentType);
 	const isHtml = subtype === "html" || subtype === "xhtml+xml" || (type === "" && looksLikeHtml(body));
 	const isMarkdown = subtype === "markdown" || subtype === "x-markdown" || subtype === "md";
@@ -268,14 +625,14 @@ export function extractContent(body: string, contentType: string, mode: FetchMod
 			? markdownToMarkdown(body)
 			: isHtml
 				? mode === "text"
-					? { markdown: tidy(stripTags(pickContainer(stripNoise(body)))) }
-					: htmlToMarkdown(body)
+					? { markdown: htmlToText(body) }
+					: htmlToMarkdown(body, baseUrl)
 				: isText
 					? textToMarkdown(body)
 					: undefined;
 	if (base === undefined) throw new FetchError("目标内容类型不受支持", "unsupported_content");
+	if (base.markdown.trim().length === 0) throw new FetchError("未能从响应中提取到正文", "extraction_failed");
 	const truncated = base.markdown.length > maxChars;
-	const markdown = truncated ? `${base.markdown.slice(0, maxChars)}\n\n（正文已截断）` : base.markdown;
-	if (markdown.length === 0) throw new FetchError("未能从响应中提取到正文", "extraction_failed");
-	return { ...(base.title === undefined ? {} : { title: base.title }), markdown };
+	const markdown = truncated ? truncateMarkdown(base.markdown, maxChars) : base.markdown;
+	return { ...(base.title === undefined ? {} : { title: base.title }), markdown, truncated };
 }

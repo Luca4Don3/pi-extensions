@@ -1,5 +1,5 @@
 /**
- * web_fetch 脚手架离线测试：工具契约、参数校验与配置校验。
+ * web_fetch 离线测试：工具契约、参数校验与配置校验。
  * 全部使用假 Pi API 与进程内环境变量，不触网、不访问真实密钥库。
  */
 import assert from "node:assert/strict";
@@ -95,7 +95,7 @@ test("注入抓取实现后返回正文与结构化 details", async () => {
 
 
 
-test("重定向后的最终地址被逐跳校验，details 不暴露查询串", async () => {
+test("重定向结果元数据不暴露查询串",  async () => {
 	const { tool } = setup({
 		config: () => ({ timeoutMs: 1000, maxResponseBytes: 4096, maxChars: 500, maxRedirects: 3, remoteFallback: "off" }),
 		resolveTarget: async (rawUrl) => {
@@ -126,7 +126,7 @@ test("重定向后的最终地址被逐跳校验，details 不暴露查询串", 
 test("空 URL、空白 URL 与非法 maxChars 被拒绝", async () => {
 	const { tool } = setup();
 	await withEnv({}, async () => {
-		for (const params of [{ url: "" }, { url: "   " }, { url: "https://example.com", maxChars: 0 }]) {
+		for (const params of [{ url: "" }, { url: "   " }, { url: "https://example.com", maxChars: 0 }, { url: "https://example.com", maxChars: 200001 }, { url: "https://example.com", mode: "unknown" }]) {
 			await assert.rejects(tool.execute("fetch-bad", params), (error) => {
 				assert.equal(error.kind, "invalid_url");
 				return true;
@@ -152,7 +152,8 @@ test("配置默认值与边界严格校验", () => {
 		maxRedirects: 3,
 		remoteFallback: "off",
 	});
-	assert.equal(configModule.readWebFetchConfig({ PI_WEB_FETCH_REMOTE_FALLBACK: "JINA" }).remoteFallback, "jina");
+	assert.equal(configModule.readWebFetchConfig({ PI_WEB_FETCH_REMOTE_FALLBACK: " OFF " }).remoteFallback, "off");
+	assert.throws(() => configModule.readWebFetchConfig({ PI_WEB_FETCH_REMOTE_FALLBACK: "JINA" }), (error) => error.kind === "remote_blocked");
 	assert.equal(configModule.readWebFetchConfig({ PI_WEB_FETCH_MAX_CHARS: " 1 " }).maxChars, 1);
 	assert.equal(configModule.readWebFetchConfig({ PI_WEB_FETCH_MAX_RESPONSE_BYTES: "20971520" }).maxResponseBytes, 20_971_520);
 	for (const name of [

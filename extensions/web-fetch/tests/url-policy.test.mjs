@@ -117,3 +117,20 @@ test("解析失败与 DNS 拒绝都归入固定分类，不泄漏原始错误", 
 		return true;
 	});
 });
+
+test("DNS 查询取消立即停止等待并消费迟到拒绝", async () => {
+	const controller = new AbortController();
+	let rejectLookup;
+	let lookupStarted = false;
+	const lookup = () => {
+		lookupStarted = true;
+		return new Promise((_, reject) => { rejectLookup = reject; });
+	};
+	const pending = module_.resolveFetchTarget("http://dns-cancel.test/", controller.signal, lookup);
+	await new Promise((resolve) => setImmediate(resolve));
+	assert.equal(lookupStarted, true);
+	controller.abort();
+	await assert.rejects(pending, (error) => error.kind === "aborted");
+	rejectLookup(new Error("late DNS rejection"));
+	await new Promise((resolve) => setTimeout(resolve, 10));
+});

@@ -88,6 +88,77 @@ test("重定向循环在限定次数后失败", async () => {
 	});
 });
 
+test("maxRedirects 可配置为 1 或 5", async () => {
+	await withServer((request, response) => {
+		const path = new URL(request.url ?? "/", "http://127.0.0.1").pathname;
+		const index = Number(path.slice(1) || 0);
+		if (index < 4) return send(response, "", 302, { location: `/${index + 1}` });
+		send(response, "final chain body");
+	}, async (base) => {
+		const first = `${base}/0`;
+		await assert.rejects(client.httpFetch({ ...baseRequest(base), url: new URL(first), target: { url: new URL(first), address: "127.0.0.1", family: 4 }, maxRedirects: 1, resolveTarget: localResolver(base) }), (error) => error.kind === "blocked_url");
+		const fifth = await client.httpFetch({ ...baseRequest(base), url: new URL(first), target: { url: new URL(first), address: "127.0.0.1", family: 4 }, maxRedirects: 5, resolveTarget: localResolver(base) });
+		assert.equal(fifth.redirectCount, 4);
+		assert.equal(fifth.body, "final chain body");
+	});
+});
+
+test("只把真正的重定向状态码当作跳转", async () => {
+	let requests = 0;
+	await withServer((request, response) => {
+		requests += 1;
+		send(response, "not a redirect", 300, { location: "/elsewhere" });
+	}, async (base) => {
+		await assert.rejects(client.httpFetch({ ...baseRequest(base), resolveTarget: localResolver(base) }), (error) => {
+			assert.equal(error.kind, "http_error");
+			assert.equal(error.options?.statusCode, 300);
+			return true;
+		});
+		assert.equal(requests, 1);
+	});
+});
+
+test("多跳共享一个总超时预算", async () => {
+	let requests = 0;
+	await withServer((request, response) => {
+		requests += 1;
+		const index = Number(new URL(request.url ?? "/", "http://127.0.0.1").pathname.slice(1) || 0);
+		setTimeout(() => {
+			if (response.destroyed) return;
+			if (index < 5) send(response, "", 302, { location: `/${index + 1}` });
+			else send(response, "late final");
+		}, 65);
+	}, async (base) => {
+		const first = `${base}/0`;
+		await assert.rejects(client.httpFetch({ ...baseRequest(base), url: new URL(first), target: { url: new URL(first), address: "127.0.0.1", family: 4 }, timeoutMs: 110, resolveTarget: localResolver(base) }), (error) => error.kind === "timeout");
+		assert.ok(requests >= 2, `应已进入后续跳转，实际请求 ${requests} 次`);
+	});
+});
+
+test("跳转 DNS 等待被取消后不建连，迟到拒绝被消费", async () => {
+	let requests = 0;
+	let rejectResolver;
+	let resolveCalled = false;
+	await withServer((request, response) => {
+		requests += 1;
+		send(response, "", 302, { location: "/never-connect" });
+	}, async (base) => {
+		const controller = new AbortController();
+		const resolveTarget = () => {
+			resolveCalled = true;
+			return new Promise((_, reject) => { rejectResolver = reject; });
+		};
+		const pending = client.httpFetch({ ...baseRequest(base), url: new URL(`${base}/`), target: { url: new URL(`${base}/`), address: "127.0.0.1", family: 4 }, resolveTarget, signal: controller.signal });
+		await new Promise((resolve) => setTimeout(resolve, 20));
+		assert.equal(resolveCalled, true);
+		controller.abort();
+		await assert.rejects(pending, (error) => error.kind === "aborted");
+		assert.equal(requests, 1);
+		rejectResolver(new Error("late resolver rejection"));
+		await new Promise((resolve) => setTimeout(resolve, 10));
+	});
+});
+
 test("404、403、429、500 归入 http_error 并带上状态码", async () => {
 	for (const [status, pattern] of [[404, /不存在/u], [403, /认证/u], [429, /限流/u], [500, /服务端/u]]) {
 		await withServer((request, response) => send(response, "detail", status), async (base) => {
@@ -143,7 +214,7 @@ test("请求头白名单不含 Cookie 与 Authorization", async () => {
 	await withServer((request, response) => {
 		assert.equal(request.headers.cookie, undefined);
 		assert.equal(request.headers.authorization, undefined);
-		assert.equal(request.headers["user-agent"], "pi-web-fetch/0.1.0-beta.1");
+		assert.equal(request.headers["user-agent"], "pi-web-fetch/0.1.0-beta.2");
 		send(response, "ok");
 	}, async (base) => {
 		const result = await client.httpFetch({ ...baseRequest(base), resolveTarget: localResolver(base) });

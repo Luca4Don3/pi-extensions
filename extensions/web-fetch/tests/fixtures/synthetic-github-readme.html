@@ -1,0 +1,41 @@
+<!-- 合成离线测试样本：仿静态 GitHub README 结构；并非真实网页采集。 -->
+<!doctype html>
+<html>
+<head>
+	<title>合成项目文档</title>
+	<style>.noise { color: red; }</style>
+	<script>window.syntheticSecret = "不得提取";</script>
+</head>
+<body>
+	<nav>合成导航噪声</nav>
+	<article class="markdown-body">
+		<div class="heading-wrap"><h1>合成项目说明</h1><div><p>中文正文与 <a href="../doc/index.html">相对文档</a>、<a href="#details">片段</a>、<a href="//cdn.example.test/reference">协议相对链接</a>。</p></div></div>
+		<p>危险地址 <a href="javascript:alert(1)">不应成为链接</a>。</p>
+		<h2 id="details">代码与 <code>&lt;T&gt;</code> <a href="../doc/index.html">链接</a></h2>
+		<ul><li><code>&lt;T&gt; and `ticks`</code> 与 <a href="https://example.test/guide">绝对链接</a></li></ul>
+		<table><tr><th>类型</th><th>说明</th></tr><tr><td><code>&lt;Item&gt;</code></td><td><a href="../doc/table.html">表格链接</a></td></tr></table>
+		<pre><code class="language-python">def greet(name):
+    if name:
+        print(f"&lt;{name}&gt;")
+
+	return name
+
+</code></pre>
+		<pre><code class="language-cpp">template &lt;typename T&gt;
+class Box {
+public:
+    T value;
+};</code></pre>
+		<pre><code class="language-html">&lt;section&gt;
+  &lt;item&gt;&amp;lt;T&amp;gt;&lt;/item&gt;
+&lt;/section&gt;</code></pre>
+		<pre><code class="language-xml">&lt;root&gt;
+  &lt;value&gt;中文&lt;/value&gt;
+&lt;/root&gt;</code></pre>
+		<pre><code class="language-text">包含围栏：
+```示例
+仍在同一代码块</code></pre>
+	</article>
+	<footer>合成页脚噪声</footer>
+</body>
+</html>

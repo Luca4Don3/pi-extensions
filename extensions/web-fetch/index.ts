@@ -1,19 +1,18 @@
 /**
  * web_fetch：本地优先的网页正文抓取扩展。
  *
- * 设计边界（v0.1.0-beta.1 脚手架阶段）：
  * - 只读取调用方给出的公开 URL，不执行网页脚本，不携带 Cookie / Authorization。
- * - 所有网络访问都要经过未实现的 URL 策略与有界传输层（后续阶段补齐）。
- * - 当前阶段仅建立工具契约、参数校验与配置校验；抓取流程返回固定诊断，
- *   不假装已经具备抓取能力。
+ * - 初始解析、逐跳重定向、连接与正文读取共享同一绝对截止时间。
+ * - 同步提取前后检查截止时间，不返回过期结果；不启用任何远程回退。
  */
 
 import { type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { type WebFetchDetails, WebFetchParams } from "./params.js";
-import { readWebFetchConfig, type WebFetchConfig } from "./config.js";
+import { MAX_CHARS_LIMIT, readWebFetchConfig, type WebFetchConfig } from "./config.js";
 import { FetchError, type FetchErrorKind } from "./errors.js";
 import { resolveFetchTarget } from "./transport/url-policy.js";
 import { httpFetch } from "./transport/http-client.js";
+import { createFetchDeadline } from "./transport/deadline.js";
 import { extractContent } from "./extract/index.js";
 
 export { WebFetchParams };
@@ -21,13 +20,15 @@ export type { WebFetchDetails, WebFetchConfig, FetchErrorKind };
 
 /** 抓取与提取的依赖；默认走真实实现，测试可整体注入。 */
 export interface WebFetchDependencies {
-	resolveTarget?: (url: string) => ReturnType<typeof resolveFetchTarget>;
+	resolveTarget?: (url: string, signal?: AbortSignal) => ReturnType<typeof resolveFetchTarget>;
 	fetchPage?: (request: {
 		url: URL;
 		target: { address: string; family: 4 | 6 };
 		signal?: AbortSignal;
 		timeoutMs: number;
+		deadlineMs: number;
 		maxResponseBytes: number;
+		maxRedirects: number;
 	}) => Promise<{ body: string; contentType: string; finalUrl: URL; redirectCount: number; statusCode: number }>;
 	extract?: typeof extractContent;
 }
@@ -40,8 +41,11 @@ export interface WebFetchOptions extends WebFetchDependencies {
 /** 把配置读取收敛为一次调用，便于测试注入。 */
 function resolveConfig(override?: () => WebFetchConfig): WebFetchConfig {
 	try {
-		return (override ?? readWebFetchConfig)();
+		const config = (override ?? readWebFetchConfig)();
+		if (config.remoteFallback !== "off") throw new FetchError("远程回退尚未实现，请将 PI_WEB_FETCH_REMOTE_FALLBACK 设为 off", "remote_blocked");
+		return config;
 	} catch (error) {
+		if (error instanceof FetchError && error.kind === "remote_blocked") throw error;
 		throw new FetchError("web_fetch 配置无效", "blocked_url", {});
 	}
 }
@@ -63,52 +67,61 @@ export default function piWebFetch(pi: ExtensionAPI, options: WebFetchOptions = 
 			if (url.length === 0) throw new FetchError("url 不能为空", "invalid_url", {});
 			const mode = params.mode ?? "auto";
 			const maxChars = params.maxChars ?? config.maxChars;
-			if (!Number.isSafeInteger(maxChars) || (maxChars as number) < 1) {
-				throw new FetchError("maxChars 必须是正整数", "invalid_url", {});
+			if (!Number.isSafeInteger(maxChars) || maxChars < 1 || maxChars > MAX_CHARS_LIMIT) {
+				throw new FetchError("maxChars 超出允许范围", "invalid_url", {});
 			}
+			if (mode !== "auto" && mode !== "article" && mode !== "text") throw new FetchError("mode 不受支持", "invalid_url");
 			// 先做完整的目标校验，再决定是否发起任何连接。
 			const resolveTarget = options.resolveTarget ?? resolveFetchTarget;
 			// details 一律只保留来源与路径：签名 URL、令牌等查询参数不得进入对外结果。
 			const safeUrl = (value: URL): string => `${value.origin}${value.pathname}`;
-			const target = await resolveTarget(url);
-			if (signal?.aborted) throw new FetchError("操作已取消", "aborted");
-
-			const fetchPage = options.fetchPage ?? ((request) => httpFetch({
-				url: request.url,
-				target: { url: request.url, address: request.target.address, family: request.target.family },
-				signal: request.signal,
-				timeoutMs: request.timeoutMs,
-				maxResponseBytes: request.maxResponseBytes,
-				// 后续每一跳都重新走完整校验；首跳目标已在上面校验过。
-				resolveTarget,
-			}).then((result) => ({
-				body: result.body,
-				contentType: result.headers["content-type"] ?? "",
-				finalUrl: result.finalUrl,
-				redirectCount: result.redirectCount,
-				statusCode: result.status,
-			})));
-			const fetched = await fetchPage({ url: target.url, target, signal, timeoutMs: config.timeoutMs, maxResponseBytes: config.maxResponseBytes });
-			if (signal?.aborted) throw new FetchError("操作已取消", "aborted");
-
-			const extract = options.extract ?? extractContent;
-			const extracted = extract(fetched.body, fetched.contentType, mode, maxChars);
-			const text = extracted.markdown;
-			return {
-				content: [{ type: "text", text: text.length > 0 ? text : "（未提取到正文）" }],
-				details: {
-					requestedUrl: safeUrl(target.url),
-					finalUrl: safeUrl(fetched.finalUrl),
-					contentType: fetched.contentType,
-					statusCode: fetched.statusCode,
-					redirectCount: fetched.redirectCount,
-					...(extracted.title === undefined ? {} : { title: extracted.title }),
-					provider: "direct",
-					extractedChars: text.length,
-					truncated: text.length >= maxChars,
-					durationMs: Date.now() - startedAt,
-				} satisfies WebFetchDetails,
-			};
+			const deadline = createFetchDeadline(config.timeoutMs, signal);
+			try {
+				const target = await deadline.run(() => resolveTarget(url, deadline.signal));
+				const fetchPage = options.fetchPage ?? ((request) => httpFetch({
+					url: request.url,
+					target: { url: request.url, address: request.target.address, family: request.target.family },
+					signal: request.signal,
+					timeoutMs: request.timeoutMs,
+					deadlineMs: request.deadlineMs,
+					maxResponseBytes: request.maxResponseBytes,
+					maxRedirects: request.maxRedirects,
+					resolveTarget,
+				}).then((result) => ({
+					body: result.body,
+					contentType: result.headers["content-type"] ?? "",
+					finalUrl: result.finalUrl,
+					redirectCount: result.redirectCount,
+					statusCode: result.status,
+				})));
+				const fetched = await deadline.run(() => fetchPage({
+					url: target.url, target, signal: deadline.signal, timeoutMs: config.timeoutMs,
+					deadlineMs: deadline.deadlineMs, maxResponseBytes: config.maxResponseBytes, maxRedirects: config.maxRedirects,
+				}));
+				const extract = options.extract ?? extractContent;
+				deadline.check();
+				const extracted = extract(fetched.body, fetched.contentType, mode, maxChars, fetched.finalUrl);
+				// 同步提取不可被计时器抢占，完成后必须检查真实时钟，不返回过期正文。
+				deadline.check();
+				const text = extracted.markdown;
+				return {
+					content: [{ type: "text", text }],
+					details: {
+						requestedUrl: safeUrl(target.url),
+						finalUrl: safeUrl(fetched.finalUrl),
+						contentType: fetched.contentType,
+						statusCode: fetched.statusCode,
+						redirectCount: fetched.redirectCount,
+						...(extracted.title === undefined ? {} : { title: extracted.title }),
+						provider: "direct",
+						extractedChars: text.length,
+						truncated: extracted.truncated,
+						durationMs: Date.now() - startedAt,
+					} satisfies WebFetchDetails,
+				};
+			} finally {
+				deadline.dispose();
+			}
 		},
 	});
 }

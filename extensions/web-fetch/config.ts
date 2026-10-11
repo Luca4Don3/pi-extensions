@@ -1,4 +1,5 @@
 import process from "node:process";
+import { FetchError } from "./errors.js";
 
 /**
  * web_fetch 的配置读取与严格校验。
@@ -7,9 +8,8 @@ import process from "node:process";
  * 并且错误文本不回显调用方给出的原值。
  */
 
-/** 默认整次抓取总预算；开启远程回退时单独放宽。 */
+/** 默认整次抓取总预算，包含初始解析、所有跳转与正文读取。 */
 export const DEFAULT_TIMEOUT_MS = 20_000;
-export const REMOTE_TIMEOUT_MS = 30_000;
 /** 默认解压后响应体上限，与 web-search 的响应体上限保持一致。 */
 export const DEFAULT_MAX_RESPONSE_BYTES = 5_242_880;
 export const MAX_RESPONSE_BYTES = 20_971_520;
@@ -20,9 +20,8 @@ export const MAX_CHARS_LIMIT = 200_000;
 export const DEFAULT_MAX_REDIRECTS = 3;
 export const MAX_REDIRECTS_LIMIT = 5;
 
-/** 远程免费回退通道；默认关闭。 */
-export type RemoteFallback = "off" | "jina";
-export const REMOTE_FALLBACKS: readonly RemoteFallback[] = ["off", "jina"];
+/** 当前仅实现本地抓取；远程回退必须保持关闭。 */
+export type RemoteFallback = "off";
 
 export interface WebFetchConfig {
 	readonly timeoutMs: number;
@@ -48,9 +47,9 @@ function readRemoteFallback(source: Record<string, string | undefined>): RemoteF
 	const raw = source.PI_WEB_FETCH_REMOTE_FALLBACK;
 	if (raw === undefined) return "off";
 	const trimmed = raw.trim().toLowerCase();
-	const matched = REMOTE_FALLBACKS.find((candidate) => candidate === trimmed);
-	if (matched === undefined) throw new Error("PI_WEB_FETCH_REMOTE_FALLBACK 只接受 off 或 jina");
-	return matched;
+	if (trimmed === "jina") throw new FetchError("远程回退尚未实现，请将 PI_WEB_FETCH_REMOTE_FALLBACK 设为 off", "remote_blocked");
+	if (trimmed !== "off") throw new Error("PI_WEB_FETCH_REMOTE_FALLBACK 当前只接受 off");
+	return "off";
 }
 
 /** 从环境变量读取抓取配置；未设置时全部使用默认值。 */

@@ -24,15 +24,6 @@ pi-extensions/
 │   ├── web-search/
 │   │   ├── index.ts              # 扩展入口与搜索执行
 │   │   ├── response-body.ts      # 响应体流式解码与字节上限
-│   │   └── quota/                 # 额度预检、成本估算与私有状态持久化
-│   ├── web-fetch/
-│   │   ├── index.ts               # web_fetch 工具注册与抓取流程
-│   │   ├── config.ts              # 环境变量读取与严格校验
-│   │   ├── errors.ts              # 抓取错误分类
-│   │   ├── params.ts              # 工具参数表
-│   │   ├── transport/             # URL 策略、HTTP 传输、有界响应解码
-│   │   ├── extract/               # HTML / Markdown / 纯文本 / JSON 正文提取
-│   │   └── tests/
 │   │   ├── search/
 │   │   │   ├── registry.ts       # provider ID、环境变量与匿名能力元数据
 │   │   │   ├── protocol.ts       # REST provider 共用协议
@@ -50,6 +41,14 @@ pi-extensions/
 │   │   └── tests/
 │   │       ├── *.test.mjs        # 离线测试
 │   │       └── smoke.mjs         # 真实网络冒烟
+│   ├── web-fetch/
+│   │   ├── index.ts              # 网页抓取工具与统一预算
+│   │   ├── config.ts             # 配置严格校验
+│   │   ├── errors.ts             # 固定错误分类
+│   │   ├── params.ts             # 参数与输出元数据
+│   │   ├── transport/            # 截止时间、目标校验、绑定连接、有界解码
+│   │   ├── extract/              # 正文转换与代码保护
+│   │   └── tests/                # 离线回归、合成样本与真实网络冒烟
 │   ├── subagent/
 │   │   ├── index.ts              # 工具入口
 │   │   ├── agents.ts             # agent 发现逻辑
@@ -300,11 +299,11 @@ Pi 的内置工具只有 `read` / `bash` / `edit` / `write` / `grep` / `find` / 
 
 > **与 npm 上同名包 `pi-web-search` 的区别**：本扩展直接连接 Exa / Parallel 的远程模型上下文协议（Model Context Protocol，MCP）端点，并通过原生 REST 接口调用 Tavily、Firecrawl 与 SerpApi。本扩展不发布到 npm，只通过上面的 GitHub 安装方式分发。
 
-## 状态：v0.7.0-beta.1
+## 状态：v0.7.0-beta.2
 
-本轮新增混合额度管理（Quota Manager）与按原因区分的持久冷却，并把匿名候选顺序调整为 **Exa → Tavily → Parallel → Firecrawl → TinyFish（keyless）**；计费候选顺序独立维护，Exa 仍排第一。仍然不新增搜索 provider、不做质量评分或结果融合，也不添加 `web_fetch`。
+搜索已具备混合额度管理（Quota Manager）与按原因区分的持久冷却，匿名候选顺序为 **Exa → Tavily → Parallel → Firecrawl → TinyFish（keyless）**；计费候选顺序独立维护，Exa 仍排第一。当前不扩展搜索服务商、不做质量评分或结果融合。
 
-本轮新增独立扩展 `web-fetch`：本地优先的 `web_fetch` 工具，读取公开网页并输出可读 Markdown，自带 SSRF 防护与有界响应处理。搜索与抓取是两个独立安装、独立测试的扩展，互不强依赖。
+独立扩展 `web-fetch` 提供本地直接抓取公开网页的 `web_fetch` 工具，自带服务端请求伪造（SSRF）防护与有界响应处理。搜索与抓取独立安装、独立测试，互不强依赖。仓库版本 `v0.7.0-beta.2`、抓取独立包版本 `0.1.0-beta.2`；搜索独立包保持 `0.6.0-beta.3`。本轮仅修复抓取稳定性：统一总截止时间与跳转配置、保护代码和链接、加固流取消与解压清理、按声明字符集解码、精确标记截断，并明确拒绝未实现的远程回退。
 
 **TinyFish 只接入零凭据 keyless 匿名通道。** 该通道位于 MCP 端点，不需要任何 API Key 或 OAuth，服务端自述限额为 30 请求/分钟、每日 50 次搜索。官方文档对其认证通道「超出每日额度后是否扣减钱包余额」的说法相互矛盾且无法验证，因此本轮不实现认证通道，也不把配置 `TINYFISH_API_KEY` 视为免费。
 
@@ -371,10 +370,6 @@ Pi 的内置工具只有 `read` / `bash` / `edit` / `write` / `grep` / `find` / 
 | `PI_WEB_SEARCH_FREE_COOLDOWN_MS` | 未设置 | 显式设置时作为固定冷却覆盖全部通道；接受 `0` 至 `86400000` 的安全整数，`0` 禁用冷却，非法值报错。未设置时按原因阶梯退避（见下） |
 | `PI_WEB_SEARCH_MAX_RESPONSE_BYTES` | `5242880` | 解压后响应体上限，默认 5 MiB；只接受十进制正整数 `1` 至 `20971520`（20 MiB），首尾空白允许，非法配置在读取凭据或请求前报错 |
 | `PI_WEB_SEARCH_TIMEOUT_MS` | `25000` | 单次请求预算，最小 `100` 毫秒 |
-| `PI_WEB_FETCH_TIMEOUT_MS` | `20000` | `web_fetch` 单次抓取预算，最小 `100` 毫秒，最大 `60000` |
-| `PI_WEB_FETCH_MAX_RESPONSE_BYTES` | `5242880` | `web_fetch` 解压后响应体上限，`1` 至 `20971520`（20 MiB） |
-| `PI_WEB_FETCH_MAX_CHARS` | `24000` | `web_fetch` 返回给模型的正文上限，`1` 至 `200000` |
-| `PI_WEB_FETCH_MAX_REDIRECTS` | `3` | `web_fetch` 手动跟随的重定向次数，`1` 至 `5`，每一跳都重新校验目标 |
 | `PI_WEB_SEARCH_RETRIES` | `1` | 可重试错误的重试次数，`0` 表示不重试；单次退避等待最多 5 秒 |
 
 默认拒绝所有密钥通道时，搜索不会读取任何 provider 密钥环境变量或系统密钥库。所有已配置密钥均按可能计费处理；本轮只查询余额，不从余额推断免费资格，也不构造 `free-key` 通道。Firecrawl 请求与计费说明见[搜索文档](https://docs.firecrawl.dev/features/search)和[计费文档](https://docs.firecrawl.dev/billing)。
@@ -505,6 +500,35 @@ Exa 返回的正文采用大模型友好的文本布局（`Title:` / `URL:` / `H
 - 仅写入公开网页正文；API key 只在内存与请求头 / URL 中，不进入落盘内容，也不会出现在错误文本里
 - 上游响应回显 key（正文、来源 URL 或错误文本）时，`content`、`details` 与落盘内容都会先脱敏再截断
 
+# 网页抓取（`web_fetch`）
+
+```bash
+pi install ~/pi-extensions/extensions/web-fetch
+```
+
+可以单独读取公开网址，无需安装或先调用搜索。参数为 `url`、`mode`（`auto` / `article` / `text`）及可选 `maxChars`：
+
+```json
+{ "url": "https://example.com/", "mode": "auto", "maxChars": 24000 }
+```
+
+- 初始域名系统（DNS）解析、全部重定向、建立连接与正文读取共用一个绝对截止时间，不会逐跳重置预算。取消或超时后不再启动下一跳；底层操作系统的解析任务可能继续完成，但迟到结果不会用于建连。
+- 连接绑定已校验的公网地址；每次跳转重新验证协议、凭据、端口及目标地址。不继承代理，不发送认证或缓存凭据。
+- 压缩格式解码后累计响应体字节数；超限中止网络并通过持有的读取器取消流，不等待可能挂起的清理操作，不返回部分正文。
+- 根据响应头声明的字符集增量解码，支持 UTF-8、GBK、GB18030 等运行时支持的字符集；未知字符集或非法字节明确失败。未声明字符集时按 UTF-8，不猜测页面内编码声明。
+- 代码块与行内代码先隔离再恢复，保留尖括号、缩进、制表符与空行；直接读取 Markdown 或纯文本不压缩空白。相对链接按最终网页地址解析，不额外抓取链接。
+- `details.truncated` 来自提取层，正文恰好达到上限不算截断；包括截断提示在内的正文不超过 `maxChars`。输出地址省略查询串和片段，不回显签名参数。
+
+| 环境变量 | 默认 | 作用 |
+| --- | --- | --- |
+| `PI_WEB_FETCH_TIMEOUT_MS` | `20000` | 整次抓取预算，接受十进制整数 `1` 至 `60000` 毫秒 |
+| `PI_WEB_FETCH_MAX_RESPONSE_BYTES` | `5242880` | 解压后响应体上限，`1` 至 `20971520` 字节 |
+| `PI_WEB_FETCH_MAX_CHARS` | `24000` | 模型可见正文上限，`1` 至 `200000` 字符；工具参数同样受此上限约束 |
+| `PI_WEB_FETCH_MAX_REDIRECTS` | `3` | 实际执行的最大跳转次数，`1` 至 `5` |
+| `PI_WEB_FETCH_REMOTE_FALLBACK` | `off` | 当前仅支持关闭；设置 `jina` 会在任何解析或请求前明确报错，不会静默忽略 |
+
+同步正文提取在开始与结束时检查截止时间，过期结果不会返回；但不采用工作线程，因此计时器不能抢占正在执行的同步计算。这不是同步提取耗时的硬性上限。
+
 ## 开发与测试
 
 以下测试覆盖仓库内**所有**插件：
@@ -515,6 +539,9 @@ node --test extensions/*/tests/*.test.mjs
 
 # 全部匿名 provider 与 auto 的真实网络冒烟（默认强制匿名、不读密钥、不访问真实密钥库）
 node extensions/web-search/tests/smoke.mjs
+
+# 抓取扩展的真实网络冒烟（仅公开网址，不调用模型或付费服务）
+node extensions/web-fetch/tests/smoke.mjs
 
 # 仅当环境路由配置已显式允许计费时才可运行；可能产生费用，不要把密钥放入命令参数
 node extensions/web-search/tests/smoke.mjs --billable
@@ -533,7 +560,9 @@ for p in pi-ai pi-agent-core pi-tui; do
 done
 ```
 
-CI（`.github/workflows/ci.yml`）固定安装 `@earendil-works/pi-coding-agent@1.1.0` 后只跑离线用例，用来守住 Pi 兼容性。
+持续集成（CI）固定安装 `@earendil-works/pi-coding-agent@1.1.0` 后只跑离线用例，覆盖各扩展与抓取合成样本。合成样本模拟代码托管说明页和嵌套技术文档，并非抓取的真实站点页面；持续集成成功不代表真实网络冒烟已通过。
+
+本轮在隔离的 Pi `1.1.0` 软件开发工具包（SDK）运行时完成抓取验收，不读取用户配置、不调用模型，也不修改安装。示例网页、技术文档、代码托管页面及实际跳转均成功；原始 Markdown 地址首轮成功，后续出现超时及网络失败，已保留失败记录。不能据此宣称所有真实网络冒烟均通过，也不代表用户终端界面或长期网络可用性已验证。
 
 ## 限制与注意
 
@@ -549,7 +578,7 @@ CI（`.github/workflows/ci.yml`）固定安装 `@earendil-works/pi-coding-agent@
 
 - 免费认证层：仅在能验证账户不会超额计费时，才把免费账户密钥纳入免费候选池；当前余额接口不足以证明，暂不启用
 - 质量感知的跨 provider 后备策略；评估 RRF 与 benchmark 前先明确方法和复现条件，目前均未实现
-- `web_fetch` 远程回退暂缓：Jina Reader keyless 会把目标 URL 发送给第三方，默认关闭且需使用者主动开启；本轮不实现，也不把付费抓取服务纳入默认路径
+- `web_fetch` 远程回退暂缓：目标地址发送给第三方涉及隐私决策；当前只接受关闭，尚未实现的 `jina` 配置会明确报错，不把付费抓取服务纳入默认路径
 - `web_fetch` 提取质量优化：按站点类型细化正文容器规则，或评估引入成熟正文提取库；不引入浏览器渲染
 - 结果缓存与进一步的 provider 模块整理；本轮并非完整 MCP 模块迁移
 - TinyFish 认证通道暂缓：其 API Reference 的 Billing 段写「每日 12,000 次后需要钱包正余额，否则 402」，而定价页与公告写「Search 永不扣钱包、$0 余额仍可用」，两处口径矛盾且无法验证。keyless 匿名通道没有账户，因此不存在扣费风险，本轮只接入它。见 [Search API Reference](https://docs.tinyfish.ai/search-api/reference) 与 [Pricing](https://www.tinyfish.ai/pricing)。

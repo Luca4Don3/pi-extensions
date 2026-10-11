@@ -143,22 +143,67 @@ export function isPublicIPAddress(value: string): boolean {
 	return false;
 }
 
+function checkSignal(signal?: AbortSignal): void {
+	if (signal?.aborted === true) throw signalError(signal);
+}
+
+function signalError(signal: AbortSignal): FetchError {
+	const reason = signal.reason;
+	if (reason instanceof FetchError && (reason.kind === "timeout" || reason.kind === "aborted")) return reason;
+	return new FetchError("操作已取消", "aborted");
+}
+
+/** DNS 操作系统查询本身不可取消；取消时停止等待并消费迟到拒绝。 */
+function raceWithSignal<T>(operation: () => Promise<T>, signal?: AbortSignal): Promise<T> {
+	if (signal === undefined) return operation();
+	if (signal.aborted) return Promise.reject(signalError(signal));
+	return new Promise<T>((resolve, reject) => {
+		let settled = false;
+		const cleanup = (): void => signal.removeEventListener("abort", onAbort);
+		const finish = (callback: () => void): void => {
+			if (settled) return;
+			settled = true;
+			cleanup();
+			callback();
+		};
+		const onAbort = (): void => finish(() => reject(signalError(signal)));
+		signal.addEventListener("abort", onAbort, { once: true });
+		if (signal.aborted) {
+			onAbort();
+			return;
+		}
+		let pending: Promise<T>;
+		try {
+			pending = operation();
+		} catch (error) {
+			finish(() => reject(error));
+			return;
+		}
+		Promise.resolve(pending).then(
+			(value) => finish(() => resolve(value)),
+			(error: unknown) => finish(() => reject(error)),
+		);
+	});
+}
+
 /** 把主机名或 IP 字面量解析为已校验的公网地址。 */
-async function resolveAddress(hostname: string, signal?: AbortSignal): Promise<{ address: string; family: 4 | 6 } | undefined> {
+async function resolveAddress(
+	hostname: string,
+	signal?: AbortSignal,
+	lookupFn: (hostname: string, options: { all: true; verbatim: true }) => Promise<Array<{ address: string; family: number }>> = lookup,
+): Promise<{ address: string; family: 4 | 6 } | undefined> {
 	// URL 的 IPv6 主机名带方括号，`isIP` 不能直接识别，先剥掉再判断。
 	const literal = hostname.startsWith("[") && hostname.endsWith("]") ? hostname.slice(1, -1) : hostname;
 	const version = isIP(literal);
 	if (version !== 0) {
 		return isPublicIPAddress(literal) ? { address: literal, family: version === 6 ? 6 : 4 } : undefined;
 	}
-	const records = await lookup(hostname, { all: true, verbatim: true });
+	const records = await raceWithSignal(() => lookupFn(hostname, { all: true, verbatim: true }), signal);
 	const usable = records.filter((record: { address: string }) => isPublicIPAddress(record.address));
 	if (usable.length === 0) return undefined;
 	// 只返回已校验的地址；传输层用同一结果建连，不留出重新解析的窗口。
 	const chosen = usable[0]!;
 	return { address: chosen.address, family: chosen.family === 6 ? 6 : 4 };
-
-
 }
 
 /**
@@ -166,7 +211,12 @@ async function resolveAddress(hostname: string, signal?: AbortSignal): Promise<{
  * 非法协议、内嵌凭据、非公网地址与不受支持的端口都会返回固定分类的 FetchError，
  * 错误文本不回显调用方给出的原 URL。
  */
-export async function resolveFetchTarget(rawUrl: string, signal?: AbortSignal): Promise<ResolvedTarget> {
+export async function resolveFetchTarget(
+	rawUrl: string,
+	signal?: AbortSignal,
+	lookupFn?: (hostname: string, options: { all: true; verbatim: true }) => Promise<Array<{ address: string; family: number }>>,
+): Promise<ResolvedTarget> {
+	checkSignal(signal);
 	const trimmed = typeof rawUrl === "string" ? rawUrl.trim() : "";
 	if (trimmed.length === 0) throw new FetchError("url 不能为空", "invalid_url");
 	let parsed: URL;
@@ -186,10 +236,12 @@ export async function resolveFetchTarget(rawUrl: string, signal?: AbortSignal): 
 	}
 	if (parsed.hostname.length === 0) throw new FetchError("url 缺少主机名", "invalid_url");
 	try {
-		const resolved = await resolveAddress(parsed.hostname, signal);
+		const resolved = await resolveAddress(parsed.hostname, signal, lookupFn);
+		checkSignal(signal);
 		if (resolved === undefined) throw new FetchError("目标不是公网地址", "blocked_url");
 		return { url: parsed, address: resolved.address, family: resolved.family };
 	} catch (error) {
+		checkSignal(signal);
 		if (error instanceof FetchError) throw error;
 		throw new FetchError("目标地址解析失败", "blocked_url");
 	}

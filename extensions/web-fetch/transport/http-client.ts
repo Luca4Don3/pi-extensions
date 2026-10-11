@@ -1,19 +1,11 @@
-/**
- * 安全的有界 HTTP 传输。
- *
- * 关键约束：
- * - 目标地址必须来自 `resolveFetchTarget`，随后**只连接那个已校验的 IP**，
- *   不让 HTTP 客户端按主机名重新解析，关闭 DNS 重绑定窗口。
- * - 重定向手动跟随，每一跳都重新走一遍完整的目标校验。
- * - 只发送固定的请求头，不携带 Cookie、Authorization 或调用方提供的头。
- * - 超时、外部取消与响应体上限各自生效，互不掩盖。
- */
+/** 安全的有界 HTTP 传输：逐跳校验目标，并在请求全程共享绝对截止时间。 */
 
 import { request } from "node:https";
-import { request as httpRequest } from "node:http";
-import { Readable } from "node:stream";
+import { request as httpRequest, type IncomingMessage } from "node:http";
+import { pipeline, Readable, type Transform } from "node:stream";
 import { createBrotliDecompress, createGunzip, createInflate } from "node:zlib";
 import { FetchError, type FetchErrorKind } from "../errors.js";
+import { createFetchDeadline } from "./deadline.js";
 import { resolveFetchTarget, type ResolvedTarget } from "./url-policy.js";
 import { readResponseTextLimited } from "./response-body.js";
 
@@ -24,12 +16,13 @@ export interface HttpFetchRequest {
 	readonly target: ResolvedTarget;
 	readonly signal?: AbortSignal;
 	readonly timeoutMs: number;
+	/** 可传入先前创建的截止时刻，避免初始 DNS 后重置预算。 */
+	readonly deadlineMs?: number;
 	readonly maxResponseBytes: number;
-	/**
-	 * 目标解析注入点；默认使用 `resolveFetchTarget`。
-	 * 测试用它在不放弃安全语义的前提下驱动本地服务器。
-	 */
-	readonly resolveTarget?: (url: string) => Promise<ResolvedTarget>;
+	/** 重定向上限，默认 3。 */
+	readonly maxRedirects?: number;
+	/** 每一跳重新解析目标；默认策略会使用 signal 取消 DNS 等待。 */
+	readonly resolveTarget?: (url: string, signal?: AbortSignal) => Promise<ResolvedTarget>;
 }
 
 export interface HttpFetchResponse {
@@ -45,15 +38,16 @@ export function buildHeaders(url: URL): Record<string, string> {
 	return {
 		accept: "text/html,application/xhtml+xml,text/plain,application/json;q=0.9,*/*;q=0.5",
 		"accept-language": "zh-CN,zh;q=0.9,en;q=0.8",
-		"accept-encoding": "gzip, deflate",
-		"user-agent": "pi-web-fetch/0.1.0-beta.1",
+		"accept-encoding": "gzip, deflate, br",
+		"user-agent": "pi-web-fetch/0.1.0-beta.2",
 		host: url.host,
 	};
 }
 
-/** 取出响应头中的跳转目标；相对地址按当前 URL 解析。 */
-function redirectLocation(url: URL, headers: Record<string, string>): string | undefined {
-	const location = headers.location ?? headers["content-location"];
+/** 只接受真正的 Location 头；相对地址按当前 URL 解析。 */
+function redirectLocation(url: URL, headers: IncomingMessage["headers"]): string | undefined {
+	const header = headers.location;
+	const location = Array.isArray(header) ? header[0] : header;
 	if (location === undefined) return undefined;
 	try {
 		return new URL(location, url).toString();
@@ -62,49 +56,111 @@ function redirectLocation(url: URL, headers: Record<string, string>): string | u
 	}
 }
 
-/** 单次请求；不使用跟随重定向的 fetch，保证每一跳都被校验。 */
+function signalError(signal: AbortSignal): Error {
+	const reason = signal.reason;
+	return reason instanceof Error ? reason : new FetchError("操作已取消", "aborted");
+}
+
+interface RequestHandle {
+	readonly status: number;
+	readonly headers: IncomingMessage["headers"];
+	readonly raw: IncomingMessage;
+	cleanup(): void;
+}
+
+/** 单次请求；lookup 始终绑定到已校验 IP，abort listener 保留至正文清理结束。 */
 function requestOnce(
 	target: ResolvedTarget,
 	headers: Record<string, string>,
-	controller: AbortController,
-): Promise<{ status: number; headers: Record<string, string>; raw: import("node:http").IncomingMessage }> {
+	signal: AbortSignal,
+): Promise<RequestHandle> {
+	if (signal.aborted) return Promise.reject(signalError(signal));
 	const isTls = target.url.protocol === "https:";
 	const impl = isTls ? request : httpRequest;
 	return new Promise((resolve, reject) => {
-		const req = impl(
-			{
-				protocol: target.url.protocol,
-				hostname: target.address,
-				port: target.url.port.length > 0 ? Number(target.url.port) : isTls ? 443 : 80,
-				path: `${target.url.pathname}${target.url.search}`,
-				method: "GET",
-				headers,
-				// 连接必须落在已校验的地址上；这里不再做任何域名解析。
-				lookup: (_hostname, _options, callback) => callback(null, target.address, target.family),
-				...(isTls ? { servername: target.url.hostname } : {}),
-			},
-			(response) => resolve({ status: response.statusCode ?? 0, headers: response.headers as Record<string, string>, raw: response }),
-		);
-		req.on("error", reject);
-		req.end();
-		controller.signal.addEventListener("abort", () => req.destroy(), { once: true });
+		let settled = false;
+		let raw: IncomingMessage | undefined;
+		let detached = false;
+		let req: ReturnType<typeof request> | undefined;
+		const onAbort = (): void => { req?.destroy(signalError(signal)); };
+		const onRawError = (): void => undefined;
+		const cleanup = (): void => {
+			if (detached) return;
+			detached = true;
+			signal.removeEventListener("abort", onAbort);
+			req?.removeListener("error", onRequestError);
+			raw?.removeListener("error", onRawError);
+		};
+		const onRequestError = (error: Error): void => {
+			if (!settled) {
+				settled = true;
+				cleanup();
+				reject(error);
+			} else if (raw !== undefined && !raw.destroyed) {
+				raw.destroy(error);
+			}
+		};
+		try {
+			req = impl(
+				{
+					protocol: target.url.protocol,
+					hostname: target.address,
+					port: target.url.port.length > 0 ? Number(target.url.port) : isTls ? 443 : 80,
+					path: `${target.url.pathname}${target.url.search}`,
+					method: "GET",
+					headers,
+					// 连接只使用已校验 IP，不让 HTTP 客户端重新解析主机名。
+					lookup: (_hostname, _options, callback) => callback(null, target.address, target.family),
+					...(isTls ? { servername: target.url.hostname } : {}),
+				},
+				(response) => {
+					if (settled) {
+						response.destroy();
+						return;
+					}
+					settled = true;
+					raw = response;
+					raw.on("error", onRawError);
+					resolve({
+						status: response.statusCode ?? 0,
+						headers: response.headers,
+						raw: response,
+						cleanup,
+					});
+				},
+			);
+			req!.on("error", onRequestError);
+			signal.addEventListener("abort", onAbort, { once: true });
+			if (signal.aborted) onAbort();
+			else req!.end();
+		} catch (error) {
+			if (req !== undefined) cleanup();
+			if (!settled) {
+				settled = true;
+				reject(error);
+			}
+		}
 	});
 }
 
-/** 按 content-encoding 先解压；Node 原生 http 不像 fetch 那样自动解压。 */
-function decodeBody(raw: import("node:http").IncomingMessage): Readable {
+/** 解压流通过 pipeline 关联源与变换流，确保任一端错误都会销毁另一端。 */
+function decodeBody(raw: IncomingMessage): Readable {
 	const encoding = (raw.headers["content-encoding"] ?? "").toString().trim().toLowerCase();
-	if (encoding === "gzip" || encoding === "x-gzip") return raw.pipe(createGunzip());
-	if (encoding === "deflate") return raw.pipe(createInflate());
-	if (encoding === "br") return raw.pipe(createBrotliDecompress());
-	return raw;
+	if (encoding.length === 0 || encoding === "identity") return raw;
+	let decoder: Transform;
+	if (encoding === "gzip" || encoding === "x-gzip") decoder = createGunzip();
+	else if (encoding === "deflate") decoder = createInflate();
+	else if (encoding === "br") decoder = createBrotliDecompress();
+	else throw new FetchError("目标使用了不支持的内容编码", "unsupported_content");
+	pipeline(raw, decoder, (error) => {
+		// pipeline 会销毁两端；回调负责消费退出错误，不让它成为未处理事件。
+		if (error !== undefined && error !== null && !decoder.destroyed) decoder.destroy(error);
+	});
+	return decoder;
 }
 
-/**
- * 把 Node 响应流转成 Fetch Response，复用同一套有界解码逻辑。
- * 已解压的正文不再带原始的 content-encoding 与 content-length，避免与流长度不符。
- */
-function toWebResponse(raw: import("node:http").IncomingMessage, status: number): Response {
+/** 把 Node 响应流转成 Fetch Response；解压后的长度不再沿用原始长度头。 */
+function toWebResponse(raw: IncomingMessage, status: number): Response {
 	const headers = new Headers();
 	for (const [name, value] of Object.entries(raw.headers)) {
 		const lower = name.toLowerCase();
@@ -115,90 +171,99 @@ function toWebResponse(raw: import("node:http").IncomingMessage, status: number)
 	return new Response(Readable.toWeb(decodeBody(raw)) as unknown as BodyInit, { status, headers });
 }
 
-/** 总预算的软化上限：单次请求超时已由 per-request 计时器负责，这里只兜住多次跳转累计耗时。 */
-const ABSOLUTE_TOTAL_MS = 60_000;
-/** 重定向次数上限；与配置的默认值一致，超出即失败。 */
-const MAX_REDIRECTS = 3;
+function isRedirectStatus(status: number): boolean {
+	return status === 301 || status === 302 || status === 303 || status === 307 || status === 308;
+}
 
-/** 带重定向与预算控制的一次完整抓取；每一跳都重新走完整目标校验。 */
+/** 带逐跳目标校验与单一绝对截止时间的完整抓取。 */
 export async function httpFetch(input: HttpFetchRequest): Promise<HttpFetchResponse> {
-	const startedAt = Date.now();
+	const deadline = createFetchDeadline(input.timeoutMs, input.signal, input.deadlineMs);
 	const resolve = input.resolveTarget ?? resolveFetchTarget;
+	const maxRedirects = input.maxRedirects ?? 3;
+	if (!Number.isSafeInteger(maxRedirects) || maxRedirects < 0) {
+		deadline.dispose();
+		throw new FetchError("重定向次数配置无效", "blocked_url");
+	}
 	let current = input.target;
 	let redirectCount = 0;
 	let url = current.url;
-	/** 剩余预算；解析与请求都不得超出它。 */
-	const remainingMs = (): number => Math.max(1, ABSOLUTE_TOTAL_MS - (Date.now() - startedAt));
-
-	for (;;) {
-		const controller = new AbortController();
-		let timedOut = false;
-		const timer = setTimeout(() => {
-			timedOut = true;
-			controller.abort();
-		}, Math.min(input.timeoutMs, remainingMs()));
-		const onExternalAbort = (): void => controller.abort(input.signal?.reason);
-		if (input.signal?.aborted) {
-			clearTimeout(timer);
-			throw new FetchError("操作已取消", "aborted");
-		}
-		input.signal?.addEventListener("abort", onExternalAbort, { once: true });
-		try {
-			const { status, headers, raw } = await requestOnce(current, buildHeaders(url), controller);
-			if (status >= 300 && status < 400) {
-				const location = redirectLocation(url, headers);
-				raw.resume();
-				if (location === undefined || redirectCount >= MAX_REDIRECTS) {
-					throw new FetchError("重定向不可用或次数超限", "blocked_url");
-				}
-				// 每一跳都重新校验协议、地址与端口，绝不复用上一跳的结论。
-				current = await resolve(location);
-				url = current.url;
-				redirectCount += 1;
-				continue;
-			}
-			if (status === 401 || status === 403) throw new FetchError("目标要求认证", "http_error", { statusCode: status });
-			if (status === 404) throw new FetchError("目标不存在", "http_error", { statusCode: status });
-			if (status === 429) {
-				throw new FetchError("目标限流", "http_error", { statusCode: status, retryAfterMs: parseRetryAfter(headers["retry-after"]) });
-			}
-			if (status >= 500) throw new FetchError("目标服务端错误", "http_error", { statusCode: status });
-			if (status !== 200) throw new FetchError("目标返回了不受支持的状态", "http_error", { statusCode: status });
-
-			const response = toWebResponse(raw, status);
-			const body = await readResponseTextLimited(response, input.maxResponseBytes, controller);
-			if (body.length === 0) throw new FetchError("目标没有返回正文", "extraction_failed");
-			return {
-				status,
-				headers: Object.fromEntries(Object.entries(raw.headers).filter(([, value]) => typeof value === "string")) as Record<string, string>,
-				body,
-				finalUrl: url,
-				redirectCount,
+	try {
+		for (;;) {
+			deadline.check();
+			const controller = new AbortController();
+			const relayAbort = (): void => {
+				if (!controller.signal.aborted) controller.abort(deadline.signal.reason);
 			};
-		} catch (error) {
-			if (input.signal?.aborted) throw new FetchError("操作已取消", "aborted");
-			if (timedOut) throw new FetchError("抓取超时", "timeout");
-			if (error instanceof FetchError) throw error;
-			// 目标解析（含每一跳重定向）失败时沿用其分类，不把安全拒绝降级成网络错误。
-			const kind = (error as { kind?: string } | undefined)?.kind;
-			if (typeof kind === "string") throw new FetchError("目标不可达", kind as FetchErrorKind);
-			throw new FetchError("抓取失败", "network_error");
-		} finally {
-			clearTimeout(timer);
-			input.signal?.removeEventListener("abort", onExternalAbort);
+			deadline.signal.addEventListener("abort", relayAbort, { once: true });
+			let handle: RequestHandle | undefined;
+			let succeeded = false;
+			try {
+				if (deadline.signal.aborted) relayAbort();
+				handle = await deadline.run(() => requestOnce(current, buildHeaders(url), controller.signal));
+				deadline.check();
+				const { status, headers, raw } = handle;
+				if (isRedirectStatus(status)) {
+					const location = redirectLocation(url, headers);
+					raw.destroy();
+					if (location === undefined || redirectCount >= maxRedirects) {
+						throw new FetchError("重定向不可用或次数超限", "blocked_url");
+					}
+					current = await deadline.run(() => resolve(location, deadline.signal));
+					url = current.url;
+					redirectCount += 1;
+					continue;
+				}
+				if (status === 401 || status === 403) throw new FetchError("目标要求认证", "http_error", { statusCode: status });
+				if (status === 404) throw new FetchError("目标不存在", "http_error", { statusCode: status });
+				if (status === 429) {
+					throw new FetchError("目标限流", "http_error", { statusCode: status, retryAfterMs: parseRetryAfter(headers["retry-after"]) });
+				}
+				if (status >= 500) throw new FetchError("目标服务端错误", "http_error", { statusCode: status });
+				if (status !== 200) throw new FetchError("目标返回了不受支持的状态", "http_error", { statusCode: status });
+
+				const response = toWebResponse(raw, status);
+				const body = await deadline.run(() => readResponseTextLimited(response, input.maxResponseBytes, controller));
+				if (body.length === 0) throw new FetchError("目标没有返回正文", "extraction_failed");
+				succeeded = true;
+				return {
+					status,
+					headers: Object.fromEntries(Object.entries(raw.headers).filter(([, value]) => typeof value === "string")) as Record<string, string>,
+					body,
+					finalUrl: url,
+					redirectCount,
+				};
+			} finally {
+				deadline.signal.removeEventListener("abort", relayAbort);
+				if (handle !== undefined) {
+					handle.cleanup();
+					if (!succeeded && !handle.raw.destroyed) handle.raw.destroy();
+				}
+			}
 		}
-		if (remainingMs() <= 1) throw new FetchError("抓取超时", "timeout");
+	} catch (error) {
+		try {
+			deadline.check();
+		} catch (deadlineError) {
+			throw deadlineError;
+		}
+		if (error instanceof FetchError) throw error;
+		// 目标解析的安全分类不得降级成普通网络错误。
+		const kind = (error as { kind?: string } | undefined)?.kind;
+		if (typeof kind === "string") throw new FetchError("目标不可达", kind as FetchErrorKind);
+		throw new FetchError("抓取失败", "network_error");
+	} finally {
+		deadline.dispose();
 	}
 }
 
 /** 解析 Retry-After 的秒与 HTTP 日期两种形式。 */
-function parseRetryAfter(value: string | undefined): number | undefined {
+function parseRetryAfter(value: string | string[] | undefined): number | undefined {
 	if (value === undefined) return undefined;
-	const trimmed = value.trim();
+	const trimmed = (Array.isArray(value) ? value[0] : value).trim();
 	if (trimmed.length === 0) return undefined;
 	const seconds = Number(trimmed);
 	if (Number.isFinite(seconds) && seconds >= 0) return Math.ceil(seconds * 1000);
-	const timestamp = Date.parse(value);
+	const timestamp = Date.parse(trimmed);
 	if (!Number.isFinite(timestamp)) return undefined;
 	return Math.max(0, timestamp - Date.now());
 }

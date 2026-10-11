@@ -1,6 +1,6 @@
 /** web_fetch 工具的模型可见参数表。 */
 import { Type } from "typebox";
-import { DEFAULT_MAX_CHARS } from "./config.js";
+import { DEFAULT_MAX_CHARS, MAX_CHARS_LIMIT } from "./config.js";
 
 /** 内容提取模式：auto 自动判断，article 走正文提取，text 只取纯文本。 */
 export const FETCH_MODES = ["auto", "article", "text"] as const;
@@ -20,6 +20,7 @@ export const WebFetchParams = Type.Object({
 		Type.Integer({
 			description: `Maximum characters of body text returned to the model. Defaults to ${DEFAULT_MAX_CHARS}.`,
 			minimum: 1,
+			maximum: MAX_CHARS_LIMIT,
 		}),
 	),
 });

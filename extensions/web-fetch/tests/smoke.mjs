@@ -5,6 +5,7 @@
  * 用法：node tests/smoke.mjs
  */
 
+import assert from "node:assert/strict";
 import { fileURLToPath } from "node:url";
 import { createJiti } from "jiti";
 
@@ -22,7 +23,7 @@ console.log(`[1] 参数: ${Object.keys(tool.parameters.properties).join(", ")}`)
 
 const cases = [
 	["HTML 文档", { url: "https://pi.dev/docs/latest/extensions" }],
-	["Markdown 直读", { url: "https://raw.githubusercontent.com/anomalyco/opencode/v2.0.13/packages/core/src/plugin/websearch/tinyfish.ts" }],
+	["Markdown 直读", { url: "https://raw.githubusercontent.com/anomalyco/opencode/v2.0.13/README.md" }],
 	["GitHub README", { url: "https://github.com/searxng/searxng" }],
 	["example.com", { url: "https://example.com/" }],
 	["text 模式", { url: "https://pi.dev/docs/latest/extensions", mode: "text", maxChars: 4000 }],
@@ -33,6 +34,12 @@ for (const [label, params] of cases) {
 	try {
 		const result = await tool.execute("smoke", params);
 		const details = result.details ?? {};
+		const text = result.content?.[0]?.text ?? "";
+		assert.equal(details.statusCode, 200);
+		assert.equal(details.provider, "direct");
+		assert.ok(text.trim().length > 0, "正文必须非空");
+		assert.ok(text.length <= (params.maxChars ?? 24000), "包括截断提示在内也不得超限");
+		assert.equal(details.extractedChars, text.length);
 		console.log(
 			`\n[${label}] OK ${Date.now() - startedAt}ms | status=${details.statusCode} | provider=${details.provider} | chars=${details.extractedChars} | truncated=${details.truncated} | redirects=${details.redirectCount}`,
 		);
