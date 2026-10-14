@@ -39,8 +39,8 @@ import { createPrivateQuotaStateStore } from "./quota/state-store.js";
 import {
 	BackendError,
 	errorDetailFrom,
-	isHttpUrl,
 	messageKind,
+	isHttpUrl,
 	type SearchErrorKind,
 	type WebSource,
 } from "./search-core.js";
@@ -54,16 +54,15 @@ import {
 import { getProviderMetadata, isProviderId, PROVIDER_IDS } from "./search/registry.js";
 import { readMaxResponseBytes, readResponseTextLimited } from "./response-body.js";
 
+import { readSearchRequestConfig, type SearchRequestConfig } from "./config.js";
+import { parseMcpResponse } from "./mcp-protocol.js";
+
 export type { WebSource };
 
 /** Exa 远程 MCP 端点（可选 key 以查询参数附加）。 */
 const EXA_MCP_URL = "https://mcp.exa.ai/mcp";
 /** Parallel 远程 MCP 端点（可选 key 以 Bearer 头附加）。 */
 const PARALLEL_MCP_URL = "https://search.parallel.ai/mcp";
-/** 默认单请求预算（毫秒），可用 PI_WEB_SEARCH_TIMEOUT_MS 覆盖。 */
-const DEFAULT_TIMEOUT_MS = 25_000;
-/** 默认重试次数（仅限流 / 5xx / 网络抖动可重试），可用 PI_WEB_SEARCH_RETRIES 覆盖。 */
-const DEFAULT_RETRIES = 1;
 /** 重试退避基数：第 n 次重试等待 RETRY_BASE_MS * 2^n。 */
 const RETRY_BASE_MS = 400;
 /** 单次退避等待上限，避免上游 Retry-After 把一次搜索拖太久。 */
@@ -124,24 +123,6 @@ interface McpRequest {
 	id: number;
 	method: "tools/call";
 	params: { name: string; arguments: object };
-}
-
-/** MCP `tools/call` 的响应信封（直接 JSON 或单个 SSE 帧）。 */
-interface McpEnvelope {
-	result?: {
-		/** MCP 允许 HTTP 200 + JSON-RPC 成功时用该字段表示工具执行失败。 */
-		isError?: boolean;
-		content?: { type?: string; text?: string }[];
-	};
-	error?: { code?: number; message?: string } | string;
-}
-
-/** 读取整数环境变量，非法或越界时回退默认值。 */
-function readIntEnv(name: string, fallback: number, min: number): number {
-	const raw = process.env[name];
-	if (raw === undefined || raw.trim().length === 0) return fallback;
-	const value = Number(raw);
-	return Number.isInteger(value) && value >= min ? value : fallback;
 }
 
 /** 解析 Retry-After（秒数或 HTTP 日期）；原值用于冷却，重试等待另行限幅。 */
@@ -401,64 +382,6 @@ function extractSources(text: string): WebSource[] {
 	return extractSourcesByLines(text);
 }
 
-/** 解析一个 JSON 载荷：JSON-RPC 错误与 MCP isError 都归类抛出，否则返回首个非空 text。 */
-function parsePayload(line: string): string | undefined {
-	let parsed: unknown;
-	try {
-		parsed = JSON.parse(line);
-	} catch {
-		return undefined;
-	}
-	const envelope = parsed as McpEnvelope | null;
-	if (envelope === null || typeof envelope !== "object") return undefined;
-	if (envelope.error !== undefined) {
-		const detail = typeof envelope.error === "string" ? envelope.error : envelope.error.message;
-		const message = typeof detail === "string" && detail.length > 0 ? detail : "MCP search error";
-		throw new BackendError(message, messageKind(message) ?? "protocol_error");
-	}
-	const content = envelope.result?.content;
-	const item = Array.isArray(content)
-		? content.find((entry) => typeof entry?.text === "string" && entry.text.length > 0)
-		: undefined;
-	const text = item?.text;
-	// MCP 协议允许 HTTP 200 + JSON-RPC 成功时用 result.isError 表示工具执行失败，
-	// 这种情况必须当成错误，不能把 content 里的错误文本当作搜索结果交给模型。
-	if (envelope.result?.isError === true) {
-		const message = typeof text === "string" && text.length > 0 ? text : "MCP search tool failed";
-		throw new BackendError(message, messageKind(message) ?? "protocol_error");
-	}
-	return text;
-}
-
-/** 解析 MCP HTTP 响应体：先按直接 JSON，再按 SSE 事件块（同一事件的多行 data 拼接）。 */
-function parseMcpResponse(body: string): string | undefined {
-	const trimmed = body.trim();
-	if (trimmed.startsWith("{")) {
-		const direct = parsePayload(trimmed);
-		if (direct !== undefined) return direct;
-	}
-
-	let buffer: string[] = [];
-	const flush = (): string | undefined => {
-		if (buffer.length === 0) return undefined;
-		const payload = buffer.join("\n");
-		buffer = [];
-		return parsePayload(payload);
-	};
-	for (const line of trimmed.split("\n")) {
-		if (line.startsWith("data:")) {
-			buffer.push(line.slice("data:".length).trimStart());
-			continue;
-		}
-		// 空行表示一个 SSE 事件结束；未结束事件的尾部在循环后 flush。
-		if (line.trim().length === 0) {
-			const found = flush();
-			if (found !== undefined) return found;
-		}
-	}
-	return flush();
-}
-
 /**
  * 对单条来源的所有可见字段统一脱敏。
  * 上游响应可能回显 key（例如错误链接或 URL 查询参数），这里保证 key
@@ -551,11 +474,10 @@ async function searchChannel(
 	numResults: number,
 	maxResponseBytes: number,
 	quotaContext: QuotaSearchContext,
+	requestConfig: SearchRequestConfig,
 	signal?: AbortSignal,
 ): Promise<{ text: string; sources: WebSource[]; attempts: number }> {
-	// 每次调用时读取，便于测试注入（PI_WEB_SEARCH_TIMEOUT_MS / PI_WEB_SEARCH_RETRIES）。
-	const timeoutMs = readIntEnv("PI_WEB_SEARCH_TIMEOUT_MS", DEFAULT_TIMEOUT_MS, 100);
-	const retries = readIntEnv("PI_WEB_SEARCH_RETRIES", DEFAULT_RETRIES, 0);
+	const { timeoutMs, retries } = requestConfig;
 	const { backend, channel } = step;
 
 	const payload: McpRequest = {
@@ -718,12 +640,36 @@ async function searchChannel(
 				const sources = parseApiResponse(backend, body, numResults);
 				return { text: renderParallel(sources, ""), sources };
 			}
-			const text = parseMcpResponse(body);
-			if (text === undefined) throw new BackendError(`${backend} returned no usable results`, "protocol_error");
-			if (backend === "exa" && channel === "free" && isExaFreeRateLimitNotice(text)) {
+			const textBlocks = parseMcpResponse(body);
+			if (textBlocks === undefined) throw new BackendError(`${backend} returned no usable results`, "protocol_error");
+			const text = textBlocks.join("\n\n");
+			if (backend === "exa" && channel === "free" && textBlocks.some(isExaFreeRateLimitNotice)) {
 				throw new BackendError(text.trim(), "quota_exhausted");
 			}
-			const sources = backend === "tinyfish" ? parseTinyFishResults(text, numResults) : extractSources(text);
+			const seen = new Set<string>();
+			const sources = textBlocks.flatMap((block) => {
+				if (backend !== "tinyfish") return extractSources(block);
+				// 仅跳过普通介绍；结构化负载始终交由解析器检查错误信封。
+				let structured = false;
+				try {
+					JSON.parse(block);
+					structured = true;
+				} catch {
+					// JSON 解码失败不代表服务错误可以忽略。
+				}
+				if (structured || /^\s*[\[{]/.test(block)) return parseTinyFishResults(block, numResults);
+				const kind = messageKind(block)
+					?? (/\brate_limited\b/i.test(block) ? "rate_limited" : undefined);
+				if (kind || /\bprovider_error\b/i.test(block)) {
+					throw new BackendError(block, kind ?? "protocol_error");
+				}
+				return [];
+			})
+				.filter((source) => {
+					if (seen.has(source.url)) return false;
+					seen.add(source.url);
+					return true;
+				}).slice(0, numResults);
 			if (sources.length === 0) {
 				throw new BackendError(`${backend} 未返回可用的搜索来源`, "protocol_error");
 			}
@@ -808,6 +754,7 @@ export default function piWebSearch(pi: ExtensionAPI, options: WebSearchOptions 
 		parameters: WebSearchParams,
 		annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
 		async execute(_toolCallId, params, signal) {
+			const requestConfig = readSearchRequestConfig();
 			const query = params.query.trim();
 			if (query.length === 0) throw new Error("query must not be empty");
 			if (isAborted(signal)) throw createAbortError();
@@ -868,6 +815,7 @@ export default function piWebSearch(pi: ExtensionAPI, options: WebSearchOptions 
 						numResults,
 						maxResponseBytes,
 						quotaContext,
+						requestConfig,
 						signal,
 					);
 					attemptCount += attempts;

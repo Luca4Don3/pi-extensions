@@ -1,6 +1,6 @@
 {
   "name": "@luca4don3/pi-extensions",
-  "version": "0.7.0-beta.2",
+  "version": "0.7.0-beta.3",
   "description": "A collection of independently installable Pi extensions: web-search, web-fetch, subagent, chinese-prompt, and opencode-fallback.",
   "type": "module",
   "keywords": [

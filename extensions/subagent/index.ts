@@ -24,6 +24,8 @@ import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { type AgentConfig, type AgentScope, discoverAgents } from "./agents.js";
 import { waitForProcess } from "./process-lifecycle.js";
+import { getFinalOutput } from "./message-output.js";
+import { mapWithConcurrencyLimit } from "./concurrency.js";
 import { LineBuffer, TailBuffer, MessageBuffer, ToolIdBuffer } from "./output-buffer.js";
 import { describeSpawnFailure } from "./spawn-failure.js";
 import {
@@ -162,18 +164,6 @@ interface SubagentDetails {
 	results: SingleResult[];
 }
 
-function getFinalOutput(messages: Message[]): string {
-	for (let i = messages.length - 1; i >= 0; i--) {
-		const msg = messages[i];
-		if (msg.role === "assistant") {
-			for (const part of msg.content) {
-				if (part.type === "text") return part.text;
-			}
-		}
-	}
-	return "";
-}
-
 function compactResultForDetails(result: SingleResult, maxChars: number): SingleResult {
 	const output = compactText(getFinalOutput(result.messages), maxChars, "subagent output");
 	return {
@@ -207,26 +197,6 @@ function getDisplayItems(messages: Message[]): DisplayItem[] {
 		}
 	}
 	return items;
-}
-
-async function mapWithConcurrencyLimit<TIn, TOut>(
-	items: TIn[],
-	concurrency: number,
-	fn: (item: TIn, index: number) => Promise<TOut>,
-): Promise<TOut[]> {
-	if (items.length === 0) return [];
-	const limit = Math.max(1, Math.min(concurrency, items.length));
-	const results: TOut[] = new Array(items.length);
-	let nextIndex = 0;
-	const workers = new Array(limit).fill(null).map(async () => {
-		while (true) {
-			const current = nextIndex++;
-			if (current >= items.length) return;
-			results[current] = await fn(items[current], current);
-		}
-	});
-	await Promise.all(workers);
-	return results;
 }
 
 async function writePromptToTempFile(agentName: string, prompt: string): Promise<{ dir: string; filePath: string }> {
@@ -316,6 +286,7 @@ async function runSingleAgent(
 	};
 
 	try {
+		if (signal?.aborted) throw new Error("Subagent was aborted");
 		const boundedSystemPrompt = `${agent.systemPrompt.trim()}${buildSubagentOutputPolicy(DEFAULT_MAX_OUTPUT_CHARS)}`;
 		if (boundedSystemPrompt.trim()) {
 			const tmp = await writePromptToTempFile(agent.name, boundedSystemPrompt);
@@ -324,6 +295,7 @@ async function runSingleAgent(
 			args.push("--append-system-prompt", tmpPromptPath);
 		}
 
+		if (signal?.aborted) throw new Error("Subagent was aborted");
 		args.push(`Task: ${task}`);
 		const exitCode = await new Promise<number>((resolve, reject) => {
 			const invocation = getPiInvocation(args);
@@ -334,6 +306,18 @@ async function runSingleAgent(
 			});
 			const outputAbort = new AbortController();
 			let outputFailed = false;
+			let callbackFailed = false;
+			let firstCallbackError: unknown;
+			const guardOutput = (fn: () => void, cancel = true) => {
+				if (callbackFailed) return;
+				try {
+					fn();
+				} catch (error) {
+					callbackFailed = true;
+					firstCallbackError = error;
+					if (cancel) outputAbort.abort();
+				}
+			};
 			const seenToolCallIds = new ToolIdBuffer();
 			const messages = new MessageBuffer(currentResult.messages);
 			const stderr = new TailBuffer();
@@ -359,7 +343,7 @@ async function runSingleAgent(
 			};
 
 			const processLine = (line: string) => {
-				if (outputFailed || !line.trim()) return;
+				if (callbackFailed || outputFailed || !line.trim()) return;
 				let event: any;
 				try {
 					event = JSON.parse(line);
@@ -410,22 +394,27 @@ async function runSingleAgent(
 			const lines = new LineBuffer(processLine, () => {
 				failOutput("stdout 单行超过 1048576 字节");
 			});
-			proc.stdout.on("data", (data) => lines.write(data));
-			proc.stderr.on("data", (data) => {
+			proc.stdout.on("data", (data) => guardOutput(() => lines.write(data)));
+			proc.stderr.on("data", (data) => guardOutput(() => {
 				stderr.write(data);
 				syncLimits();
-			});
+			}));
 
 			waitForProcess(proc, signal ? AbortSignal.any([signal, outputAbort.signal]) : outputAbort.signal, () => {
-				lines.end();
+				// 关闭后的尾行回调同样保留首错，但无需再取消已关闭的进程。
+				guardOutput(() => lines.end(), false);
 				stderr.end();
 				syncLimits();
 			}, (diagnostic) => {
 				if (diagnostic.includes("输出不完整")) currentResult.outputTruncated = true;
 				currentResult.errorMessage = currentResult.errorMessage
 					? `${currentResult.errorMessage}\n${diagnostic}` : diagnostic;
-			}).then((code) => resolve(outputFailed ? 1 : code), (error) => {
-				if (outputFailed && !signal?.aborted) resolve(1);
+			}).then((code) => {
+				if (callbackFailed) reject(firstCallbackError);
+				else resolve(outputFailed ? 1 : code);
+			}, (error) => {
+				if (callbackFailed) reject(firstCallbackError);
+				else if (outputFailed && !signal?.aborted) resolve(1);
 				else reject(error);
 			});
 
@@ -444,6 +433,17 @@ async function runSingleAgent(
 			throw new Error(`子 agent 进程启动失败：${currentResult.spawnError}`);
 		}
 		return currentResult;
+	} catch (error) {
+		currentResult.exitCode = 1;
+		currentResult.stopReason = signal?.aborted ? "aborted" : "error";
+		currentResult.errorMessage = signal?.aborted ? "子任务已取消" : "子任务执行异常，请检查启动配置与工作目录";
+		currentResult.spawnError = undefined;
+		try {
+			emitUpdate();
+		} catch {
+			// 错误状态通知失败不能覆盖原始异常，包括 falsy 抛出值。
+		}
+		throw error;
 	} finally {
 		if (tmpPromptPath)
 			try {
@@ -713,35 +713,54 @@ export default function (pi: ExtensionAPI) {
 					}
 				};
 
-				const results = await mapWithConcurrencyLimit(params.tasks, MAX_CONCURRENCY, async (t, index) => {
-					const result = await runSingleAgent(
-						ctx.cwd,
-						agents,
-						t.agent,
-						t.task,
-						t.cwd,
-						undefined,
-						signal,
-						// Per-task update callback
-						(partial) => {
-							if (partial.details?.results[0]) {
-								allResults[index] = partial.details.results[0];
-								emitParallelUpdate();
-							}
-						},
-						makeDetails("parallel"),
-						getAgentOutputLimit(t.agent),
-					);
-					allResults[index] = result;
-					emitParallelUpdate();
-					return result;
-				});
+				let results: SingleResult[];
+				try {
+					results = await mapWithConcurrencyLimit(params.tasks, MAX_CONCURRENCY, async (t, index, combinedSignal) => {
+						const result = await runSingleAgent(
+							ctx.cwd,
+							agents,
+							t.agent,
+							t.task,
+							t.cwd,
+							undefined,
+							combinedSignal,
+							// 保留各子任务最新输出与用量，取消后也要更新最终状态。
+							(partial) => {
+								if (partial.details?.results[0]) {
+									allResults[index] = partial.details.results[0];
+									emitParallelUpdate();
+								}
+							},
+							makeDetails("parallel"),
+							getAgentOutputLimit(t.agent),
+						);
+						allResults[index] = result;
+						emitParallelUpdate();
+						return result;
+					}, signal);
+				} catch {
+					for (const result of allResults) {
+						if (result.exitCode !== -1) continue;
+						result.exitCode = 1;
+						result.stopReason = "aborted";
+						result.errorMessage = "子任务未启动，调度已停止";
+					}
+					const details = makeDetails("parallel")(allResults);
+					if (signal?.aborted) throw Object.assign(new Error("Subagent was aborted"), { details, usage: aggregateUsage(allResults) });
+					return {
+						content: [{ type: "text", text: "并行任务执行异常，已停止调度并等待运行中子任务取消；请检查启动配置与工作目录。" }],
+						details,
+						isError: true,
+					};
+				}
 
-				const successCount = results.filter((r) => r.exitCode === 0).length;
+				// 普通非零结果不触发共享取消，但总体仍必须标记失败。
+				const succeeded = (r: SingleResult) => r.exitCode === 0 && r.stopReason !== "error" && r.stopReason !== "aborted";
+				const successCount = results.filter(succeeded).length;
 				const summaries = results.map((r) => {
 					const output = getFinalOutput(r.messages);
 					const preview = output.slice(0, 100) + (output.length > 100 ? "..." : "");
-					return `[${r.agent}] ${r.exitCode === 0 ? "completed" : "failed"}: ${preview || "(no output)"}`;
+					return `[${r.agent}] ${succeeded(r) ? "completed" : "failed"}: ${preview || "(no output)"}`;
 				});
 				return {
 					content: [
@@ -751,6 +770,7 @@ export default function (pi: ExtensionAPI) {
 						},
 					],
 					details: makeDetails("parallel")(results),
+					isError: successCount !== results.length,
 				};
 			}
 
@@ -983,8 +1003,8 @@ export default function (pi: ExtensionAPI) {
 
 			if (details.mode === "parallel") {
 				const running = details.results.filter((r) => r.exitCode === -1).length;
-				const successCount = details.results.filter((r) => r.exitCode === 0).length;
-				const failCount = details.results.filter((r) => r.exitCode > 0).length;
+				const successCount = details.results.filter((r) => r.exitCode === 0 && r.stopReason !== "error" && r.stopReason !== "aborted").length;
+				const failCount = details.results.length - running - successCount;
 				const isRunning = running > 0;
 				const icon = isRunning
 					? theme.fg("warning", "⏳")
