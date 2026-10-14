@@ -59,7 +59,7 @@ function isBlockedIPv4(value: number): boolean {
 	if (a === 192 && b === 168) return true; // 192.168.0.0/16 私有
 	if (a === 198 && (b === 18 || b === 19)) return true; // 198.18.0.0/15 基准测试
 	if (a === 198 && b === 51 && octets[2] === 100) return true; // 198.51.100.0/24 测试网
-	if (a === 203 && b === 0) return true; // 203.0.113.0/24 测试网
+	if (a === 203 && b === 0 && octets[2] === 113) return true; // 203.0.113.0/24 测试网
 	if (a >= 224) return true; // 224.0.0.0/4 组播、240.0.0.0/4 保留与广播
 	return false;
 }
@@ -105,31 +105,40 @@ function expandIPv6(value: string): number[] | undefined {
 
 /** 判断 IPv6 是否属于必须拒绝的地址；IPv4 映射与 NAT64 递归判断内层 IPv4。 */
 function isBlockedIPv6(groups: number[]): boolean {
-	const first = groups[0]!;
-	if (groups.every((group) => group === 0)) return true; // ::/128 未指定
-	if (first === 0 && groups[1] === 0 && groups.every((group, index) => (index < 2 ? true : group === 0))) {
-		return true; // ::/128 的各种压缩写法
+	// 前缀按位比较，避免把 /48、/64、/96 等误扩大为前两组或整个 /16。
+	const hasPrefix = (prefix: readonly number[], bits: number): boolean => {
+		const whole = Math.floor(bits / 16);
+		for (let index = 0; index < whole; index++) {
+			if (groups[index] !== prefix[index]) return false;
+		}
+		const remaining = bits % 16;
+		return remaining === 0 || (groups[whole]! >>> (16 - remaining)) === (prefix[whole]! >>> (16 - remaining));
+	};
+	// 保留既有 IPv4 兼容与映射行为；回环、未指定等也由内层 IPv4 规则拒绝。
+	// 只匹配完整 /96，不能把相邻的 IPv4 可转换前缀当作映射地址。
+	if (hasPrefix([0, 0, 0, 0, 0, 0], 96) || hasPrefix([0, 0, 0, 0, 0, 0xffff], 96)) {
+		return isBlockedIPv4(groups[6]! * 0x10000 + groups[7]!);
 	}
-	// ::/96（IPv4 兼容，已废弃）与 ::ffff:0:0/96（IPv4 映射）都递归判断内层 IPv4，
-	// 否则会把 ::ffff:93.184.216.34 这类公网映射地址整段误拒。
-	if (first === 0 && groups[1]! === 0 && groups[2]! === 0 && groups[3]! === 0 && groups[4]! === 0 && (groups[5]! === 0 || groups[5]! === 0xffff)) {
-		const mapped = (groups[6]! << 16) | groups[7]!;
-		return isBlockedIPv4(mapped);
+	// 仅允许 64:ff9b::/96 的公网 NAT64 映射；64:ff9b:1::/48 是本地转换段。
+	if (hasPrefix([0x64, 0xff9b, 0, 0, 0, 0], 96)) {
+		return isBlockedIPv4(groups[6]! * 0x10000 + groups[7]!);
 	}
-	if (first === 0x64 && groups[1]! === 0xff9b) {
-		// 64:ff9b::/96 NAT64：内层 IPv4 必须同样通过校验
-		const embedded = (groups[6]! << 16) | groups[7]!;
-		return isBlockedIPv4(embedded);
-	}
-	if (first === 0x100) return true; // 100::/64 丢弃段
-	if (first === 0x2001 && groups[1]! === 0x0000) return true; // 2001::/32 Teredo
-	if (first === 0x2001 && groups[1]! === 0x0db8) return true; // 2001:db8::/32 文档
-	if ((first & 0xfe00) === 0xfc00) return true; // fc00::/7 唯一本地地址
-	if ((first & 0xffc0) === 0xfe80) return true; // fe80::/10 链路本地
-	if ((first & 0xffc0) === 0xfec0) return true; // fec0::/10 站点本地单播
-	if ((first & 0xff00) === 0xff00) return true; // ff00::/8 组播
-	if (first === 0x2002) return true; // 2002::/16 6to4（内层地址可在转换后指向私网）
-	return false;
+	// 除上述兼容映射外，公网单播只在 2000::/3 中；其余为保留或非公网空间。
+	// 因而涵盖 100::/64 丢弃、5f00::/16 分段路由、唯一本地、链路本地与组播。
+	if (!hasPrefix([0x2000], 3)) return true;
+
+	// 2001::/23 是 IANA 协议分配空间（Teredo、2001:2::/48 基准测试、ORCHID 等），
+	// 属于基础设施与保留地址，不是可抓取的公网网站，整体拒绝；
+	// 公共 DNS 等真实公网单播位于该段之外（例如 2001:4860::/32）。
+	// https://www.iana.org/assignments/iana-ipv6-special-registry/iana-ipv6-special-registry.xhtml
+	if (hasPrefix([0x2001, 0], 23)) return true;
+
+	const blockedPrefixes: ReadonlyArray<readonly [readonly number[], number]> = [
+		[[0x2001, 0xdb8], 32], // 文档段：不在 2001::/23 内，必须单独拒绝
+		[[0x2002], 16], // 6to4：转换后的 IPv4 可能指向私网
+		[[0x3fff, 0], 20], // 3fff::/20 新增文档段，不能误拒整个 3fff::/16
+	];
+	return blockedPrefixes.some(([prefix, bits]) => hasPrefix(prefix, bits));
 }
 
 /** 文本形式的 IP 是否允许作为抓取目标。 */

@@ -46,8 +46,8 @@ export function isOpencodeRequest(input: unknown): boolean {
 	return hostname === OPENCODE_HOST || hostname?.endsWith(`.${OPENCODE_HOST}`) === true;
 }
 
-function isAborted(init: Record<string, unknown> | undefined): boolean {
-	const signal = init?.signal;
+function isAborted(input: unknown, init: Record<string, unknown> | undefined): boolean {
+	const signal = init?.signal ?? (input instanceof Request ? input.signal : undefined);
 	return Boolean(signal && typeof signal === "object" && "aborted" in signal && signal.aborted);
 }
 
@@ -111,6 +111,41 @@ export function needsPinnedProxy(input: unknown, init?: Record<string, unknown>)
 	return false;
 }
 
+/**
+ * 只读取副本；已用、锁定或读取失败的正文直接报错，避免未知模型被错误路由。
+ *
+ * 只对 "正文在 Request 对象里、init 没有覆盖、且是 /messages" 的情况生效：其它
+ * 形态仍走同步判定。此处假定 /messages 的正文是可解析 JSON——非 JSON 时
+ * readModelFromBody 返回 undefined，按直连优先处理，不把已知模型误钉到代理。
+ */
+async function needsPinnedProxyWithRequest(input: unknown, init?: Record<string, unknown>): Promise<boolean> {
+	if (!(input instanceof Request) || init?.body != null || !getUrl(input)?.pathname.endsWith("/messages")) {
+		return needsPinnedProxy(input, init);
+	}
+	const signal = (init?.signal ?? input.signal) as AbortSignal;
+	signal.throwIfAborted();
+	const copy = input.clone();
+	let onAbort: (() => void) | undefined;
+	try {
+		const body = await Promise.race([
+			copy.text(),
+			new Promise<never>((_resolve, reject) => {
+				onAbort = () => reject(signal.reason);
+				signal.addEventListener("abort", onAbort, { once: true });
+				if (signal.aborted) onAbort();
+			}),
+		]);
+		return needsPinnedProxy(input, { ...init, body });
+	} catch (error) {
+		// 取消或读取失败时，clone 的正文读取通常仍在后台推进：必须消费它的迟到
+		// 结果，否则 Node 的未处理拒绝策略可能让整个进程退出。
+		void copy.text().catch(() => {});
+		throw error;
+	} finally {
+		if (onAbort) signal.removeEventListener("abort", onAbort);
+	}
+}
+
 export function createOpencodeFallbackFetch(
 	originalFetch: FetchLike,
 	directAgent: Dispatcher,
@@ -122,7 +157,7 @@ export function createOpencodeFallbackFetch(
 		}
 
 		// GPT / Grok / Muse / Claude：固定走代理，不尝试直连，避免出口漂移。
-		if (needsPinnedProxy(input, init)) {
+		if (await needsPinnedProxyWithRequest(input, init)) {
 			return Reflect.apply(originalFetch, this, [input, withDispatcher(init, proxyAgent)]);
 		}
 
@@ -130,7 +165,7 @@ export function createOpencodeFallbackFetch(
 		try {
 			return await Reflect.apply(originalFetch, this, [input, withDispatcher(init, directAgent)]);
 		} catch (error) {
-			if (isAborted(init) || !isConnectionFailure(error)) throw error;
+			if (isAborted(input, init) || (error instanceof Error && error.name === "AbortError") || !isConnectionFailure(error)) throw error;
 			return Reflect.apply(originalFetch, this, [input, withDispatcher(init, proxyAgent)]);
 		}
 	};

@@ -925,7 +925,17 @@ export default function piWebSearch(pi: ExtensionAPI, options: WebSearchOptions 
 					};
 					// 超限正文落盘，模型仍可按需 read 完整内容（沿用 Pi 对大结果的惯例）。
 					if (isAborted(signal)) throw createAbortError();
-					const spill = outcome.truncated ? await spillFullText(text) : undefined;
+					let spill: SpillResult | undefined;
+					let fullTextWarning: string | undefined;
+					if (outcome.truncated) {
+						try {
+							spill = await spillFullText(text);
+						} catch {
+							// 落盘失败不代表搜索失败：结果已经拿到，只丢掉它会让这次已发出的
+					// 请求（可能计费）白费，还要再走一遍后续通道。这里只降级提示。
+							fullTextWarning = "正文已截断，完整正文落盘失败。";
+						}
+					}
 					// 取消贯穿整个生命周期：取消时不改变任何通道健康状态。
 					if (isAborted(signal)) throw createAbortError();
 					quotaManager.recordSuccess(step.backend, quotaChannel(step.channel), step.apiKey);
@@ -956,6 +966,7 @@ export default function piWebSearch(pi: ExtensionAPI, options: WebSearchOptions 
 							...(persistenceWarnings.size > 0 ? { quotaWarning: `额度状态写入退化：${[...persistenceWarnings].join(", ")}` } : {}),
 							...(fallbackReason !== undefined ? { fallbackReason } : {}),
 							...(spill !== undefined ? { fullTextPath: spill.path, fullTextComplete: spill.complete } : {}),
+							...(fullTextWarning !== undefined ? { fullTextWarning } : {}),
 						},
 					};
 				} catch (error) {

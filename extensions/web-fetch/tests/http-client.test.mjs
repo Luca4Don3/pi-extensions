@@ -123,15 +123,16 @@ test("多跳共享一个总超时预算", async () => {
 	await withServer((request, response) => {
 		requests += 1;
 		const index = Number(new URL(request.url ?? "/", "http://127.0.0.1").pathname.slice(1) || 0);
-		setTimeout(() => {
+		// 跳转即时，只在最终响应上拖时间：预算若按跳重置，这个慢响应就会成功返回 200。
+		if (index < 5) send(response, "", 302, { location: `/${index + 1}` });
+		else setTimeout(() => {
 			if (response.destroyed) return;
-			if (index < 5) send(response, "", 302, { location: `/${index + 1}` });
-			else send(response, "late final");
-		}, 65);
+			send(response, "late final");
+		}, 200);
 	}, async (base) => {
 		const first = `${base}/0`;
-		await assert.rejects(client.httpFetch({ ...baseRequest(base), url: new URL(first), target: { url: new URL(first), address: "127.0.0.1", family: 4 }, timeoutMs: 110, resolveTarget: localResolver(base) }), (error) => error.kind === "timeout");
-		assert.ok(requests >= 2, `应已进入后续跳转，实际请求 ${requests} 次`);
+		await assert.rejects(client.httpFetch({ ...baseRequest(base), url: new URL(first), target: { url: new URL(first), address: "127.0.0.1", family: 4 }, timeoutMs: 120, maxRedirects: 5, resolveTarget: localResolver(base) }), (error) => error.kind === "timeout");
+		assert.ok(requests >= 6, `应已走完全部跳转，实际请求 ${requests} 次`);
 	});
 });
 

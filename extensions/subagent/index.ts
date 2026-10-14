@@ -23,6 +23,8 @@ import { type ExtensionAPI, withFileMutationQueue } from "@earendil-works/pi-cod
 import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { type AgentConfig, type AgentScope, discoverAgents } from "./agents.js";
+import { waitForProcess } from "./process-lifecycle.js";
+import { describeSpawnFailure } from "./spawn-failure.js";
 import {
 	accumulateUsage,
 	aggregateUsage,
@@ -142,6 +144,8 @@ interface SingleResult {
 	model?: string;
 	stopReason?: string;
 	errorMessage?: string;
+	/** spawn 失败时的可行动诊断；正常退出时为空。 */
+	spawnError?: string;
 	step?: number;
 	maxOutputChars?: number;
 }
@@ -316,9 +320,7 @@ async function runSingleAgent(
 		}
 
 		args.push(`Task: ${task}`);
-		let wasAborted = false;
-
-		const exitCode = await new Promise<number>((resolve) => {
+		const exitCode = await new Promise<number>((resolve, reject) => {
 			const invocation = getPiInvocation(args);
 			const proc = spawn(invocation.command, invocation.args, {
 				cwd: cwd ?? defaultCwd,
@@ -386,30 +388,24 @@ async function runSingleAgent(
 				currentResult.stderr += data.toString();
 			});
 
-			proc.on("close", (code) => {
+			waitForProcess(proc, signal, () => {
 				if (buffer.trim()) processLine(buffer);
-				resolve(code ?? 0);
-			});
+			}).then(resolve, reject);
 
-			proc.on("error", () => {
-				resolve(1);
+			// waitForProcess 已把 error 折算为退出码；这里只留下可行动的诊断，
+					// 让「找不到 pi」不再退化成一句莫名的 exitCode 1。
+			proc.on("error", (error: NodeJS.ErrnoException) => {
+				if (currentResult.spawnError === undefined) {
+					currentResult.spawnError = describeSpawnFailure(error, invocation.command);
+				}
 			});
-
-			if (signal) {
-				const killProc = () => {
-					wasAborted = true;
-					proc.kill("SIGTERM");
-					setTimeout(() => {
-						if (!proc.killed) proc.kill("SIGKILL");
-					}, 5000);
-				};
-				if (signal.aborted) killProc();
-				else signal.addEventListener("abort", killProc, { once: true });
-			}
 		});
 
 		currentResult.exitCode = exitCode;
-		if (wasAborted) throw new Error("Subagent was aborted");
+		// 启动失败与被启动进程自身失败是两回事：前者必须给出可行动的诊断。
+		if (currentResult.spawnError !== undefined) {
+			throw new Error(`子 agent 进程启动失败：${currentResult.spawnError}`);
+		}
 		return currentResult;
 	} finally {
 		if (tmpPromptPath)

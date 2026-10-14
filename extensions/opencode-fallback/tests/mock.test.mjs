@@ -232,3 +232,114 @@ test("17. needsPinnedProxy 的端点与模型判定", () => {
 	assert.equal(needsPinnedProxy("https://opencode.ai/zen/go/v1/chat/completions", jsonInit("deepseek-v4.1-flash")), false);
 	assert.equal(needsPinnedProxy("https://example.com/zen/go/v1/responses"), false);
 });
+
+// ---- 正文放在 Request 对象里的路由判定 ----
+
+const requestModel = (model, signal) =>
+	new Request("https://opencode.ai/zen/go/v1/messages", { ...jsonInit(model), ...(signal ? { signal } : {}) });
+
+test("18. Request 形式的 /messages + claude 固定走代理，且不消耗原正文", async () => {
+	const seen = [];
+	const fetchLike = async (input, init) => {
+		seen.push(init?.dispatcher?.name);
+		// 原请求的正文必须仍然可读：被消费掉就说明 clone 没有做到只读副本。
+		assert.match(await input.text(), /claude/);
+		return new Response("ok");
+	};
+	const wrapped = createOpencodeFallbackFetch(fetchLike, { name: "direct" }, { name: "proxy" });
+	await wrapped(requestModel("claude-haiku-5-5"));
+	assert.deepEqual(seen, ["proxy"]);
+});
+
+test("19. Request 形式的 /messages + 非 claude 保持直连优先", async () => {
+	const seen = [];
+	const fetchLike = async (_input, init) => {
+		seen.push(init?.dispatcher?.name);
+		return new Response("ok");
+	};
+	const wrapped = createOpencodeFallbackFetch(fetchLike, { name: "direct" }, { name: "proxy" });
+	await wrapped(requestModel("minimax-m3"));
+	assert.deepEqual(seen, ["direct"]);
+});
+
+test("20. init.body 覆盖 Request 正文，仍按同步路径判定", async () => {
+	const seen = [];
+	const fetchLike = async (_input, init) => {
+		seen.push(init?.dispatcher?.name);
+		return new Response("ok");
+	};
+	const wrapped = createOpencodeFallbackFetch(fetchLike, { name: "direct" }, { name: "proxy" });
+	// 原 Request 是 claude，但 init 给出 minimax：按覆盖语义不应固定代理。
+	await wrapped(requestModel("claude-opus-4"), jsonInit("minimax-m3"));
+	assert.deepEqual(seen, ["direct"]);
+});
+
+test("21. Request 形式的 /responses 仍按端点固定代理，不读正文", async () => {
+	const seen = [];
+	const fetchLike = async (_input, init) => {
+		seen.push(init?.dispatcher?.name);
+		return new Response("ok");
+	};
+	const wrapped = createOpencodeFallbackFetch(fetchLike, { name: "direct" }, { name: "proxy" });
+	await wrapped(new Request("https://opencode.ai/zen/go/v1/responses", jsonInit("muse-spark-1.3-contributor")));
+	assert.deepEqual(seen, ["proxy"]);
+});
+
+test("22. init.signal 已取消时不读取正文也不发请求", async () => {
+	const seen = [];
+	const fetchLike = async (_input, init) => {
+		seen.push(init?.dispatcher?.name);
+		return new Response("ok");
+	};
+	const wrapped = createOpencodeFallbackFetch(fetchLike, { name: "direct" }, { name: "proxy" });
+	const controller = new AbortController();
+	controller.abort();
+	await assert.rejects(wrapped(requestModel("claude-opus-4"), { signal: controller.signal }), /abort/i);
+	assert.deepEqual(seen, [], "已取消的请求不应发出");
+});
+
+test("23. Request 自带 signal 已取消时同样立即失败", async () => {
+	const seen = [];
+	const fetchLike = async (_input, init) => {
+		seen.push(init?.dispatcher?.name);
+		return new Response("ok");
+	};
+	const wrapped = createOpencodeFallbackFetch(fetchLike, { name: "direct" }, { name: "proxy" });
+	const controller = new AbortController();
+	controller.abort();
+	await assert.rejects(wrapped(requestModel("claude-opus-4", controller.signal)), /abort/i);
+	assert.deepEqual(seen, []);
+});
+
+test("24. 非 opencode 的 Request 原样透传，不加 dispatcher", async () => {
+	const seen = [];
+	const fetchLike = async (_input, init) => {
+		seen.push(init?.dispatcher?.name);
+		return new Response("ok");
+	};
+	const wrapped = createOpencodeFallbackFetch(fetchLike, { name: "direct" }, { name: "proxy" });
+	await wrapped(new Request("https://example.com/v1/messages", jsonInit("claude-opus-4")));
+	assert.deepEqual(seen, [undefined]);
+});
+
+test("25. 取消时 clone 的迟到正文读取不会成为未处理拒绝", async () => {
+	const wrapped = createOpencodeFallbackFetch(async () => new Response("ok"), { name: "direct" }, { name: "proxy" });
+	const controller = new AbortController();
+	const request = new Request("https://opencode.ai/zen/go/v1/messages", {
+		...jsonInit("claude-opus-4"),
+		signal: controller.signal,
+	});
+	const rejections = [];
+	const onUnhandled = (reason) => rejections.push(reason);
+	process.on("unhandledRejection", onUnhandled);
+	try {
+		// 在副本正文尚未读完时取消：race 先失败，clone 的读取随后才会失败。
+		const pending = wrapped(request);
+		controller.abort();
+		await assert.rejects(pending, /abort/i);
+		await new Promise((resolve) => setImmediate(resolve));
+	} finally {
+		process.off("unhandledRejection", onUnhandled);
+	}
+	assert.deepEqual(rejections, [], "clone 的迟到 rejection 必须被消费");
+});

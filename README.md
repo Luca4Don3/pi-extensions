@@ -244,6 +244,8 @@ cp extensions/subagent/examples/agents/*.md ~/.pi/agent/agents/
 
 装上即生效，无参数、无配置。它通过 `before_agent_start` 事件把规则追加到 system prompt 末尾，不改动其它上下文。不需要时 `pi remove` 即可。
 
+代价说明：它每轮都返回完整 system prompt，对无法表示这种变化的 provider 会让已缓存的前缀失效，从而增加 token 成本；换来的是中文约束进入每一次推理。
+
 ---
 
 # OpenCode Fallback
@@ -481,11 +483,16 @@ Exa 返回的正文采用大模型友好的文本布局（`Title:` / `URL:` / `H
 | `provider` | 实际命中的后端：`exa` / `parallel` / `tavily` / `firecrawl` / `serpapi` |
 | `channel` | 兼容保留的通道标签：`free` / `key` |
 | `accessTier` | 访问层级：`anonymous` / `billable` |
+| `query` | 脱敏后的查询词 |
+| `numResults` | 本次请求的结果条数上限 |
 | `sourceCount` | 结构化来源条数（不超过 `maxResults`） |
 | `sources` | `[{ url, title, snippet, publishedAt }]` |
 | `truncated` | 模型可见正文是否被截断 |
+| `quotaPersistence` | 额度状态持久化状态：`not_initialized` / `persistent` / `memory_only` / `degraded` |
+| `quotaWarning` | 持久化退化时的固定诊断，不含系统路径与凭据 |
 | `fullTextPath` | 截断时完整正文的落盘路径 |
 | `fullTextComplete` | 落盘内容是否完整（受 2 MB 上限约束） |
+| `fullTextWarning` | 正文已截断但完整落盘失败时的固定提示，不含系统路径 |
 | `attemptCount` | 本次搜索实际发出的请求次数 |
 | `fallbackReason` | 发生降级时的链路说明，如 `exa(key)[quota_exhausted]: ...` |
 
