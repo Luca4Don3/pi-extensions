@@ -1,66 +1,78 @@
 import type { ChildProcess } from "node:child_process";
 
+export const DRAIN_TIMEOUT_MS = 1000;
+
 export function waitForProcess(
 	proc: ChildProcess,
 	signal?: AbortSignal,
 	onClose?: () => void,
+	onDiagnostic?: (message: string) => void,
 ): Promise<number> {
 	return new Promise((resolve, reject) => {
 		let exited = proc.exitCode !== null || proc.signalCode !== null;
 		let settled = false;
 		let aborted = false;
 		let killTimer: ReturnType<typeof setTimeout> | undefined;
-
-		const cleanup = () => {
-			if (killTimer !== undefined) clearTimeout(killTimer);
-			killTimer = undefined;
-			signal?.removeEventListener("abort", abort);
-		};
+		let drainTimer: ReturnType<typeof setTimeout> | undefined;
 		const finish = (code: number) => {
 			if (settled) return;
 			settled = true;
-			exited = true;
-			cleanup();
+			if (killTimer !== undefined) clearTimeout(killTimer);
+			if (drainTimer !== undefined) clearTimeout(drainTimer);
+			signal?.removeEventListener("abort", abort);
 			proc.removeListener("exit", onExit);
 			proc.removeListener("close", onClosed);
 			proc.removeListener("error", onError);
-			if (aborted) reject(new Error("Subagent was aborted"));
-			else resolve(code);
+			try {
+				onClose?.();
+				if (aborted) reject(new Error("Subagent was aborted"));
+				else resolve(code);
+			} catch (error) { reject(error); }
+		};
+		const exitStatus = (code: number | null, exitSignal: NodeJS.Signals | null) => {
+			if (exitSignal) {
+				onDiagnostic?.(`子进程因信号 ${exitSignal} 退出`);
+				return code || 1;
+			}
+			return code ?? 1;
 		};
 		const onExit = () => {
 			exited = true;
-			cleanup();
+			if (killTimer !== undefined) clearTimeout(killTimer);
+			// exit 不代表管道已关闭；后代可能仍持有写端，只允许有界排空。
+			drainTimer = setTimeout(() => {
+				onDiagnostic?.("输出排空超过 1000 毫秒，已关闭本地管道；输出不完整");
+				proc.stdout?.destroy();
+				proc.stderr?.destroy();
+				finish(exitStatus(proc.exitCode, proc.signalCode) || 1);
+			}, DRAIN_TIMEOUT_MS);
 		};
-		const onClosed = (code: number | null) => {
-			if (settled) return;
-			onClose?.();
-			finish(code ?? 0);
+		const onClosed = (code: number | null, exitSignal: NodeJS.Signals | null) => {
+			if (!settled) finish(exitStatus(code, exitSignal));
 		};
 		const onError = () => finish(1);
 		const abort = () => {
-			if (exited || settled || aborted) return;
+			if (settled || aborted) return;
 			aborted = true;
-			// killed 只表示发送过信号，必须根据真实退出状态决定是否升级。
+			// 排空期间的取消仍有效，但不能向已退出的进程发送信号。
+			if (exited) return;
 			killTimer = setTimeout(() => {
-				killTimer = undefined;
 				if (!exited && !settled && proc.exitCode === null && proc.signalCode === null)
 					proc.kill("SIGKILL");
 			}, 5000);
 			proc.kill("SIGTERM");
 		};
-
 		proc.once("exit", onExit);
 		proc.once("close", onClosed);
 		proc.once("error", onError);
-		// 传入时进程可能已经退出，此时 exit / close 事件不会再发生：
-		// 必须直接结算，否则 Promise 会永久挂起。
-		if (exited) {
-			finish(proc.exitCode ?? 0);
+		if (exited && (!proc.stdout || proc.stdout.destroyed) && (!proc.stderr || proc.stderr.destroyed)) {
+			finish(exitStatus(proc.exitCode, proc.signalCode));
 			return;
 		}
 		if (signal) {
 			signal.addEventListener("abort", abort, { once: true });
 			if (signal.aborted) abort();
 		}
+		if (exited) onExit();
 	});
 }

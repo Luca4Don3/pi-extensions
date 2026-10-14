@@ -7,7 +7,8 @@
  */
 
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync } from "node:fs";
+import { join } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 
@@ -70,7 +71,10 @@ function setup(store = fakeStore(), options = {}) {
 
 /** 注入环境变量，结束后恢复原值（含删除此前不存在的键）。 */
 async function withEnv(vars, fn) {
+	const temporaryRoot = fileURLToPath(new URL("../.temp/", import.meta.url));
+	mkdirSync(temporaryRoot, { recursive: true });
 	const merged = {
+		TMPDIR: mkdtempSync(join(temporaryRoot, "auth-spill-")),
 		PI_WEB_SEARCH_ROUTING: "free-first",
 		PI_WEB_SEARCH_ALLOW_BILLABLE: undefined,
 		PI_WEB_SEARCH_ALLOW_PAID: undefined,

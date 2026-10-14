@@ -13,7 +13,7 @@ export function resolveProxyUrl(): string {
 }
 const FALLBACK_STATE = Symbol.for("pi.opencode-direct-fallback");
 
-type FetchLike = (input: unknown, init?: Record<string, unknown>) => Promise<Response>;
+type FetchLike = (input: Parameters<typeof globalThis.fetch>[0], init?: Record<string, unknown>) => Promise<Response>;
 type Dispatcher = object;
 
 interface UndiciModule {
@@ -47,7 +47,7 @@ export function isOpencodeRequest(input: unknown): boolean {
 }
 
 function isAborted(input: unknown, init: Record<string, unknown> | undefined): boolean {
-	const signal = init?.signal ?? (input instanceof Request ? input.signal : undefined);
+	const signal = init?.signal === undefined ? (input instanceof Request ? input.signal : undefined) : init.signal;
 	return Boolean(signal && typeof signal === "object" && "aborted" in signal && signal.aborted);
 }
 
@@ -63,30 +63,40 @@ export function isConnectionFailure(error: unknown): boolean {
 	const code = errorCode(error);
 	if (code && [
 		"ECONNREFUSED",
-		"ECONNRESET",
 		"EAI_AGAIN",
 		"ENETUNREACH",
 		"ENOTFOUND",
-		"ETIMEDOUT",
 		"UND_ERR_CONNECT_TIMEOUT",
-		"UND_ERR_HEADERS_TIMEOUT",
-		"UND_ERR_SOCKET",
 	].includes(code)) {
 		return true;
 	}
-	return error instanceof TypeError && error.message === "fetch failed";
+	return false;
 }
 
 function withDispatcher(init: Record<string, unknown> | undefined, dispatcher: Dispatcher): Record<string, unknown> {
 	return { ...(init ?? {}), dispatcher };
 }
 
-/** 从请求体里读出 model 名（Pi 的请求体是 JSON 字符串）。 */
+export const ROUTING_BODY_MAX_BYTES = 1024 * 1024;
+export const ROUTING_BODY_TIMEOUT_MS = 250;
+
+/** 只解码有严格大小上限的常见正文；未知类型保持保守路由。 */
 function readModelFromBody(body: unknown): string | undefined {
-	if (typeof body !== "string") return undefined;
+	let text: string;
+	if (typeof body === "string") {
+		if (body.length > ROUTING_BODY_MAX_BYTES || Buffer.byteLength(body) > ROUTING_BODY_MAX_BYTES) {
+			throw new Error("opencode-fallback: routing body too large");
+		}
+		text = body;
+	} else if (body instanceof Uint8Array) {
+		if (body.byteLength > ROUTING_BODY_MAX_BYTES) throw new Error("opencode-fallback: routing body too large");
+		text = new TextDecoder().decode(body);
+	} else {
+		return undefined;
+	}
 	try {
-		const parsed = JSON.parse(body) as { model?: unknown };
-		return typeof parsed.model === "string" ? parsed.model : undefined;
+		const parsed = JSON.parse(text) as { model?: unknown } | null;
+		return typeof parsed?.model === "string" ? parsed.model : undefined;
 	} catch {
 		return undefined;
 	}
@@ -96,7 +106,7 @@ function readModelFromBody(body: unknown): string | undefined {
  * 判断该请求是否属于「必须固定走代理」的模型：GPT / Grok / Muse / Claude。
  *
  * - `/responses`：opencode-go 下当前只有 GPT / Grok / Muse，端点即可判定。
- * - `/messages`：同一端点下还混有 minimax / qwen，必须看请求体里的 model。
+ * - `/messages`：仅已识别的 minimax / qwen 允许直连，其余及未知模型固定代理。
  *
  * 这些模型存在地区限制，且会话路由要求出口稳定，所以既不尝试直连、也不回退直连。
  */
@@ -106,43 +116,70 @@ export function needsPinnedProxy(input: unknown, init?: Record<string, unknown>)
 	if (url.pathname.endsWith("/responses")) return true;
 	if (url.pathname.endsWith("/messages")) {
 		const model = readModelFromBody(init?.body);
-		return typeof model === "string" && /^claude-/iu.test(model);
+		return typeof model !== "string" || !/^(minimax-|qwen)/iu.test(model);
 	}
 	return false;
 }
 
-/**
- * 只读取副本；已用、锁定或读取失败的正文直接报错，避免未知模型被错误路由。
- *
- * 只对 "正文在 Request 对象里、init 没有覆盖、且是 /messages" 的情况生效：其它
- * 形态仍走同步判定。此处假定 /messages 的正文是可解析 JSON——非 JSON 时
- * readModelFromBody 返回 undefined，按直连优先处理，不把已知模型误钉到代理。
- */
+/** 副本读取受独立期限和累计字节上限约束；取消不等待底层流配合。 */
 async function needsPinnedProxyWithRequest(input: unknown, init?: Record<string, unknown>): Promise<boolean> {
-	if (!(input instanceof Request) || init?.body != null || !getUrl(input)?.pathname.endsWith("/messages")) {
-		return needsPinnedProxy(input, init);
+	if (!getUrl(input)?.pathname.endsWith("/messages")) return needsPinnedProxy(input, init);
+	const signal = (init?.signal === undefined ? (input instanceof Request ? input.signal : undefined) : init.signal) as AbortSignal | null | undefined;
+	signal?.throwIfAborted();
+	let body = init?.body;
+	let stream: ReadableStream<Uint8Array> | null = null;
+	let originalBody: ReadableStream<Uint8Array> | null = null;
+	if (body == null && input instanceof Request) {
+		stream = input.clone().body;
+		originalBody = input.body;
+	} else if (body instanceof Blob) {
+		if (body.size > ROUTING_BODY_MAX_BYTES) throw new Error("opencode-fallback: routing body too large");
+		stream = body.stream();
 	}
-	const signal = (init?.signal ?? input.signal) as AbortSignal;
-	signal.throwIfAborted();
-	const copy = input.clone();
+	if (!stream) return needsPinnedProxy(input, { ...init, body });
+	const reader = stream.getReader();
+	const deadline = Date.now() + ROUTING_BODY_TIMEOUT_MS;
+	let timer: ReturnType<typeof setTimeout> | undefined;
 	let onAbort: (() => void) | undefined;
+	const stopped = new Promise<never>((_resolve, reject) => {
+		timer = setTimeout(() => reject(new Error("opencode-fallback: routing body timeout")), ROUTING_BODY_TIMEOUT_MS);
+		onAbort = () => reject(signal?.reason ?? new DOMException("Aborted", "AbortError"));
+		signal?.addEventListener("abort", onAbort, { once: true });
+		if (signal?.aborted) onAbort();
+	});
 	try {
-		const body = await Promise.race([
-			copy.text(),
-			new Promise<never>((_resolve, reject) => {
-				onAbort = () => reject(signal.reason);
-				signal.addEventListener("abort", onAbort, { once: true });
-				if (signal.aborted) onAbort();
-			}),
-		]);
+		const chunks: Uint8Array[] = [];
+		let size = 0;
+		let reads = 0;
+		while (true) {
+			// 同时限制分块数，避免空分块或极碎分块累积等待回调。
+			if (++reads > 16_384) throw new Error("opencode-fallback: routing body too fragmented");
+			signal?.throwIfAborted();
+			if (Date.now() >= deadline) throw new Error("opencode-fallback: routing body timeout");
+			const result = await Promise.race([reader.read(), stopped]);
+			if (result.done) break;
+			size += result.value.byteLength;
+			if (size > ROUTING_BODY_MAX_BYTES) throw new Error("opencode-fallback: routing body too large");
+			if (result.value.byteLength) chunks.push(result.value);
+		}
+		const bytes = new Uint8Array(size);
+		let offset = 0;
+		for (const chunk of chunks) {
+			bytes.set(chunk, offset);
+			offset += chunk.byteLength;
+		}
+		body = bytes;
 		return needsPinnedProxy(input, { ...init, body });
 	} catch (error) {
-		// 取消或读取失败时，clone 的正文读取通常仍在后台推进：必须消费它的迟到
-		// 结果，否则 Node 的未处理拒绝策略可能让整个进程退出。
-		void copy.text().catch(() => {});
+		// 路由失败时同时关闭原分支，释放生产器；成功时保留正文供发送。
+		// 取消可能永不完成或迟到拒绝，不能等待，也不能覆盖路由异常。
+		try { void originalBody?.cancel().catch(() => {}); } catch { /* 保留原路由异常。 */ }
 		throw error;
 	} finally {
-		if (onAbort) signal.removeEventListener("abort", onAbort);
+		clearTimeout(timer);
+		if (onAbort) signal?.removeEventListener("abort", onAbort);
+		// 副本的取消可能等待原分支，不能无界等待，也不能遗漏迟到拒绝。
+		try { void reader.cancel().catch(() => {}); } catch { /* 取消失败不覆盖原错误。 */ }
 	}
 }
 
@@ -161,11 +198,14 @@ export function createOpencodeFallbackFetch(
 			return Reflect.apply(originalFetch, this, [input, withDispatcher(init, proxyAgent)]);
 		}
 
-		// 其余模型保持原行为：直连优先，仅连接类失败才回退代理。
+		// 非安全方法绝不重放；底层错误无法证明模型请求尚未发出。
+		const method = String(init?.method ?? (input instanceof Request ? input.method : "GET")).toUpperCase();
+		const reusable = init?.body == null && (!(input instanceof Request) || (!input.body && !input.bodyUsed));
+		const canRetry = ["GET", "HEAD", "OPTIONS"].includes(method) && reusable;
 		try {
 			return await Reflect.apply(originalFetch, this, [input, withDispatcher(init, directAgent)]);
 		} catch (error) {
-			if (isAborted(input, init) || (error instanceof Error && error.name === "AbortError") || !isConnectionFailure(error)) throw error;
+			if (!canRetry || isAborted(input, init) || (error instanceof Error && error.name === "AbortError") || !isConnectionFailure(error)) throw error;
 			return Reflect.apply(originalFetch, this, [input, withDispatcher(init, proxyAgent)]);
 		}
 	};

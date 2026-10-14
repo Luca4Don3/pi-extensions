@@ -39,6 +39,7 @@
     "typebox": "*"
   },
   "scripts": {
+    "typecheck": "node node_modules/typescript/bin/tsc --project tsconfig.json",
     "test": "node --test extensions/*/tests/*.test.mjs",
     "test:live": "node extensions/web-search/tests/smoke.mjs"
   }

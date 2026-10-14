@@ -24,6 +24,7 @@ import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { type AgentConfig, type AgentScope, discoverAgents } from "./agents.js";
 import { waitForProcess } from "./process-lifecycle.js";
+import { LineBuffer, TailBuffer, MessageBuffer, ToolIdBuffer } from "./output-buffer.js";
 import { describeSpawnFailure } from "./spawn-failure.js";
 import {
 	accumulateUsage,
@@ -140,6 +141,10 @@ interface SingleResult {
 	exitCode: number;
 	messages: Message[];
 	stderr: string;
+	outputTruncated?: boolean;
+	messagesTruncated?: boolean;
+	stderrTruncated?: boolean;
+	toolIdsTruncated?: boolean;
 	usage: UsageStats;
 	model?: string;
 	stopReason?: string;
@@ -327,11 +332,34 @@ async function runSingleAgent(
 				shell: false,
 				stdio: ["ignore", "pipe", "pipe"],
 			});
-			let buffer = "";
-			const seenToolCallIds = new Set<string>();
+			const outputAbort = new AbortController();
+			let outputFailed = false;
+			const seenToolCallIds = new ToolIdBuffer();
+			const messages = new MessageBuffer(currentResult.messages);
+			const stderr = new TailBuffer();
+			const syncLimits = () => {
+				currentResult.messagesTruncated = messages.truncated;
+				currentResult.stderrTruncated = stderr.truncated;
+				currentResult.toolIdsTruncated = seenToolCallIds.truncated;
+				currentResult.stderr = stderr.text;
+			};
+
+			const failOutput = (diagnostic: string) => {
+				if (outputFailed) return;
+				outputFailed = true;
+				currentResult.outputTruncated = true;
+				currentResult.errorMessage = `${diagnostic}，已停止进程；输出及用量可能不完整`;
+				syncLimits();
+				outputAbort.abort();
+			};
+			const rememberToolId = (id: string) => {
+				if (seenToolCallIds.add(id)) return true;
+				failOutput("工具结果去重超过容量（1024 个标识或单标识 4096 字节）");
+				return false;
+			};
 
 			const processLine = (line: string) => {
-				if (!line.trim()) return;
+				if (outputFailed || !line.trim()) return;
 				let event: any;
 				try {
 					event = JSON.parse(line);
@@ -341,11 +369,11 @@ async function runSingleAgent(
 
 				if (event.type === "message_end" && event.message) {
 					const msg = event.message as Message;
-					currentResult.messages.push(msg);
-
 					if (msg.role === "toolResult" && msg.toolCallId) {
-						seenToolCallIds.add(msg.toolCallId);
+						if (seenToolCallIds.has(msg.toolCallId)) return;
+						if (!rememberToolId(msg.toolCallId)) return;
 					}
+					messages.push(msg);
 
 					if (msg.role === "assistant") {
 						accumulateUsage(currentResult.usage, msg.usage);
@@ -353,6 +381,7 @@ async function runSingleAgent(
 						if (msg.stopReason) currentResult.stopReason = msg.stopReason;
 						if (msg.errorMessage) currentResult.errorMessage = msg.errorMessage;
 					}
+					syncLimits();
 					emitUpdate();
 				}
 
@@ -369,28 +398,36 @@ async function runSingleAgent(
 						) {
 							continue;
 						}
-						currentResult.messages.push(toolResult as Message);
-						if (toolResult.toolCallId) seenToolCallIds.add(toolResult.toolCallId);
+						if (toolResult.toolCallId && !rememberToolId(toolResult.toolCallId)) return;
+						messages.push(toolResult as Message);
 						added = true;
 					}
+					syncLimits();
 					if (added) emitUpdate();
 				}
 			};
 
-			proc.stdout.on("data", (data) => {
-				buffer += data.toString();
-				const lines = buffer.split("\n");
-				buffer = lines.pop() || "";
-				for (const line of lines) processLine(line);
+			const lines = new LineBuffer(processLine, () => {
+				failOutput("stdout 单行超过 1048576 字节");
 			});
-
+			proc.stdout.on("data", (data) => lines.write(data));
 			proc.stderr.on("data", (data) => {
-				currentResult.stderr += data.toString();
+				stderr.write(data);
+				syncLimits();
 			});
 
-			waitForProcess(proc, signal, () => {
-				if (buffer.trim()) processLine(buffer);
-			}).then(resolve, reject);
+			waitForProcess(proc, signal ? AbortSignal.any([signal, outputAbort.signal]) : outputAbort.signal, () => {
+				lines.end();
+				stderr.end();
+				syncLimits();
+			}, (diagnostic) => {
+				if (diagnostic.includes("输出不完整")) currentResult.outputTruncated = true;
+				currentResult.errorMessage = currentResult.errorMessage
+					? `${currentResult.errorMessage}\n${diagnostic}` : diagnostic;
+			}).then((code) => resolve(outputFailed ? 1 : code), (error) => {
+				if (outputFailed && !signal?.aborted) resolve(1);
+				else reject(error);
+			});
 
 			// waitForProcess 已把 error 折算为退出码；这里只留下可行动的诊断，
 					// 让「找不到 pi」不再退化成一句莫名的 exitCode 1。
@@ -543,7 +580,7 @@ export default function (pi: ExtensionAPI) {
 				};
 			}
 
-			if ((agentScope === "project" || agentScope === "both") && confirmProjectAgents && ctx.hasUI) {
+			if ((agentScope === "project" || agentScope === "both") && confirmProjectAgents) {
 				const requestedAgentNames = new Set<string>();
 				if (params.chain) for (const step of params.chain) requestedAgentNames.add(step.agent);
 				if (params.tasks) for (const t of params.tasks) requestedAgentNames.add(t.agent);
@@ -554,6 +591,11 @@ export default function (pi: ExtensionAPI) {
 					.filter((a): a is AgentConfig => a?.source === "project");
 
 				if (projectAgentsRequested.length > 0) {
+					if (!ctx.hasUI) return {
+						content: [{ type: "text", text: "拒绝执行：项目 agent 需要确认，但当前没有可用 UI。" }],
+						details: makeDetails(hasChain ? "chain" : hasTasks ? "parallel" : "single")([]),
+						isError: true,
+					};
 					const names = projectAgentsRequested.map((a) => a.name).join(", ");
 					const dir = discovery.projectAgentsDir ?? "(unknown)";
 					const ok = await ctx.ui.confirm(
@@ -563,6 +605,7 @@ export default function (pi: ExtensionAPI) {
 					if (!ok)
 						return {
 							content: [{ type: "text", text: "Canceled: project-local agents not approved." }],
+							isError: true,
 							details: makeDetails(hasChain ? "chain" : hasTasks ? "parallel" : "single")([]),
 						};
 				}

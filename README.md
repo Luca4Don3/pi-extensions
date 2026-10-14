@@ -14,7 +14,7 @@
 | Web Fetch | `extensions/web-fetch/` | `pi install ~/pi-extensions/extensions/web-fetch` | 原生 `web_fetch` 工具：本地优先抓取公开网页并输出可读 Markdown；SSRF 防护、有界响应体、逐跳重定向校验 |
 | Subagent | `extensions/subagent/` | `pi install ~/pi-extensions/extensions/subagent` | 把任务委派给独立上下文的子 agent（single / parallel / chain） |
 | Chinese Prompt | `extensions/chinese-prompt/` | `pi install ~/pi-extensions/extensions/chinese-prompt` | 注入中文强约束 system prompt，推理与输出全程简体中文 |
-| OpenCode Fallback | `extensions/opencode-fallback/` | `pi install ~/pi-extensions/extensions/opencode-fallback` | GPT/Grok/Muse/Claude 固定走代理，其余模型直连优先、失败回退 |
+| OpenCode Fallback | `extensions/opencode-fallback/` | `pi install ~/pi-extensions/extensions/opencode-fallback` | 受限及未知模型固定代理，其余模型直连优先；模型请求不重放 |
 
 ## 仓库结构
 
@@ -199,6 +199,10 @@ pi -e ~/pi-extensions/extensions/web-search/index.ts
 
 其它参数：`agentScope`（`user` / `project` / `both`）、`confirmProjectAgents`、`maxOutputChars`、`maxPreviousChars`、`cwd`。
 
+项目级定义默认需要确认；无交互界面且 `confirmProjectAgents=true` 时拒绝执行请求中的项目级定义，用户级定义不受影响。`confirmProjectAgents=false` 只表示本次调用显式跳过确认，不建立持久信任或白名单，应仅由可信调用方使用。
+
+执行期固定上限：标准输出单行 1 MiB、标准错误尾部 64 KiB、消息缓存 256 条且总计 2 MiB、工具去重标识 1024 个且单个不超过 4 KiB。缓存淘汰会在结果详情中标记；单行或去重超限会停止进程并明确失败，用量可能不完整。正常退出码为零才视为成功；信号退出记录信号并判为失败。进程退出后只允许排空管道 1 秒，逾期关闭本地管道并报告输出不完整，不将其视为成功。
+
 ## 配置 agent
 
 子 agent 由 `~/.pi/agent/agents/*.md`（用户级）和 `.pi/agents/*.md`（项目级）定义，frontmatter 支持：
@@ -253,7 +257,7 @@ cp extensions/subagent/examples/agents/*.md ~/.pi/agent/agents/
 给发往 `opencode.ai` 的请求做两级路由：
 
 1. **固定代理**：GPT / Grok / Muse / Claude 四类模型**始终走代理**，不尝试直连
-2. **兜底回退**：其余模型（deepseek / glm / kimi / minimax 等）直连优先，仅连接类失败才回退代理
+2. **保守回退**：允许直连的模型只发送一次；仅无正文的安全方法（`GET` / `HEAD` / `OPTIONS`）在明确的建连前错误下允许代理回退
 
 ## 为什么这四类必须固定走代理
 
@@ -264,10 +268,10 @@ cp extensions/subagent/examples/agents/*.md ~/.pi/agent/agents/
 | 端点 | 处理 |
 | --- | --- |
 | `/v1/responses` | 一律固定代理（该端点下当前只有 GPT / Grok / Muse） |
-| `/v1/messages` | 读请求体的 `model`，仅 `claude-*` 固定代理（同一端点还混有 minimax / qwen，不能只看端点） |
-| 其它端点 | 直连优先，连接失败回退代理 |
+| `/v1/messages` | 读取 `model`，仅已识别的 `minimax-*` / `qwen*` 允许直连；其余、缺失及不可解析模型固定代理 |
+| 其它端点 | 直连优先；非安全方法不自动回退 |
 
-请求体不可解析时（非 JSON 字符串），`/v1/messages` 不会被强制代理，避免误伤。
+正文识别支持字符串、字节数组、二进制大对象（Blob）和请求对象（Request），保留 `init.body` 的覆盖语义。路由解析最多读取 1 MiB，流读取期限为 250 毫秒，且最多读取 16384 个分块；超限、超时、取消或不可克隆的正文在发送前明确失败。失败时尽力取消原正文及读取副本，不无界等待取消。未知正文类型保守走代理，不为模型识别消费其正文。
 
 ## 配置
 
@@ -282,8 +286,9 @@ cp extensions/subagent/examples/agents/*.md ~/.pi/agent/agents/
 | 非 `opencode.ai` 请求 | 原样透传，不附加 dispatcher |
 | GPT / Grok / Muse / Claude | 直接走代理，**代理失败也不回退直连** |
 | 其他 `opencode.ai` 请求直连成功 | 直接返回 |
-| 其他请求直连报连接类错误（`ECONNREFUSED` / `ECONNRESET` / `ENOTFOUND` / `ETIMEDOUT` / `UND_ERR_*` 等） | 改用代理重试一次 |
-| 非连接类错误、请求已取消 | 直接抛出，不重试 |
+| 无正文的安全方法遇到 `ECONNREFUSED` / `EAI_AGAIN` / `ENETUNREACH` / `ENOTFOUND` / `UND_ERR_CONNECT_TIMEOUT` | 改用代理重试一次 |
+| `POST` / `PUT` / `PATCH` / `DELETE` 等非安全方法 | 任意错误都直接抛出，不重放 |
+| 连接重置、响应头超时、套接字异常、普通超时、未知错误或请求已取消 | 直接抛出，不重试 |
 
 只对 `opencode.ai` 及其子域生效；`opencode.ai.example.com` 这类相似域名不会被误判。
 
@@ -459,6 +464,16 @@ Exa 匿名 MCP 响应中精确额度提示 `You've hit Exa's free MCP rate limit
 
 本修复的解压、边界与中断验收使用本地 HTTP 测试服务器，不发起厂商搜索；前文四家匿名通道与终端验证记录来自 `v0.5.0-beta.1`。
 
+### 正文落盘安全
+
+`spill-store.ts` 在规范化后的系统临时根下使用按用户标识（UID）隔离的 `pi-web-search-<uid>` 目录。每次操作检查祖先及结果目录的类型、所有权、权限和文件身份；可被其他用户写入的祖先必须有粘滞位。已有结果目录必须为当前用户所有的私有普通目录，符号链接、普通文件或宽权限目录都会被拒绝，不自动收紧已有权限。
+
+正文使用密码学随机文件名和排他创建，并在支持的平台禁止跟随文件符号链接；通过文件句柄和路径复查普通文件、所有权、私有权限及单链接属性。不覆盖已有文件，目录权限为 `0700`，文件权限为 `0600`。落盘失败仍返回已取得的搜索结果和 `fullTextWarning`，不因此重新搜索；取消仍终止调用。
+
+清理只针对本模块严格命名的合规私有普通文件，排除本次结果，并为近期文件提供 60 秒宽限。超过宽限后按修改时间尽力保留 20 个文件；并发写入时数量可以暂时超过 20，因此不是目录总磁盘占用的硬上限，也不保证结果永久保存。
+
+信任边界依赖系统的用户隔离和普通权限模型，不承诺抵御同用户恶意进程、管理员或未映射到权限位的扩展访问控制列表（ACL）。缺少用户身份接口的平台会安全降级为落盘失败；目录链接校验不能替代操作系统级原子路径解析。
+
 匿名候选顺序不是质量排名；当前不做质量不足后的跨 provider 选择，质量感知路由留待后续路线图。
 
 ## 工作原理
@@ -567,7 +582,23 @@ for p in pi-ai pi-agent-core pi-tui; do
 done
 ```
 
-持续集成（CI）固定安装 `@earendil-works/pi-coding-agent@1.1.0` 后只跑离线用例，覆盖各扩展与抓取合成样本。合成样本模拟代码托管说明页和嵌套技术文档，并非抓取的真实站点页面；持续集成成功不代表真实网络冒烟已通过。
+持续集成（CI）固定安装 `@earendil-works/pi-coding-agent@1.1.0`，在 Node.js 22 与 24 上执行严格类型检查及离线用例。类型检查覆盖扩展源码，测试及示例目录不纳入编译检查；测试由 `npm test` 单独执行。合成样本模拟代码托管说明页和嵌套技术文档，并非抓取的真实站点页面；持续集成成功不代表真实网络冒烟或安全审计已通过。
+
+本地执行 `npm run typecheck` 前，需安装并链接与工作流一致的 `typescript@5.9.3` 和 `@types/node@22.19.19`：
+
+```bash
+npm install -g typescript@5.9.3 @types/node@22.19.19
+mkdir -p node_modules/@types
+ln -sfn "$(npm root -g)/typescript" node_modules/typescript
+ln -sfn "$(npm root -g)/@types/node" node_modules/@types/node
+npm run typecheck
+```
+
+### 安全门禁边界
+
+完整本地安全审计仍是提交和推送前的独立检查，覆盖工作区、未跟踪文件、暂存对象、全部本地历史及悬空对象、元数据、本地大文件存储对象和已检出的子模块。现有工具的基线、指纹密钥、豁免原因及到期记录必须留在扫描器管理的私有 Git 元数据目录，不提交、不上传为工作流产物。
+
+仓库工作流目前**尚未包含可移植安全扫描或基线到期门禁**，也不声明远端分支保护已启用。后续需独立设计不含敏感原文的持续集成基线，并审核扫描覆盖及误报；不能复制本地私有基线，也不能用测试通过代替安全审计。
 
 本轮在隔离的 Pi `1.1.0` 软件开发工具包（SDK）运行时完成抓取验收，不读取用户配置、不调用模型，也不修改安装。示例网页、技术文档、代码托管页面及实际跳转均成功；原始 Markdown 地址首轮成功，后续出现超时及网络失败，已保留失败记录。不能据此宣称所有真实网络冒烟均通过，也不代表用户终端界面或长期网络可用性已验证。
 

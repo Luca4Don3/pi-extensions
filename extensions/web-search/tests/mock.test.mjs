@@ -7,7 +7,7 @@
  */
 
 import assert from "node:assert/strict";
-import { mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, readdirSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
@@ -56,8 +56,10 @@ function setup(options = {}) {
 const { tool, commands } = setup();
 
 /** 隔离正文落盘测试目录，避免触碰系统临时目录中的其他结果。 */
-const TEST_TMPDIR = fileURLToPath(new URL("../.temp/mock-test-tmp/", import.meta.url));
-const SPILL_DIR = join(TEST_TMPDIR, "pi-web-search");
+const TEMP_ROOT = fileURLToPath(new URL("../.temp/", import.meta.url));
+mkdirSync(TEMP_ROOT, { recursive: true });
+const TEST_TMPDIR = mkdtempSync(join(TEMP_ROOT, "mock-spill-"));
+const SPILL_DIR = join(TEST_TMPDIR, `pi-web-search-${process.getuid()}`);
 /** 需要按用例注入并在结束后恢复的环境变量。 */
 const ENV_KEYS = [
 	"PI_WEB_SEARCH_TIMEOUT_MS", "PI_WEB_SEARCH_RETRIES", "PI_WEB_SEARCH_ROUTING",
@@ -325,10 +327,13 @@ test("13. 落盘上限：超过 2MB 只写 2MB", async () => {
 	}));
 });
 
-test("14. 落盘目录只保留最近 20 个 results-*.txt", async () => {
+test("14. 旧文件尽力清理至 20 个 results-*.txt", async () => {
 	mkdirSync(SPILL_DIR, { recursive: true, mode: 0o700 });
+	const old = new Date(Date.now() - 120_000);
 	for (let i = 0; i < 25; i++) {
-		writeFileSync(join(SPILL_DIR, `results-0000000000000-${String(i).padStart(4, "0")}.txt`), "stale");
+		const path = join(SPILL_DIR, `results-0000000000000-${String(i).padStart(48, "0")}.txt`);
+		writeFileSync(path, "stale", { mode: 0o600 });
+		utimesSync(path, old, old);
 	}
 	const bigBody = `Title: Prune\nURL: https://example.com/prune\nHighlights:\n${"p".repeat(40000)}`;
 	await withEnv({}, () => withFetch(() => Promise.resolve(okResponse(exaSse(bigBody))), async () => {

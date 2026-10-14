@@ -10,11 +10,11 @@ import { createJiti } from "jiti";
 // index.ts 用命名导入拿 fs/promises：包装器必须在加载它之前装好，
 // 否则替换只影响测试自己的引用，测不到生产代码真实走的路径。
 const realMkdir = fs.mkdir;
-const realWriteFile = fs.writeFile;
+const realOpen = fs.open;
 let overrideMkdir;
-let overrideWriteFile;
+let overrideOpen;
 fs.mkdir = (...args) => (overrideMkdir ?? realMkdir)(...args);
-fs.writeFile = (...args) => (overrideWriteFile ?? realWriteFile)(...args);
+fs.open = (...args) => (overrideOpen ?? realOpen)(...args);
 syncBuiltinESMExports();
 
 const jiti = createJiti(import.meta.url);
@@ -29,16 +29,9 @@ const body = `Title: Success\nURL: https://example.com/success\nHighlights:\n${"
 async function runCase(kind, cancel = false) {
 	mkdirSync(root, { recursive: true });
 	const directory = mkdtempSync(join(root, "case-"));
-	const spillDirectory = join(directory, "pi-web-search");
-	const originalNow = Date.now;
-	const originalRandom = Math.random;
-	if (kind === "mkdir") writeFileSync(spillDirectory, "受控目录冲突");
-	if (kind === "writeFile") {
-		mkdirSync(spillDirectory);
-		Date.now = () => 1700000000000;
-		Math.random = () => 0.5;
-		mkdirSync(join(spillDirectory, `results-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.txt`));
-	}
+	const spillDirectory = join(directory, `pi-web-search-${process.getuid()}`);
+	const blocker = join(directory, "blocker");
+	writeFileSync(blocker, "受控故障");
 	const vars = {
 		TMPDIR: directory,
 		PI_WEB_SEARCH_RETRIES: "0",
@@ -57,19 +50,30 @@ async function runCase(kind, cancel = false) {
 		else process.env[key] = value;
 	}
 	const controller = new AbortController();
-	const operation = kind === "success" ? "writeFile" : kind;
-	// 仍执行真实文件操作，仅在该操作结束后触发取消，覆盖成功及失败后的取消检查。
-	if (cancel) {
-		const realOperation = operation === "mkdir" ? realMkdir : realWriteFile;
-		const wrapped = async (...args) => {
-			try { return await realOperation(...args); }
-			finally {
-				if (String(args[0]).startsWith(spillDirectory)) controller.abort();
-			}
-		};
-		if (operation === "mkdir") overrideMkdir = wrapped;
-		else overrideWriteFile = wrapped;
-	}
+	let injected = 0;
+	// 明确调用真实 mkdir/open 制造故障，不用目录权限检查代替写入路径。
+	if (kind === "mkdir") overrideMkdir = async (...args) => {
+		if (!String(args[0]).endsWith(`pi-web-search-${process.getuid()}`)) return realMkdir(...args);
+		injected++;
+		try { return await realMkdir(join(blocker, "child"), args[1]); }
+		finally { if (cancel) controller.abort(); }
+	};
+	overrideOpen = async (...args) => {
+		if (kind === "open") {
+			injected++;
+			try { return await realOpen(spillDirectory, args[1], args[2]); }
+			finally { if (cancel) controller.abort(); }
+		}
+		const handle = await realOpen(...args);
+		if (cancel && kind === "success") {
+			const write = handle.writeFile.bind(handle);
+			handle.writeFile = async (...values) => {
+				try { return await write(...values); }
+				finally { injected++; controller.abort(); }
+			};
+		}
+		return handle;
+	};
 	const originalFetch = globalThis.fetch;
 	let requests = 0;
 	globalThis.fetch = async () => {
@@ -93,6 +97,7 @@ async function runCase(kind, cancel = false) {
 		} else {
 			const result = await execution;
 			assert.equal(result.details.provider, "exa");
+			assert.equal(result.details.attemptCount, 1);
 			assert.equal(result.details.sourceCount, 1);
 			assert.equal(result.details.sources[0].url, "https://example.com/success");
 			assert.equal(result.details.truncated, true);
@@ -104,14 +109,13 @@ async function runCase(kind, cancel = false) {
 			assert.equal(serialized.includes(directory), false);
 			assert.equal(serialized.includes("offline-spill-secret"), false);
 		}
+		assert.equal(injected, 1);
 		assert.equal(requests, 1);
 		assert.equal(failures, 0);
 	} finally {
 		globalThis.fetch = originalFetch;
 		overrideMkdir = undefined;
-		overrideWriteFile = undefined;
-		Date.now = originalNow;
-		Math.random = originalRandom;
+		overrideOpen = undefined;
 		for (const [key, value] of Object.entries(saved)) {
 			if (value === undefined) delete process.env[key];
 			else process.env[key] = value;
@@ -119,7 +123,7 @@ async function runCase(kind, cancel = false) {
 	}
 }
 
-for (const kind of ["mkdir", "writeFile"]) {
+for (const kind of ["mkdir", "open"]) {
 	test(`真实 ${kind} 冲突保留搜索结果，不触发渠道回退`, { concurrency: false }, () => runCase(kind));
 	test(`真实 ${kind} 冲突后的取消仍终止`, { concurrency: false }, () => runCase(kind, true));
 }

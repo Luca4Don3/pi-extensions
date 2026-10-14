@@ -18,8 +18,7 @@
  * @module pi-web-search
  */
 
-import { mkdir, readdir, rm, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { spillFullText, SPILL_MAX_BYTES, type SpillResult } from "./spill-store.js";
 import { join } from "node:path";
 import { getAgentDir, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
@@ -73,12 +72,6 @@ const RETRY_MAX_WAIT_MS = 5_000;
 const DEFAULT_NUM_RESULTS = 8;
 /** 模型可见正文上限，超出部分被截断并显式告知模型。 */
 const MAX_TEXT_CHARS = 24_000;
-/** 落盘完整正文的单文件硬上限，避免超大响应写满磁盘。 */
-const SPILL_MAX_BYTES = 2 * 1024 * 1024;
-/** 落盘目录保留的最大文件数，更旧的会被清理。 */
-const SPILL_KEEP_FILES = 20;
-/** 落盘目录名（位于系统临时目录下，不进入任何公开目录）。 */
-const SPILL_DIR_NAME = "pi-web-search";
 /** 归属标识，便于端点侧识别调用方。 */
 const USER_AGENT = "pi-web-search/0.6.0-beta.3";
 
@@ -94,12 +87,6 @@ interface SearchOutcome {
 	text: string;
 	sources: WebSource[];
 	truncated: boolean;
-}
-
-/** 落盘结果：路径 + 正文是否完整写入（受 SPILL_MAX_BYTES 约束）。 */
-interface SpillResult {
-	path: string;
-	complete: boolean;
 }
 
 /** 工具参数表。 */
@@ -470,33 +457,6 @@ function parseMcpResponse(body: string): string | undefined {
 		}
 	}
 	return flush();
-}
-
-/** 落盘目录仅保留最近 SPILL_KEEP_FILES 个文件；清理是尽力而为。 */
-async function pruneSpillDirectory(directory: string): Promise<void> {
-	try {
-		const entries = (await readdir(directory))
-			.filter((name) => name.startsWith("results-") && name.endsWith(".txt"))
-			.sort();
-		const stale = entries.slice(0, Math.max(0, entries.length - SPILL_KEEP_FILES));
-		await Promise.all(stale.map((name) => rm(join(directory, name), { force: true })));
-	} catch {
-		// 任何清理失败都不应影响搜索结果返回。
-	}
-}
-
-/**
- * 正文超限时把内容落到独立临时目录，供模型按需 read。
- * 目录权限 0700、文件权限 0600，单文件受 SPILL_MAX_BYTES 限制。
- */
-async function spillFullText(text: string): Promise<SpillResult> {
-	const directory = join(tmpdir(), SPILL_DIR_NAME);
-	await mkdir(directory, { recursive: true, mode: 0o700 });
-	const file = join(directory, `results-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.txt`);
-	const buffer = Buffer.from(text, "utf8");
-	await writeFile(file, buffer.subarray(0, SPILL_MAX_BYTES), { mode: 0o600 });
-	await pruneSpillDirectory(directory);
-	return { path: file, complete: buffer.byteLength <= SPILL_MAX_BYTES };
 }
 
 /**

@@ -31,19 +31,15 @@ test("1. isOpencodeRequest 识别主机与子域，拒绝相似域名", () => {
 test("2. isConnectionFailure 只认连接类错误", () => {
 	for (const code of [
 		"ECONNREFUSED",
-		"ECONNRESET",
 		"EAI_AGAIN",
 		"ENETUNREACH",
 		"ENOTFOUND",
-		"ETIMEDOUT",
 		"UND_ERR_CONNECT_TIMEOUT",
-		"UND_ERR_HEADERS_TIMEOUT",
-		"UND_ERR_SOCKET",
 	]) {
 		assert.equal(isConnectionFailure(errWithCode(code)), true, code);
 	}
 	assert.equal(isConnectionFailure(Object.assign(new Error("x"), { cause: { code: "ECONNREFUSED" } })), true);
-	assert.equal(isConnectionFailure(new TypeError("fetch failed")), true);
+	assert.equal(isConnectionFailure(new TypeError("fetch failed")), false);
 	assert.equal(isConnectionFailure(errWithCode("EPROTO")), false);
 	assert.equal(isConnectionFailure(new TypeError("other")), false);
 	assert.equal(isConnectionFailure(undefined), false);
@@ -169,7 +165,7 @@ test("11. /messages + claude 强制走代理", async () => {
 	assert.deepEqual(seen, ["proxy"]);
 });
 
-test("12. /messages + minimax 不误伤，保持直连优先", async () => {
+test("12. /messages + minimax 直连失败不重放 POST", async () => {
 	const seen = [];
 	const fetchLike = async (_input, init) => {
 		seen.push(init?.dispatcher?.name);
@@ -177,8 +173,8 @@ test("12. /messages + minimax 不误伤，保持直连优先", async () => {
 		return new Response("ok");
 	};
 	const wrapped = createOpencodeFallbackFetch(fetchLike, { name: "direct" }, { name: "proxy" });
-	await wrapped("https://opencode.ai/zen/go/v1/messages", jsonInit("minimax-m3"));
-	assert.deepEqual(seen, ["direct", "proxy"], "应先直连、失败后才回退");
+	await assert.rejects(wrapped("https://opencode.ai/zen/go/v1/messages", jsonInit("minimax-m3")), /boom/);
+	assert.deepEqual(seen, ["direct"], "模型 POST 禁止自动重放");
 });
 
 test("13. /messages + qwen 不误伤，直连成功即结束", async () => {
@@ -203,7 +199,7 @@ test("14. /chat/completions（deepseek 等）保持原行为", async () => {
 	assert.deepEqual(seen, ["direct"]);
 });
 
-test("15. /messages 的 body 不可解析时不误判为 Claude", async () => {
+test("15. /messages 的 body 不可解析时保守固定代理", async () => {
 	const seen = [];
 	const fetchLike = async (_input, init) => {
 		seen.push(init?.dispatcher?.name);
@@ -211,7 +207,7 @@ test("15. /messages 的 body 不可解析时不误判为 Claude", async () => {
 	};
 	const wrapped = createOpencodeFallbackFetch(fetchLike, { name: "direct" }, { name: "proxy" });
 	await wrapped("https://opencode.ai/zen/go/v1/messages", { body: new Uint8Array([1, 2, 3]) });
-	assert.deepEqual(seen, ["direct"]);
+	assert.deepEqual(seen, ["proxy"]);
 });
 
 test("16. 强制代理失败时不回退直连（出口不漂移）", async () => {

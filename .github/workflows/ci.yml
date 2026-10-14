@@ -5,10 +5,18 @@ on:
     branches: [main]
   pull_request:
 
+permissions:
+  contents: read
+
 jobs:
   test:
-    name: Offline mock tests
+    name: Offline checks (Node ${{ matrix.node }})
     runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        node: [22, 24]
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -16,21 +24,26 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: 24
+          node-version: ${{ matrix.node }}
 
-      - name: Install Pi coding agent (global)
-        run: npm install -g @earendil-works/pi-coding-agent@1.1.0
+      - name: Install Pi and typecheck tools (global)
+        run: npm install -g @earendil-works/pi-coding-agent@1.1.0 typescript@5.9.3 @types/node@22.19.19
 
       - name: Link runtime dependencies from the global package
         run: |
           PI_PKG="$(npm root -g)/@earendil-works/pi-coding-agent"
-          mkdir -p node_modules node_modules/@earendil-works
+          mkdir -p node_modules node_modules/@earendil-works node_modules/@types
+          ln -sfn "$(npm root -g)/typescript" node_modules/typescript
+          ln -sfn "$(npm root -g)/@types/node" node_modules/@types/node
           ln -sfn "$PI_PKG/node_modules/jiti" node_modules/jiti
           ln -sfn "$PI_PKG/node_modules/typebox" node_modules/typebox
           ln -sfn "$PI_PKG" node_modules/@earendil-works/pi-coding-agent
           for p in pi-ai pi-agent-core pi-tui; do
             ln -sfn "$PI_PKG/node_modules/@earendil-works/$p" "node_modules/@earendil-works/$p"
           done
+
+      - name: Typecheck extensions
+        run: npm run typecheck
 
       - name: Run offline tests
         run: npm test
