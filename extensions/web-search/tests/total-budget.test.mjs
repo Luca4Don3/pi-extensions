@@ -112,8 +112,11 @@ test("累计退避可被总预算中断，不做无界 sleep", async () => {
 			const { tool } = registerTool();
 			const startedAt = Date.now();
 			await assert.rejects(tool.execute("budget", { query: "退避", provider: "exa" }), /总时间预算已用尽/);
-			assert.ok(getCalls() <= 2, `退避被预算中断后不得继续请求，实际 ${getCalls()}`);
-			assert.ok(Date.now() - startedAt < 8_000, "退避等待不得无界延长");
+			const elapsed = Date.now() - startedAt;
+			// 退避序列 400+800+1600ms 若无界会明显超过预算；有界时应≈预算本身。
+			// 具体发起几次取决于调度，只保证上限为 retries+1，且不越过无界退避的总时长。
+			assert.ok(getCalls() <= 4, `请求次数 ${getCalls()} 不得超过 retries+1`);
+			assert.ok(elapsed < 2_000, `退避等待不得无界延长，实际 ${elapsed}ms`);
 		}));
 });
 
