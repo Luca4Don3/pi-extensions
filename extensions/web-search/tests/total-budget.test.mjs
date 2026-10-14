@@ -163,3 +163,61 @@ test("外部取消优先级高于总预算", async () => {
 			assert.equal(getCalls(), 1);
 		}));
 });
+
+/** 阻塞的凭据库读取：不遵守取消信号，只能被总预算中断。 */
+const blockingStore = () => ({ kind: "none", read: () => new Promise(() => undefined) });
+
+function registerToolWith(options = {}) {
+	const tools = [];
+	plugin({ registerTool: (value) => { tools.push(value); }, registerCommand() {} }, options);
+	return tools[0];
+}
+
+test("凭据读取受总预算约束：阻塞读取有界结束且不发任何请求", async () => {
+	await withEnv({ PI_WEB_SEARCH_TOTAL_TIMEOUT_MS: "1000", PI_WEB_SEARCH_ALLOW_BILLABLE: "true", PI_WEB_SEARCH_RETRIES: "0" },
+		async () => await withFetch("hang", async (getCalls) => {
+			const tool = registerToolWith({ credentialStore: blockingStore() });
+			const startedAt = Date.now();
+			await assert.rejects(tool.execute("budget", { query: "凭据", provider: "auto" }), /总时间预算已用尽/);
+			assert.ok(Date.now() - startedAt < 5_000, "阻塞的凭据读取必须被总预算中断");
+			assert.equal(getCalls(), 0, "预算耗尽后不得发出任何请求");
+		}));
+});
+
+test("额度初始化受总预算约束：阻塞的本地状态读取有界结束", async () => {
+	const { createQuotaManager } = await jiti.import(fileURLToPath(new URL("../quota/core.ts", import.meta.url)));
+	const hangingStateStore = {
+		kind: "private",
+		load: () => new Promise(() => undefined),
+		save: async () => ({ status: "saved" }),
+	};
+	await withEnv({ PI_WEB_SEARCH_TOTAL_TIMEOUT_MS: "1000", PI_WEB_SEARCH_RETRIES: "0" },
+		async () => await withFetch("hang", async (getCalls) => {
+			const tool = registerToolWith({ quotaManager: createQuotaManager({ stateStore: hangingStateStore }) });
+			const startedAt = Date.now();
+			await assert.rejects(tool.execute("budget", { query: "初始化", provider: "exa" }), /总时间预算已用尽/);
+			assert.ok(Date.now() - startedAt < 5_000, "阻塞的额度初始化必须被总预算中断");
+			assert.equal(getCalls(), 0, "预算耗尽后不得发出任何请求");
+		}));
+});
+
+test("额度持久化阻塞只降级为警告，不丢弃已取得的搜索结果", async () => {
+	const { createQuotaManager } = await jiti.import(fileURLToPath(new URL("../quota/core.ts", import.meta.url)));
+	const blockingSaveStore = {
+		kind: "private",
+		load: async () => ({ status: "missing" }),
+		save: () => new Promise(() => undefined),
+	};
+	await withEnv({ PI_WEB_SEARCH_TOTAL_TIMEOUT_MS: "1000", PI_WEB_SEARCH_RETRIES: "0" },
+		async () => await withFetch(() => Promise.resolve(new Response(sse("Title: T\nURL: https://example.com/a\nHighlights:\n摘要"), { status: 200 })), async (getCalls) => {
+			const tool = registerToolWith({ quotaManager: createQuotaManager({ stateStore: blockingSaveStore }) });
+			const startedAt = Date.now();
+			const result = await tool.execute("budget", { query: "持久化", provider: "exa" });
+			// 收尾写盘不得把已经成功的搜索变成失败。
+			assert.notEqual(result.isError, true);
+			assert.equal(result.details.provider, "exa");
+			assert.equal(getCalls(), 1);
+			assert.match(result.details.quotaWarning ?? "", /额度状态写入跳过/);
+			assert.ok(Date.now() - startedAt < 5_000, "写盘阻塞必须被总预算中断");
+		}));
+});

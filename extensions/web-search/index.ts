@@ -194,11 +194,52 @@ class TotalBudgetError extends BackendError {
 	}
 }
 
-/** 整次调用的绝对截止时间：额度预检、各通道尝试、退避等待与正文落盘共同遵守。 */
+/**
+ * 整次调用的绝对截止时间：以单调时钟 performance.now 锚定，
+ * 避免系统时钟调整（NTP 校正、用户改时间）让期限提前或失效。
+ */
 class TotalBudget {
-	constructor(readonly deadlineMs: number) { }
-	remainingMs(): number { return this.deadlineMs - Date.now(); }
+	private readonly startedAt = performance.now();
+	readonly deadlineMs: number;
+	constructor(totalMs: number) {
+		this.deadlineMs = this.startedAt + totalMs;
+	}
+	remainingMs(): number { return this.deadlineMs - performance.now(); }
 	get exhausted(): boolean { return this.remainingMs() <= 0; }
+}
+
+/**
+ * 用剩余预算约束只接受外部取消信号的异步阶段（凭据读取、额度初始化、状态持久化）：
+ * 先到期者胜出，外部取消优先于预算；输掉竞争的一方继续在后台推进，
+ * 其迟到拒绝必须被消费，否则可能成为未处理拒绝。
+ */
+async function withTotalBudget<T>(promise: Promise<T>, budget: TotalBudget, signal?: AbortSignal): Promise<T> {
+	if (isAborted(signal)) {
+		void promise.catch(() => undefined);
+		return Promise.reject(createAbortError());
+	}
+	const remaining = budget.remainingMs();
+	if (remaining <= 0) {
+		void promise.catch(() => undefined);
+		throw new TotalBudgetError();
+	}
+	let timer: ReturnType<typeof setTimeout> | undefined;
+	let onAbort: (() => void) | undefined;
+	const expire = new Promise<never>((_resolve, reject) => {
+		timer = setTimeout(() => reject(isAborted(signal) ? createAbortError() : new TotalBudgetError()), remaining);
+		onAbort = () => reject(createAbortError());
+		signal?.addEventListener("abort", onAbort, { once: true });
+	});
+	try {
+		return await Promise.race([promise, expire]);
+	} catch (error) {
+		// 阶段本身仍在后台运行：消费其迟到结果，避免未处理拒绝。
+		void promise.catch(() => undefined);
+		throw error;
+	} finally {
+		clearTimeout(timer);
+		if (onAbort) signal?.removeEventListener("abort", onAbort);
+	}
 }
 
 /** 额度预检失败原因映射为固定中文诊断；不含任何凭据或上游原文。 */
@@ -262,7 +303,7 @@ function sleep(ms: number, signal?: AbortSignal, deadlineMs?: number): Promise<v
 		};
 		let wait = ms;
 		if (deadlineMs !== undefined) {
-			const remaining = deadlineMs - Date.now();
+			const remaining = deadlineMs - performance.now();
 			if (remaining <= 0) {
 				expire();
 				return;
@@ -460,6 +501,8 @@ interface QuotaSearchContext {
 	config: RoutingConfig;
 	legacyHealth?: ChannelHealth;
 	persistenceWarnings: Set<string>;
+	/** 整次调用的总预算：持久化写入也要受其约束。 */
+	budget: TotalBudget;
 }
 
 function quotaChannel(channel: RouteStep["channel"]): QuotaChannel {
@@ -467,8 +510,26 @@ function quotaChannel(channel: RouteStep["channel"]): QuotaChannel {
 }
 
 async function flushQuotaState(context: QuotaSearchContext, signal?: AbortSignal): Promise<void> {
+	const skip = (): void => {
+		context.persistenceWarnings.add("额度状态写入跳过：整次调用总时间预算已用尽");
+	};
+	// 持久化是收尾动作：预算已耗尽或写入中途阻塞都只降级为警告，不丢弃已取得的搜索结果。
+	if (context.budget.exhausted) {
+		skip();
+		return;
+	}
 	const pending = Promise.resolve().then(() => context.manager.flush());
-	const result = await waitForAbort(pending, signal);
+	let result;
+	try {
+		result = await withTotalBudget(pending, context.budget, signal);
+	} catch (error) {
+		// 预算耗尽：收尾写入降级；外部取消仍按取消语义向上传递。
+		if (error instanceof TotalBudgetError) {
+			skip();
+			return;
+		}
+		throw error;
+	}
 	if (result.status === "degraded") context.persistenceWarnings.add(result.reason ?? "QUOTA_STATE_IO_UNAVAILABLE");
 }
 
@@ -557,7 +618,11 @@ async function searchChannel(
 		const controller = new AbortController();
 		let timedOut = false;
 		// 单请求预算不超过整次调用剩余预算，使两者可在同一控制器上区分先后。
-		const singleWait = Math.max(1, Math.min(timeoutMs, budget.remainingMs()));
+		const remainingAtStart = budget.remainingMs();
+		const singleWait = Math.max(1, Math.min(timeoutMs, remainingAtStart));
+		// 计时器被总预算压缩时，超时原因就是预算本身：不能把预算耗尽误判成单请求
+		// 超时后继续重试，否则会发出本不应再发的请求。
+		const budgetBoundWait = remainingAtStart < timeoutMs;
 		const timer = setTimeout(() => {
 			timedOut = true;
 			controller.abort();
@@ -714,7 +779,7 @@ async function searchChannel(
 		} catch (error) {
 			if (isAborted(signal)) throw createAbortError();
 			// 总预算耗尽优先于单请求超时：timer 一旦到期即可能由剩余预算触发。
-			if (budget.exhausted) throw new TotalBudgetError(attempts);
+			if (budget.exhausted || (timedOut && budgetBoundWait)) throw new TotalBudgetError(attempts);
 			const failure = timedOut
 				? new BackendError(`${backend} timed out after ${timeoutMs}ms`, "timeout")
 				: error instanceof BackendError
@@ -798,7 +863,7 @@ export default function piWebSearch(pi: ExtensionAPI, options: WebSearchOptions 
 		async execute(_toolCallId, params, signal) {
 			const requestConfig = readSearchRequestConfig();
 			// 整次调用总预算：在任何网络请求与凭据读取之前锚定绝对截止时间。
-			const budget = new TotalBudget(Date.now() + requestConfig.totalTimeoutMs);
+			const budget = new TotalBudget(requestConfig.totalTimeoutMs);
 			const query = params.query.trim();
 			if (query.length === 0) throw new Error("query must not be empty");
 			if (isAborted(signal)) throw createAbortError();
@@ -811,11 +876,12 @@ export default function piWebSearch(pi: ExtensionAPI, options: WebSearchOptions 
 			// 未授权计费时绝不读取密钥环境变量或系统密钥库；授权时在路由前一次解析，
 			// 保证本工具所有对外文本与落盘内容都能抹掉本次已读取的凭据。
 			const keys = config.allowBillable
-				? await resolvePlanKeys(provider, store, signal)
+				? await withTotalBudget(resolvePlanKeys(provider, store, signal), budget, signal)
 				: emptyPlanKeys();
 			if (isAborted(signal)) throw createAbortError();
+			if (budget.exhausted) throw new TotalBudgetError();
 			const candidates = buildRouteCandidates(provider, config);
-			await waitForAbort(Promise.resolve().then(() => quotaManager.initialize()), signal);
+			await withTotalBudget(Promise.resolve().then(() => quotaManager.initialize()), budget, signal);
 			const secrets = BACKENDS.map((backend) => keys[backend]);
 			interface SearchFailure {
 				label: string;
@@ -829,6 +895,7 @@ export default function piWebSearch(pi: ExtensionAPI, options: WebSearchOptions 
 				manager: quotaManager,
 				config,
 				persistenceWarnings,
+				budget,
 				...(channelHealth === undefined ? {} : { legacyHealth: channelHealth }),
 			};
 			let attemptCount = 0;
