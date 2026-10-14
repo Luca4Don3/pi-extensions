@@ -31,6 +31,18 @@ function privateFile(stat: Stats, uid: number): boolean {
 	return stat.isFile() && !stat.isSymbolicLink() && privateEntry(stat, uid) && stat.nlink === 1;
 }
 
+/** 清理本次创建但未完成的文件：先 lstat 复核仍是本进程创建的私有普通单链接文件、
+ * 且与创建时状态一致，再 unlink；清理失败不覆盖原始错误，也不重试网络搜索。
+ * 没有创建时状态（open 后首次 lstat 就失败）时无法确认归属，宁可留下也不误删他人内容。 */
+async function discardCreatedFile(file: string, created: Stats | undefined, uid: number): Promise<void> {
+	if (created === undefined) return;
+	try {
+		const latest = await lstat(file);
+		if (!privateFile(latest, uid) || !same(created, latest)) return;
+		await unlink(file);
+	} catch { /* 清理失败不覆盖原始错误。 */ }
+}
+
 /** 每次操作重新锚定系统临时根，允许 macOS /var 等系统符号链接。 */
 export async function spillFullText(text: string, temporaryRoot = tmpdir()): Promise<SpillResult> {
 	if (process.getuid === undefined) refuse();
@@ -62,15 +74,29 @@ export async function spillFullText(text: string, temporaryRoot = tmpdir()): Pro
 	const file = join(directory, `results-${Date.now()}-${randomBytes(24).toString("hex")}.txt`);
 	const handle = await open(file, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | (constants.O_NOFOLLOW ?? 0), 0o600);
 	const bytes = Buffer.from(text, "utf8");
+	// O_EXCL 创建成功即锚定归属：任何后续失败路径都据此安全清理本次创建的文件。
+	let created: Stats | undefined;
+	let persisted = false;
 	try {
+		created = await lstat(file);
+		if (!privateFile(created, uid)) refuse();
 		const stat = await handle.stat();
-		if (!privateFile(stat, uid)) refuse();
+		if (!privateFile(stat, uid) || !same(created, stat)) refuse();
 		await verify();
 		await handle.writeFile(bytes.subarray(0, SPILL_MAX_BYTES));
 		const latest = await lstat(file);
-		if (!privateFile(latest, uid) || !same(stat, latest)) refuse();
+		if (!privateFile(latest, uid) || !same(created, latest)) refuse();
 		await verify();
-	} finally { await handle.close(); }
+		// 写入与复查全部通过即视为已完整落盘：此后 close 失败不得删除，否则会把已经
+		// 取得的完整正文丢掉，调用方只剩截断文本。残留文件交由尽力清理回收。
+		persisted = true;
+		await handle.close();
+	} catch (error) {
+		// close 幂等：try 内 close 抛错也会走到这里，二次关闭不会覆盖原始错误。
+		try { await handle.close(); } catch { /* 关闭失败不覆盖原始错误。 */ }
+		if (!persisted) await discardCreatedFile(file, created, uid);
+		throw error;
+	}
 	// 仅尽力清理，不保证永久保存，也不防御同 UID 攻击；只删除校验过的私有普通单链接文件。
 	// 排除本次结果，并给近期文件固定 60 秒宽限；并发写入时允许暂时超过保留数量。
 	try {

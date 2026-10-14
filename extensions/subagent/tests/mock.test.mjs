@@ -236,3 +236,29 @@ test("16. formatTokens 的进制边界", () => {
 	assert.equal(f(999999), "1000k");
 	assert.equal(f(1000000), "1.0M");
 });
+
+// ---- PI_SUBAGENT_TRUST_PROJECT_AGENTS：宿主授权的严格解析 ----
+
+const { readTrustProjectAgents, TRUST_PROJECT_AGENTS_ENV } = indexModule;
+
+test("17. 宿主授权只接受严格 true/false，未设置为未授权", () => {
+	assert.equal(TRUST_PROJECT_AGENTS_ENV, "PI_SUBAGENT_TRUST_PROJECT_AGENTS");
+	assert.equal(readTrustProjectAgents({}), false);
+	assert.equal(readTrustProjectAgents({ PI_SUBAGENT_TRUST_PROJECT_AGENTS: undefined }), false);
+	assert.equal(readTrustProjectAgents({ PI_SUBAGENT_TRUST_PROJECT_AGENTS: " true " }), true);
+	assert.equal(readTrustProjectAgents({ PI_SUBAGENT_TRUST_PROJECT_AGENTS: "false" }), false);
+	for (const bad of ["TRUE", "1", "yes", "true false", ""]) {
+		assert.throws(
+			() => readTrustProjectAgents({ PI_SUBAGENT_TRUST_PROJECT_AGENTS: bad }),
+			/PI_SUBAGENT_TRUST_PROJECT_AGENTS 必须为 true 或 false/,
+			`非法值必须报错：${JSON.stringify(bad)}`,
+		);
+	}
+});
+
+test("18. 文档与 schema 都不得把 confirmProjectAgents 宣称为可信授权", () => {
+	const confirm = subagentTool.parameters.properties.confirmProjectAgents;
+	assert.equal(confirm.type, "boolean");
+	assert.match(confirm.description, /model-controlled|not a trusted authorization/i, "schema 必须说明该参数不是可信授权");
+	assert.match(subagentTool.description, /PI_SUBAGENT_TRUST_PROJECT_AGENTS/, "工具描述必须指向宿主环境授权");
+});

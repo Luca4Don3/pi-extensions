@@ -16,10 +16,10 @@ const url = (id) => `https://example.com/${id}`;
 const parallel = (ids) => JSON.stringify({ results: ids.map((id) => ({ url: url(id), title: `标题${id}`, excerpts: [`摘要${id}`] })) });
 
  test("配置默认、空值与闭区间端点", () => {
-	assert.deepEqual(readSearchRequestConfig({}), { retries: 1, timeoutMs: 25000 });
-	assert.deepEqual(readSearchRequestConfig({ PI_WEB_SEARCH_RETRIES: " ", PI_WEB_SEARCH_TIMEOUT_MS: "" }), { retries: 1, timeoutMs: 25000 });
-	for (const retries of [0, 1, 3]) for (const timeoutMs of [100, 25000, 120000]) {
-		assert.deepEqual(readSearchRequestConfig({ PI_WEB_SEARCH_RETRIES: String(retries), PI_WEB_SEARCH_TIMEOUT_MS: String(timeoutMs) }), { retries, timeoutMs });
+	assert.deepEqual(readSearchRequestConfig({}), { retries: 1, timeoutMs: 25000, totalTimeoutMs: 90000 });
+	assert.deepEqual(readSearchRequestConfig({ PI_WEB_SEARCH_RETRIES: " ", PI_WEB_SEARCH_TIMEOUT_MS: "", PI_WEB_SEARCH_TOTAL_TIMEOUT_MS: "  " }), { retries: 1, timeoutMs: 25000, totalTimeoutMs: 90000 });
+	for (const retries of [0, 1, 3]) for (const timeoutMs of [100, 25000, 120000]) for (const totalTimeoutMs of [1000, 90000, 600000]) {
+		assert.deepEqual(readSearchRequestConfig({ PI_WEB_SEARCH_RETRIES: String(retries), PI_WEB_SEARCH_TIMEOUT_MS: String(timeoutMs), PI_WEB_SEARCH_TOTAL_TIMEOUT_MS: String(totalTimeoutMs) }), { retries, timeoutMs, totalTimeoutMs });
 	}
 });
 
@@ -27,8 +27,9 @@ const parallel = (ids) => JSON.stringify({ results: ids.map((id) => ({ url: url(
 	for (const [name, values] of [
 		["PI_WEB_SEARCH_RETRIES", ["-1", "4", "1000000", "1.5", "Infinity", "NaN", "9007199254740992", "非法标记"]],
 		["PI_WEB_SEARCH_TIMEOUT_MS", ["0", "99", "120001", "1000000", "100.5", "Infinity", "9007199254740992", "非法标记"]],
+		["PI_WEB_SEARCH_TOTAL_TIMEOUT_MS", ["0", "999", "600001", "1000000", "100.5", "Infinity", "NaN", "9007199254740992", "非法标记"]],
 	]) for (const value of values) {
-		const range = name === "PI_WEB_SEARCH_RETRIES" ? "0..3" : "100..120000";
+		const range = name === "PI_WEB_SEARCH_RETRIES" ? "0..3" : name === "PI_WEB_SEARCH_TIMEOUT_MS" ? "100..120000" : "1000..600000";
 		assert.throws(() => readSearchRequestConfig({ [name]: value }), (error) => error.message === `${name} 配置无效：必须是 ${range} 范围内的安全整数`);
 	}
 });

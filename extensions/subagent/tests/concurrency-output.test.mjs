@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import test from 'node:test';
+import test, { after } from 'node:test';
 import { getEventListeners } from 'node:events';
 import { createJiti } from 'jiti';
 import fs from 'node:fs';
@@ -51,6 +51,14 @@ fs.writeFileSync(join(dir,'.pi','agents','controlled.md'),'---\nname: controlled
 const tools=[];
 (await jiti.import(new URL('../index.ts',import.meta.url).pathname)).default({registerTool:t=>tools.push(t)});
 const tool=tools[0];
+// 宿主授权：这些用例需要跳过项目级确认，只有宿主显式授权后才允许；测试结束恢复原状。
+const TRUST_ENV = 'PI_SUBAGENT_TRUST_PROJECT_AGENTS';
+const previousTrust = process.env[TRUST_ENV];
+process.env[TRUST_ENV] = 'true';
+after(() => {
+	if (previousTrust === undefined) delete process.env[TRUST_ENV];
+	else process.env[TRUST_ENV] = previousTrust;
+});
 const base={agentScope:'project',confirmProjectAgents:false};
 const ctx={cwd:dir,hasUI:false};
 async function withScript(code,fn) {
@@ -168,7 +176,7 @@ for (const mode of ['once', 'repeat', 'close', 'progress']) test(`独立宿主�
  await new Promise(r=>setTimeout(r,150));assert.equal(updates,count);
  console.log(JSON.stringify({mode,updates,throws,usage,closed:pids.length}));
  `);
- const outcome=spawnSync(process.execPath,[host],{encoding:'utf8',timeout:20000});
+ const outcome=spawnSync(process.execPath,[host],{encoding:'utf8',timeout:20000,env:{...process.env,[TRUST_ENV]:'true'}});
  assert.equal(outcome.error,undefined);
  assert.equal(outcome.status,0,`${outcome.stdout}\n${outcome.stderr}`);
  const audit=JSON.parse(outcome.stdout.trim());

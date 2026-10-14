@@ -2,6 +2,8 @@
 export interface SearchRequestConfig {
 	retries: number;
 	timeoutMs: number;
+	/** 整次调用（所有通道、重试、退避等待与正文落盘合计）的总时间预算上限。 */
+	totalTimeoutMs: number;
 }
 
 function readInteger(env: NodeJS.ProcessEnv, name: string, fallback: number, min: number, max: number): number {
@@ -18,5 +20,6 @@ export function readSearchRequestConfig(env: NodeJS.ProcessEnv = process.env): S
 	return {
 		retries: readInteger(env, "PI_WEB_SEARCH_RETRIES", 1, 0, 3),
 		timeoutMs: readInteger(env, "PI_WEB_SEARCH_TIMEOUT_MS", 25_000, 100, 120_000),
+		totalTimeoutMs: readInteger(env, "PI_WEB_SEARCH_TOTAL_TIMEOUT_MS", 90_000, 1_000, 600_000),
 	};
 }
