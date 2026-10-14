@@ -199,7 +199,17 @@ pi -e ~/pi-extensions/extensions/web-search/index.ts
 
 其它参数：`agentScope`（`user` / `project` / `both`）、`confirmProjectAgents`、`maxOutputChars`、`maxPreviousChars`、`cwd`。
 
-项目级定义默认需要确认；无交互界面且 `confirmProjectAgents=true` 时拒绝执行请求中的项目级定义，用户级定义不受影响。`confirmProjectAgents=false` 只表示本次调用显式跳过确认，不建立持久信任或白名单，应仅由可信调用方使用。
+项目级定义默认需要确认；无交互界面且未获宿主授权时拒绝执行请求中的项目级定义，用户级定义不受影响。
+
+信任边界：`confirmProjectAgents=false` 是**模型可控的工具参数**，只表示“本次调用请求跳过确认”，本身不构成可信授权，也不会建立任何持久信任或白名单。真正跳过项目级确认只能由宿主环境变量授权：
+
+| 环境变量 | 默认 | 说明 |
+| --- | --- | --- |
+| `PI_SUBAGENT_TRUST_PROJECT_AGENTS` | 未设置 | 只接受严格的 `true` / `false`（首尾空白允许），非法值在工具执行开始显式报错且不回显原值。只有显式为 `true` 时，模型传 `confirmProjectAgents:false` 才真正跳过确认 |
+
+未设置或为 `false` 时，模型即使传 `confirmProjectAgents:false` 也按需确认：有 UI 时询问，无 UI 时拒绝，不会被静默放行。模型传 `true` 或省略时行为不变（有 UI 询问、无 UI 拒绝）。
+
+授权值校验发生在启动任何子进程之前，因此“参数模式错误 + 授权值非法”同时出现时会先报配置错误；调用方应先修正环境变量。
 
 执行期固定上限：标准输出单行 1 MiB、标准错误尾部 64 KiB、消息缓存 256 条且总计 2 MiB、工具去重标识 1024 个且单个不超过 4 KiB。缓存淘汰会在结果详情中标记；单行或去重超限会停止进程并明确失败，用量可能不完整。正常退出码为零才视为成功；信号退出记录信号并判为失败。进程退出后只允许排空管道 1 秒，逾期关闭本地管道并报告输出不完整，不将其视为成功。
 
@@ -310,7 +320,7 @@ Pi 的内置工具只有 `read` / `bash` / `edit` / `write` / `grep` / `find` / 
 
 > **与 npm 上同名包 `pi-web-search` 的区别**：本扩展直接连接 Exa / Parallel 的远程模型上下文协议（Model Context Protocol，MCP）端点，并通过原生 REST 接口调用 Tavily、Firecrawl 与 SerpApi。本扩展不发布到 npm，只通过上面的 GitHub 安装方式分发。
 
-## 状态：v0.7.0-beta.3
+## 状态：v0.7.0-beta.4
 
 搜索已具备混合额度管理（Quota Manager）与按原因区分的持久冷却，匿名候选顺序为 **Exa → Tavily → Parallel → Firecrawl → TinyFish（keyless）**；计费候选顺序独立维护，Exa 仍排第一。当前不扩展搜索服务商、不做质量评分或结果融合。
 
@@ -385,8 +395,9 @@ Pi 的内置工具只有 `read` / `bash` / `edit` / `write` / `grep` / `find` / 
 | `PI_WEB_SEARCH_MAX_RESPONSE_BYTES` | `5242880` | 解压后响应体上限，默认 5 MiB；只接受十进制正整数 `1` 至 `20971520`（20 MiB），首尾空白允许，非法配置在读取凭据或请求前报错 |
 | `PI_WEB_SEARCH_TIMEOUT_MS` | `25000` | 单次请求预算，接受 `100` 至 `120000` 毫秒的安全整数 |
 | `PI_WEB_SEARCH_RETRIES` | `1` | 可重试错误的重试次数，接受 `0` 至 `3` 的安全整数；`0` 表示不重试，单次退避等待最多 5 秒 |
+| `PI_WEB_SEARCH_TOTAL_TIMEOUT_MS` | `90000` | 整次 `web_search` 调用的绝对时间预算，接受 `1000` 至 `600000` 毫秒的安全整数。额度预检、各通道尝试、重试退避与正文落盘共同遵守；预算耗尽立即结束本次调用并不再尝试后续通道，与单请求超时分别归类 |
 
-超时和重试配置在每次工具调用入口读取并校验一次；缺失或空白采用默认值，其他非法、越界或非安全整数配置在读取凭据及任何网络请求前明确报错，不回显原始配置值。超时限制是单次请求预算，不是所有通道和重试合计的总期限。
+超时和重试配置在每次工具调用入口读取并校验一次；缺失或空白采用默认值，其他非法、越界或非安全整数配置在读取凭据及任何网络请求前明确报错，不回显原始配置值。`PI_WEB_SEARCH_TIMEOUT_MS` 是单次请求预算，`PI_WEB_SEARCH_TOTAL_TIMEOUT_MS` 是整次调用上限：退避等待与单请求等待都可被两者中先到期者中断，外部取消优先级最高。落盘只在调用前核对总预算，写盘过程本身不可中断。
 
 默认拒绝所有密钥通道时，搜索不会读取任何 provider 密钥环境变量或系统密钥库。所有已配置密钥均按可能计费处理；本轮只查询余额，不从余额推断免费资格，也不构造 `free-key` 通道。Firecrawl 请求与计费说明见[搜索文档](https://docs.firecrawl.dev/features/search)和[计费文档](https://docs.firecrawl.dev/billing)。
 

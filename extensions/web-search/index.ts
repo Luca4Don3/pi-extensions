@@ -186,6 +186,21 @@ class QuotaPreflightError extends BackendError {
 	}
 }
 
+/** 整次调用总预算耗尽：与单请求超时区分；出现后不再尝试任何后续通道。 */
+class TotalBudgetError extends BackendError {
+	constructor(attempts = 0) {
+		super("整次搜索的总时间预算已用尽，未再尝试后续通道", "budget_exhausted");
+		this.attempts = attempts;
+	}
+}
+
+/** 整次调用的绝对截止时间：额度预检、各通道尝试、退避等待与正文落盘共同遵守。 */
+class TotalBudget {
+	constructor(readonly deadlineMs: number) { }
+	remainingMs(): number { return this.deadlineMs - Date.now(); }
+	get exhausted(): boolean { return this.remainingMs() <= 0; }
+}
+
 /** 额度预检失败原因映射为固定中文诊断；不含任何凭据或上游原文。 */
 function quotaPreflightMessage(reason: string): string {
 	switch (reason) {
@@ -230,18 +245,34 @@ function waitForControllerAbort<T>(promise: Promise<T>, controller: AbortControl
 
 /** 后端错误信息不再在内部预截断：截断必须发生在脱敏之后（见 safeDiagnostic）。 */
 
-/** 可被 AbortSignal 立即打断的等待。 */
-function sleep(ms: number, signal?: AbortSignal): Promise<void> {
+/** 可被外部取消与整次调用截止时间同时中断的等待；超时后不再无界 sleep。 */
+function sleep(ms: number, signal?: AbortSignal, deadlineMs?: number): Promise<void> {
 	return new Promise((resolve, reject) => {
+		let timer: ReturnType<typeof setTimeout>;
 		const abort = (): void => {
 			clearTimeout(timer);
 			signal?.removeEventListener("abort", abort);
 			reject(createAbortError());
 		};
-		const timer = setTimeout(() => {
+		// 外部取消优先级最高：同时到期也按取消报告。
+		const expire = (): void => {
+			clearTimeout(timer);
+			signal?.removeEventListener("abort", abort);
+			reject(isAborted(signal) ? createAbortError() : new TotalBudgetError());
+		};
+		let wait = ms;
+		if (deadlineMs !== undefined) {
+			const remaining = deadlineMs - Date.now();
+			if (remaining <= 0) {
+				expire();
+				return;
+			}
+			wait = Math.min(wait, remaining);
+		}
+		timer = setTimeout(() => {
 			signal?.removeEventListener("abort", abort);
 			resolve();
-		}, ms);
+		}, wait);
 		if (isAborted(signal)) {
 			abort();
 			return;
@@ -475,6 +506,7 @@ async function searchChannel(
 	maxResponseBytes: number,
 	quotaContext: QuotaSearchContext,
 	requestConfig: SearchRequestConfig,
+	budget: TotalBudget,
 	signal?: AbortSignal,
 ): Promise<{ text: string; sources: WebSource[]; attempts: number }> {
 	const { timeoutMs, retries } = requestConfig;
@@ -516,15 +548,20 @@ async function searchChannel(
 
 	/** 执行一次请求；失败一律以带分类的 BackendError 抛出。 */
 	const attempt = async (): Promise<{ text: string; sources: WebSource[] }> => {
+		// 每次尝试前先核对总预算：外部取消优先级最高，其次耗尽预算。
+		if (isAborted(signal)) throw createAbortError();
+		if (budget.exhausted) throw new TotalBudgetError(attempts);
 		let reservation: { dispatch(): boolean; release(): boolean; settle(actualCost?: number): boolean } | undefined;
 		let dispatched = false;
-		// 一个控制器同时承担调用方取消与超时预算：预算耗尽算超时，调用方取消按取消处理。
+		// 一个控制器同时承担调用方取消、单请求预算与整次调用剩余预算：先到期者中止请求。
 		const controller = new AbortController();
 		let timedOut = false;
+		// 单请求预算不超过整次调用剩余预算，使两者可在同一控制器上区分先后。
+		const singleWait = Math.max(1, Math.min(timeoutMs, budget.remainingMs()));
 		const timer = setTimeout(() => {
 			timedOut = true;
 			controller.abort();
-		}, timeoutMs);
+		}, singleWait);
 		const onAbort = (): void => controller.abort(signal?.reason);
 		if (isAborted(signal)) {
 			clearTimeout(timer);
@@ -676,6 +713,8 @@ async function searchChannel(
 			return { text, sources };
 		} catch (error) {
 			if (isAborted(signal)) throw createAbortError();
+			// 总预算耗尽优先于单请求超时：timer 一旦到期即可能由剩余预算触发。
+			if (budget.exhausted) throw new TotalBudgetError(attempts);
 			const failure = timedOut
 				? new BackendError(`${backend} timed out after ${timeoutMs}ms`, "timeout")
 				: error instanceof BackendError
@@ -707,12 +746,15 @@ async function searchChannel(
 			return { ...result, attempts: attempts + 1 };
 		} catch (error) {
 			if (isAborted(signal)) throw createAbortError();
+			// 预算耗尽立即结束本通道，错误直接透传给调用方，不再重试。
+			if (error instanceof TotalBudgetError) throw error;
 			const dispatchedAttempts = error instanceof BackendError ? error.attempts : 0;
 			attempts += dispatchedAttempts;
 			if (error instanceof BackendError) error.attempts = attempts;
 			if (!(error instanceof BackendError) || !error.retryable || error.kind === "rate_limited" || round >= retries) throw error;
-			// 退避等待可被取消打断；Retry-After 影响退避但等待最多 5 秒。
-			await sleep(Math.min(RETRY_MAX_WAIT_MS, Math.max(RETRY_BASE_MS * 2 ** round, error.retryAfterMs ?? 0)), signal);
+			// 退避前核对剩余预算，等待可被截止时间与外部取消同时中断。
+			if (budget.exhausted) throw new TotalBudgetError(attempts);
+			await sleep(Math.min(RETRY_MAX_WAIT_MS, Math.max(RETRY_BASE_MS * 2 ** round, error.retryAfterMs ?? 0)), signal, budget.deadlineMs);
 		}
 	}
 }
@@ -755,6 +797,8 @@ export default function piWebSearch(pi: ExtensionAPI, options: WebSearchOptions 
 		annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
 		async execute(_toolCallId, params, signal) {
 			const requestConfig = readSearchRequestConfig();
+			// 整次调用总预算：在任何网络请求与凭据读取之前锚定绝对截止时间。
+			const budget = new TotalBudget(Date.now() + requestConfig.totalTimeoutMs);
 			const query = params.query.trim();
 			if (query.length === 0) throw new Error("query must not be empty");
 			if (isAborted(signal)) throw createAbortError();
@@ -791,6 +835,15 @@ export default function piWebSearch(pi: ExtensionAPI, options: WebSearchOptions 
 
 			for (const candidate of candidates) {
 				if (isAborted(signal)) throw createAbortError();
+				// 总预算耗尽后不再尝试任何后续通道，直接带着已有失败记录结束。
+				if (budget.exhausted) {
+					failures.push({
+						label: stepLabel(candidate),
+						kind: "budget_exhausted",
+						message: new TotalBudgetError().message,
+					});
+					break;
+				}
 				if (channelHealth !== undefined && config.freeCooldownMs > 0) {
 					const cooldown = channelHealth.getCooldown(candidate.backend, candidate.channel);
 					if (cooldown !== undefined) {
@@ -816,6 +869,7 @@ export default function piWebSearch(pi: ExtensionAPI, options: WebSearchOptions 
 						maxResponseBytes,
 						quotaContext,
 						requestConfig,
+						budget,
 						signal,
 					);
 					attemptCount += attempts;
@@ -836,7 +890,10 @@ export default function piWebSearch(pi: ExtensionAPI, options: WebSearchOptions 
 					let spill: SpillResult | undefined;
 					let fullTextWarning: string | undefined;
 					if (outcome.truncated) {
-						try {
+						// 只在调用前核对预算；写盘过程本身不可中断，预算用尽时跳过落盘而不是写一半放弃。
+						if (budget.exhausted) {
+							fullTextWarning = "正文已截断；总时间预算已用尽，跳过完整正文落盘。";
+						} else try {
 							spill = await spillFullText(text);
 						} catch {
 							// 落盘失败不代表搜索失败：结果已经拿到，只丢掉它会让这次已发出的
@@ -879,6 +936,12 @@ export default function piWebSearch(pi: ExtensionAPI, options: WebSearchOptions 
 					};
 				} catch (error) {
 					if (isAborted(signal)) throw createAbortError();
+					// 预算耗尽意味着不再有后续通道：记录后直接结束本次调用。
+					if (error instanceof TotalBudgetError) {
+						attemptCount += error.attempts;
+						failures.push({ label: stepLabel(step), kind: "budget_exhausted", message: error.message });
+						break;
+					}
 					attemptCount += error instanceof BackendError ? error.attempts : 0;
 					failures.push({
 						label: stepLabel(step),

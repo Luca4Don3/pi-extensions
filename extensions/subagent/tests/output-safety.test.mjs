@@ -107,6 +107,18 @@ mkdirSync(join(dir, '.pi', 'agents'), {recursive: true});
 writeFileSync(join(dir, '.pi', 'agents', 'safety.md'), '---\nname: safety\ndescription: 测试\n---\n测试');
 const params = {agent: 'safety', task: '测试', agentScope: 'project'};
 
+// 宿主授权辅助：只在测试内显式设置，结束一律恢复原状。
+const TRUST_ENV = 'PI_SUBAGENT_TRUST_PROJECT_AGENTS';
+async function withHostTrust(value, fn) {
+	const previous = process.env[TRUST_ENV];
+	if (value === undefined) delete process.env[TRUST_ENV];
+	else process.env[TRUST_ENV] = value;
+	try { return await fn(); } finally {
+		if (previous === undefined) delete process.env[TRUST_ENV];
+		else process.env[TRUST_ENV] = previous;
+	}
+}
+
 test("无 UI 的项目确认必须拒绝，单个、并行、链均不启动", async () => {
 	for (const p of [params, {tasks:[{agent:'safety',task:'测试'}],agentScope:'project'}, {chain:[{agent:'safety',task:'测试'}],agentScope:'both'}]) {
 		const r = await tool.execute('id', {...p,confirmProjectAgents:true}, undefined, undefined, {cwd:dir,hasUI:false});
@@ -115,12 +127,55 @@ test("无 UI 的项目确认必须拒绝，单个、并行、链均不启动", a
 	}
 });
 
+test("信任边界：未授权时模型传 false，无 UI 必须拒绝且不启动", async () => {
+	const r = await withHostTrust(undefined, () => tool.execute('id', {...params, confirmProjectAgents: false}, undefined, undefined, {cwd: dir, hasUI: false}));
+	assert.equal(r.isError, true);
+	assert.match(r.content[0].text, /没有可用 UI/);
+	assert.deepEqual(r.details.results, []);
+});
+
+test("信任边界：未授权时模型传 false，有 UI 必须真的询问", async () => {
+	const asked = [];
+	const ui = {confirm: async (title, body) => { asked.push({title, body}); return false; }};
+	const r = await withHostTrust(undefined, () => tool.execute('id', {...params, confirmProjectAgents: false}, undefined, undefined, {cwd: dir, hasUI: true, ui}));
+	assert.equal(asked.length, 1, '宿主未授权时不得因参数 false 跳过确认');
+	assert.match(asked[0].body, /safety/);
+	assert.equal(r.isError, true);
+	assert.match(r.content[0].text, /Canceled/);
+	assert.deepEqual(r.details.results, []);
+});
+
+test("信任边界：宿主授权后 false 才真正跳过确认，无 UI 也执行", async () => {
+	const script = join(dir, 'trust-skip.cjs');
+	writeFileSync(script, `console.log(JSON.stringify({type:'message_end',message:{role:'assistant',content:[{type:'text',text:'授权跳过'}],usage:{input:1},stopReason:'stop'}}));`);
+	const previous = process.argv[1]; process.argv[1] = script;
+	const asked = [];
+	const ui = {confirm: async (title, body) => { asked.push({title, body}); return true; }};
+	try {
+		const r = await withHostTrust('true', () => tool.execute('id', {...params, confirmProjectAgents: false}, undefined, undefined, {cwd: dir, hasUI: true, ui}));
+		assert.equal(asked.length, 0, '宿主已授权时不应再询问');
+		assert.notEqual(r.isError, true);
+		assert.match(r.content[0].text, /授权跳过/);
+		const noUi = await withHostTrust('true', () => tool.execute('id', {...params, confirmProjectAgents: false}, undefined, undefined, {cwd: dir, hasUI: false}));
+		assert.notEqual(noUi.isError, true);
+		assert.match(noUi.content[0].text, /授权跳过/);
+	} finally { process.argv[1] = previous; }
+});
+
+test("信任边界：授权值非法时显式报错且不回显原值", async () => {
+	const r = await withHostTrust('TrUe', () => tool.execute('id', {...params, confirmProjectAgents: false}, undefined, undefined, {cwd: dir, hasUI: false}));
+	assert.equal(r.isError, true);
+	assert.match(r.content[0].text, /PI_SUBAGENT_TRUST_PROJECT_AGENTS 必须为 true 或 false/);
+	assert.doesNotMatch(r.content[0].text, /TrUe/);
+	assert.deepEqual(r.details.results, []);
+});
+
 test("真实输出淘汰不重复统计用量，false 不新增信任状态", async () => {
 	const script = join(dir, 'child.cjs');
 	writeFileSync(script, `for(let i=0;i<300;i++) console.log(JSON.stringify({type:'message_end',message:{role:'assistant',content:[{type:'text',text:'中文😀'+i}],usage:{input:1,output:2},stopReason:'stop'}}));`);
 	const previous = process.argv[1]; process.argv[1] = script;
 	try {
-		const r = await tool.execute('id', {...params,confirmProjectAgents:false}, undefined, undefined, {cwd:dir,hasUI:false});
+		const r = await withHostTrust('true', () => tool.execute('id', {...params,confirmProjectAgents:false}, undefined, undefined, {cwd:dir,hasUI:false}));
 		assert.notEqual(r.isError, true);
 		assert.equal(r.details.results[0].usage.turns, 300);
 		assert.equal(r.details.results[0].usage.input, 300);
@@ -155,7 +210,7 @@ test("真实超大 stdout 单行停止子进程并显式失败", async () => {
 	writeFileSync(script, `process.stdout.write('x'.repeat(1048577)); setInterval(()=>{},1000);`);
 	const previous = process.argv[1]; process.argv[1] = script;
 	try {
-		const r = await tool.execute('id', {...params,confirmProjectAgents:false}, undefined, undefined, {cwd:dir,hasUI:false});
+		const r = await withHostTrust('true', () => tool.execute('id', {...params,confirmProjectAgents:false}, undefined, undefined, {cwd:dir,hasUI:false}));
 		assert.equal(r.isError, true); assert.match(r.content[0].text, /1048576/);
 	} finally { process.argv[1] = previous; }
 });
@@ -181,7 +236,7 @@ setInterval(()=>{},1000);
 `);
 		const previous = process.argv[1]; process.argv[1] = script;
 		try {
-			const r = await tool.execute('id', {...params,confirmProjectAgents:false}, undefined, undefined, {cwd:dir,hasUI:false});
+			const r = await withHostTrust('true', () => tool.execute('id', {...params,confirmProjectAgents:false}, undefined, undefined, {cwd:dir,hasUI:false}));
 			assert.equal(r.isError, true);
 			assert.equal(r.details.results.length, 1);
 			const result = r.details.results[0];
@@ -212,7 +267,7 @@ for(let i=0;i<2;i++) emit({type:'message_end',message:{role:'assistant',content:
 `);
 	const previous = process.argv[1]; process.argv[1] = script;
 	try {
-		const r = await tool.execute('id', {...params,confirmProjectAgents:false}, undefined, undefined, {cwd:dir,hasUI:false});
+		const r = await withHostTrust('true', () => tool.execute('id', {...params,confirmProjectAgents:false}, undefined, undefined, {cwd:dir,hasUI:false}));
 		assert.notEqual(r.isError, true);
 		const result = r.details.results[0];
 		assert.equal(result.messages.length, 1);

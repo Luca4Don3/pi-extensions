@@ -477,6 +477,26 @@ const AgentScopeSchema = StringEnum(["user", "project", "both"] as const, {
 	default: "user",
 });
 
+/**
+ * 宿主授权用的环境变量名：只有宿主显式把它设为 true 时，
+ * 才允许跳过项目级 agent 的确认。
+ *
+ * 该授权刻意不由工具参数提供：confirmProjectAgents 是模型可控输入，
+ * 模型传 false 只表示“本次调用请求跳过确认”，本身不是可信授权。
+ */
+export const TRUST_PROJECT_AGENTS_ENV = "PI_SUBAGENT_TRUST_PROJECT_AGENTS";
+
+/** 读取宿主授权；未设置视为未授权；非法值显式报错且不回显原值。 */
+export function readTrustProjectAgents(env: Record<string, string | undefined> = process.env): boolean {
+	const raw = env[TRUST_PROJECT_AGENTS_ENV];
+	if (raw === undefined) return false;
+	const value = raw.trim();
+	if (value !== "true" && value !== "false") {
+		throw new Error(`${TRUST_PROJECT_AGENTS_ENV} 必须为 true 或 false`);
+	}
+	return value === "true";
+}
+
 const SubagentParams = Type.Object({
 	agent: Type.Optional(Type.String({ description: "Name of the agent to invoke (for single mode)" })),
 	task: Type.Optional(Type.String({ description: "Task to delegate (for single mode)" })),
@@ -484,7 +504,12 @@ const SubagentParams = Type.Object({
 	chain: Type.Optional(Type.Array(ChainItem, { description: "Array of {agent, task} for sequential execution" })),
 	agentScope: Type.Optional(AgentScopeSchema),
 	confirmProjectAgents: Type.Optional(
-		Type.Boolean({ description: "Prompt before running project-local agents. Default: true.", default: true }),
+		Type.Boolean({
+			description:
+				"Request to skip the project-agent confirmation for this call. Default: true. " +
+				"This is model-controlled input, not a trusted authorization: the skip only takes effect when the host sets PI_SUBAGENT_TRUST_PROJECT_AGENTS=true.",
+			default: true,
+		}),
 	),
 	maxOutputChars: Type.Optional(
 		Type.Number({ description: "Max characters returned to the main agent. Default: 800.", default: 800 }),
@@ -509,6 +534,7 @@ export default function (pi: ExtensionAPI) {
 			"",
 			"Modes: single (agent + task), parallel (tasks array), chain (sequential with {previous} placeholder).",
 			'Default agent scope is "user" (~/.pi/agent/agents). Set agentScope: "both" or "project" to include project-local agents.',
+			"Project-local agents require confirmation unless the host authorizes skipping it with PI_SUBAGENT_TRUST_PROJECT_AGENTS=true; the confirmProjectAgents parameter is model-controlled and never grants that trust.",
 		].join("\n"),
 		promptSnippet:
 			"Delegate a self-contained task to an isolated subagent (scout / planner / coder / reviewer) when raw output would flood your context",
@@ -567,6 +593,18 @@ export default function (pi: ExtensionAPI) {
 					results: results.map((r) => compactResultForDetails(r, getResultOutputLimit(r))),
 				});
 
+			// 信任边界：环境配置非法在使用前显式失败，不回显原值。
+			let hostTrustsProjectAgents = false;
+			try {
+				hostTrustsProjectAgents = readTrustProjectAgents(process.env);
+			} catch (error) {
+				return {
+					content: [{ type: "text", text: `配置错误：${(error as Error).message}` }],
+					details: makeDetails("single")([]),
+					isError: true,
+				};
+			}
+
 			if (modeCount !== 1) {
 				const available = agents.map((a) => `${a.name} (${a.source})`).join(", ") || "none";
 				return {
@@ -580,7 +618,10 @@ export default function (pi: ExtensionAPI) {
 				};
 			}
 
-			if ((agentScope === "project" || agentScope === "both") && confirmProjectAgents) {
+			// confirmProjectAgents:false 只是模型请求跳过确认；只有宿主显式授权才真正跳过。
+			// 未设置或 false 一律按需确认：有 UI 询问，无 UI 拒绝，不静默放行。
+			const maySkipProjectConfirm = confirmProjectAgents === false && hostTrustsProjectAgents;
+			if ((agentScope === "project" || agentScope === "both") && !maySkipProjectConfirm) {
 				const requestedAgentNames = new Set<string>();
 				if (params.chain) for (const step of params.chain) requestedAgentNames.add(step.agent);
 				if (params.tasks) for (const t of params.tasks) requestedAgentNames.add(t.agent);
