@@ -1,17 +1,14 @@
 {
   "name": "@luca4don3/pi-extensions",
   "version": "0.7.0-beta.4",
-  "description": "A collection of independently installable Pi extensions: web-search, web-fetch, subagent, chinese-prompt, and opencode-fallback.",
+  "description": "A collection of independently installable Pi extensions: subagent, chinese-prompt, and opencode-fallback.",
   "type": "module",
   "keywords": [
     "pi-package",
     "pi",
     "pi-extension",
     "pi-extensions",
-    "web-search",
-    "websearch",
-    "exa",
-    "parallel",
+    "subagent",
     "mcp"
   ],
   "license": "MIT",
@@ -40,7 +37,6 @@
   },
   "scripts": {
     "typecheck": "node node_modules/typescript/bin/tsc --project tsconfig.json",
-    "test": "node --test extensions/*/tests/*.test.mjs",
-    "test:live": "node extensions/web-search/tests/smoke.mjs"
+    "test": "node --test extensions/*/tests/*.test.mjs"
   }
 }
