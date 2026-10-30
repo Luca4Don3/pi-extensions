@@ -49,7 +49,8 @@ const dir=fs.mkdtempSync(join(resolve('.temp'),'subagent-concurrency-'));
 fs.mkdirSync(join(dir,'.pi','agents'),{recursive:true});
 fs.writeFileSync(join(dir,'.pi','agents','controlled.md'),'---\nname: controlled\ndescription: 测试\n---\n测试');
 const tools=[];
-(await jiti.import(new URL('../index.ts',import.meta.url).pathname)).default({registerTool:t=>tools.push(t)});
+const TASK_CTX={model:{provider:'test',id:'test'},thinkingLevel:'medium'};
+(await jiti.import(new URL('../index.ts',import.meta.url).pathname)).default({registerTool:t=>{const run=t.execute.bind(t);t.execute=(id,params,signal,onUpdate,ctx)=>run(id,params,signal,onUpdate,{...TASK_CTX,...(ctx??{})});tools.push(t);},getThinkingLevel:()=>'medium'});
 const tool=tools[0];
 // 宿主授权：这些用例需要跳过项目级确认，只有宿主显式授权后才允许；测试结束恢复原状。
 const TRUST_ENV = 'PI_SUBAGENT_TRUST_PROJECT_AGENTS';
@@ -147,7 +148,8 @@ for (const mode of ['once', 'repeat', 'close', 'progress']) test(`独立宿主�
  import {join} from 'node:path';
  import {createJiti} from ${JSON.stringify(import.meta.resolve('jiti'))};
  const jiti=createJiti(import.meta.url),tools=[];
- (await jiti.import(${JSON.stringify(new URL('../index.ts',import.meta.url).pathname)})).default({registerTool:t=>tools.push(t)});
+ const TASK_CTX={model:{provider:'test',id:'test'},thinkingLevel:'medium'};
+ (await jiti.import(${JSON.stringify(new URL('../index.ts',import.meta.url).pathname)})).default({registerTool:t=>{const run=t.execute.bind(t);t.execute=(id,params,signal,onUpdate,ctx)=>run(id,params,signal,onUpdate,{...TASK_CTX,...(ctx??{})});tools.push(t);},getThinkingLevel:()=>'medium'});
  const live=${JSON.stringify(live)},mode=${JSON.stringify(mode)},prompts=[];
  const original=fs.promises.mkdtemp;
  fs.promises.mkdtemp=async(...args)=>{const p=await original(...args);prompts.push(p);return p;};

@@ -101,7 +101,15 @@ test("消息数量及总字节、去重集合及单标识字节均有界", () =>
 });
 
 const tools = [];
-(await jiti.import(new URL('../index.ts', import.meta.url).pathname)).default({registerTool: (t) => tools.push(t)});
+const TASK_CTX = {model: {provider: 'test', id: 'test'}, thinkingLevel: 'medium'};
+(await jiti.import(new URL('../index.ts', import.meta.url).pathname)).default({
+	registerTool: (t) => {
+		const run = t.execute.bind(t);
+		t.execute = (id, params, signal, onUpdate, ctx) => run(id, params, signal, onUpdate, {...TASK_CTX, ...(ctx ?? {})});
+		tools.push(t);
+	},
+	getThinkingLevel: () => 'medium',
+});
 const tool = tools[0];
 mkdirSync(join(dir, '.pi', 'agents'), {recursive: true});
 writeFileSync(join(dir, '.pi', 'agents', 'safety.md'), '---\nname: safety\ndescription: 测试\n---\n测试');

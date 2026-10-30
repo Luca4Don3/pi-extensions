@@ -167,7 +167,9 @@ pi -e ~/pi-extensions/extensions/subagent/index.ts
 ] }
 ```
 
-其它参数：`agentScope`（`user` / `project` / `both`）、`confirmProjectAgents`、`maxOutputChars`、`maxPreviousChars`、`cwd`。
+其它参数：`agentScope`（`user` / `project` / `both`）、`confirmProjectAgents`、`maxOutputChars`、`maxPreviousChars`、`cwd`、`model`、`thinking`。
+
+模型与思考等级：`model` 接受 `provider/id`，可带 `:thinking` 后缀，用于覆盖本次调用的模型；`thinking` 按任务指定思考等级，优先于模型后缀。两者都可以放在 single 顶层、`tasks[]` 或 `chain[]` 的每一项里。省略时继承主会话模型，思考等级按角色取保守默认（侦查 `low`，其他 `medium`），且任何取值都不得超过主会话当前等级；越界会在启动子进程前显式失败，不会等到链式执行中途才报错。
 
 项目级定义默认需要确认；无交互界面且未获宿主授权时拒绝执行请求中的项目级定义，用户级定义不受影响。
 

@@ -16,13 +16,14 @@ import { spawn } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import type { AgentToolResult } from "@earendil-works/pi-agent-core";
+import type { AgentToolResult, ThinkingLevel } from "@earendil-works/pi-agent-core";
 import type { Message } from "@earendil-works/pi-ai";
 import { StringEnum } from "@earendil-works/pi-ai";
 import { type ExtensionAPI, withFileMutationQueue } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { type AgentConfig, type AgentScope, discoverAgents } from "./agents.js";
+import { type ResolvedModelConfig, resolveModelConfig, THINKING_LEVELS } from "./model-config.js";
 import { waitForProcess } from "./process-lifecycle.js";
 import { getFinalOutput } from "./message-output.js";
 import { mapWithConcurrencyLimit } from "./concurrency.js";
@@ -149,6 +150,7 @@ interface SingleResult {
 	toolIdsTruncated?: boolean;
 	usage: UsageStats;
 	model?: string;
+	thinkingLevel?: ThinkingLevel;
 	stopReason?: string;
 	errorMessage?: string;
 	/** spawn 失败时的可行动诊断；正常退出时为空。 */
@@ -237,6 +239,8 @@ async function runSingleAgent(
 	signal: AbortSignal | undefined,
 	onUpdate: OnUpdateCallback | undefined,
 	makeDetails: (results: SingleResult[]) => SubagentDetails,
+	/** 本地定制：本任务的模型与思考等级，由调用前统一解析并校验。 */
+	modelConfig: ResolvedModelConfig,
 	maxOutputChars = DEFAULT_MAX_OUTPUT_CHARS,
 ): Promise<SingleResult> {
 	const agent = agents.find((a) => a.name === agentName);
@@ -256,7 +260,8 @@ async function runSingleAgent(
 	}
 
 	const args: string[] = ["--mode", "json", "-p", "--no-session", "--no-skills", "--no-prompt-templates"];
-	if (agent.model) args.push("--model", agent.model);
+	// 本地定制：模型与思考等级由调用前解析（含角色默认与主会话上限封顶）。
+	args.push("--model", modelConfig.model, "--thinking", modelConfig.thinkingLevel);
 	if (agent.tools && agent.tools.length > 0) args.push("--tools", agent.tools.join(","));
 
 	let tmpPromptDir: string | null = null;
@@ -270,7 +275,8 @@ async function runSingleAgent(
 		messages: [],
 		stderr: "",
 		usage: createUsageStats(),
-		model: agent.model,
+		model: modelConfig.model,
+		thinkingLevel: modelConfig.thinkingLevel,
 		step,
 		maxOutputChars,
 	};
@@ -460,16 +466,22 @@ async function runSingleAgent(
 	}
 }
 
+const TaskThinkingSchema = StringEnum(THINKING_LEVELS, {
+	description: "按本任务难度选择思考等级，不得高于主会话；优先于调用级 thinking。省略时侦查默认为 low，其他角色为 medium，并按主会话上限封顶。",
+});
+
 const TaskItem = Type.Object({
 	agent: Type.String({ description: "Name of the agent to invoke" }),
 	task: Type.String({ description: "Task to delegate to the agent" }),
 	cwd: Type.Optional(Type.String({ description: "Working directory for the agent process" })),
+	thinking: Type.Optional(TaskThinkingSchema),
 });
 
 const ChainItem = Type.Object({
 	agent: Type.String({ description: "Name of the agent to invoke" }),
 	task: Type.String({ description: "Task with optional {previous} placeholder for prior output" }),
 	cwd: Type.Optional(Type.String({ description: "Working directory for the agent process" })),
+	thinking: Type.Optional(TaskThinkingSchema),
 });
 
 const AgentScopeSchema = StringEnum(["user", "project", "both"] as const, {
@@ -518,6 +530,14 @@ const SubagentParams = Type.Object({
 		Type.Number({ description: "Max characters passed between chain steps. Default: 1200.", default: 1200 }),
 	),
 	cwd: Type.Optional(Type.String({ description: "Working directory for the agent process (single mode)" })),
+	model: Type.Optional(
+		Type.String({
+			minLength: 1,
+			description:
+				"覆盖本次调用的模型（适用于所有执行模式）；省略时继承主会话当前模型。接受 provider/id，可带 :thinking 后缀，后缀等级受主会话上限封顶。",
+		}),
+	),
+	thinking: Type.Optional(TaskThinkingSchema),
 });
 
 export default function (pi: ExtensionAPI) {
@@ -605,6 +625,30 @@ export default function (pi: ExtensionAPI) {
 				};
 			}
 
+			// 本地定制：启动前统一解析每个任务的模型与思考等级（含角色默认、
+			// 主会话上限封顶与 :thinking 后缀），任一端越界都在启动子进程前失败，
+			// 避免链式执行到一半才发现等级不可用。
+			let modelConfigs: ResolvedModelConfig[];
+			try {
+				const parentModelConfig = {
+					model: ctx.model,
+					thinkingLevel: ctx.thinkingLevel ?? pi.getThinkingLevel(),
+				};
+				const resolveTaskConfig = (agent: string, thinking?: ThinkingLevel) =>
+					resolveModelConfig(parentModelConfig, { model: params.model, thinking: thinking ?? params.thinking }, agent);
+				modelConfigs = hasChain
+					? params.chain!.map((step) => resolveTaskConfig(step.agent, step.thinking))
+					: hasTasks
+						? params.tasks!.map((task) => resolveTaskConfig(task.agent, task.thinking))
+						: [resolveTaskConfig(params.agent ?? "")];
+			} catch (error) {
+				return {
+					content: [{ type: "text", text: (error as Error).message }],
+					details: makeDetails("single")([]),
+					isError: true,
+				};
+			}
+
 			if (modeCount !== 1) {
 				const available = agents.map((a) => `${a.name} (${a.source})`).join(", ") || "none";
 				return {
@@ -686,6 +730,7 @@ export default function (pi: ExtensionAPI) {
 						signal,
 						chainUpdate,
 						makeDetails("chain"),
+						modelConfigs[i],
 						stepOutputLimit,
 					);
 					results.push(result);
@@ -773,6 +818,7 @@ export default function (pi: ExtensionAPI) {
 								}
 							},
 							makeDetails("parallel"),
+							modelConfigs[index],
 							getAgentOutputLimit(t.agent),
 						);
 						allResults[index] = result;
@@ -826,6 +872,7 @@ export default function (pi: ExtensionAPI) {
 					signal,
 					onUpdate,
 					makeDetails("single"),
+					modelConfigs[0],
 					getAgentOutputLimit(params.agent),
 				);
 				const isError = result.exitCode !== 0 || result.stopReason === "error" || result.stopReason === "aborted";
