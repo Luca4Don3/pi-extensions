@@ -27,3 +27,8 @@ rsync -a --delete --exclude tests --exclude node_modules \
 ```
 
 同步后检查 `git diff`，预期只保留本文件与入口文件的差异。
+
+## 兼容性验证
+
+- 已在 Pi 1.4.0（npm `latest`）验证：`/tps` 与 `/tps overrides` 命令、状态栏渲染、`session_start` / `message_start` / `message_update` / `agent_end` 事件正常
+- CI 使用 Pi `@latest`，Node 22 / 23 / 24
