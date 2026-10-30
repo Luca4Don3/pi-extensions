@@ -124,7 +124,7 @@ test("7. formatAgentList 的列表与剩余计数", () => {
 
 const indexModule = await jiti.import(fileURLToPath(new URL("../index.ts", import.meta.url)));
 const registeredTools = [];
-indexModule.default({ registerTool: (tool) => registeredTools.push(tool) });
+indexModule.default({ registerTool: (tool) => registeredTools.push(tool), getThinkingLevel: () => "medium" });
 const subagentTool = registeredTools[0];
 
 test("8. 注册 subagent 工具并暴露决策指南", () => {
