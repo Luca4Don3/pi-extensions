@@ -115,25 +115,15 @@ function ensureModelsJson(agentDir: string): void {
   }
 }
 
+import { PROVIDER_MODELS } from "./models.generated.ts";
+
 export default async function (pi: ExtensionAPI) {
-  const agentDir = getAgentDir();
-  ensureModelsJson(agentDir);
-  const cfg = readProviderConfig(agentDir);
-  const hasModels = Array.isArray(cfg?.models) && cfg.models.length > 0;
-
-  // Printed on every load so the number is visible in the session, not buried in
-  // a file the user would have to know to open.
-  console.error(`[opendesign-bridge] ${BRIDGE_VERSION} · agent dir ${agentDir}`);
-
   pi.registerProvider("opendesign", {
     name: `OpenDesign ${BRIDGE_VERSION}`,
     api: "openai-completions",
     authHeader: true,
-    // 本地定制：pi 1.4 下 refreshModels 会清空 models.json 的模型，
-    // 改为直接注册当前模型列表（models.json 优先，缺失时用 STATIC_MODELS）。
-    baseUrl: cfg?.baseUrl ?? OPENDESIGN_BASE_URL,
-    models: hasModels ? (cfg?.models ?? STATIC_MODELS) : STATIC_MODELS,
-    // 本地定制：网页设备授权登录，一次拿到 runtime key 与额度 control key。
+    baseUrl: OPENDESIGN_BASE_URL,
+    models: PROVIDER_MODELS,
     oauth: {
       name: "OpenDesign (account)",
       isSubscription: true,
@@ -143,28 +133,19 @@ export default async function (pi: ExtensionAPI) {
           userCode: device.userCode,
           verificationUri: device.activationUrl,
           intervalSeconds: Math.max(1, Math.round(device.intervalMs / 1000)),
-          expiresInSeconds: Math.max(
-            1,
-            Math.round((device.expiresAt - Date.now()) / 1000),
-          ),
+          expiresInSeconds: Math.max(1, Math.round((device.expiresAt - Date.now()) / 1000)),
         });
         const grant = await pollOpenDesignDeviceLogin(device, callbacks.signal);
-        // 顺带写入 usage 的额度配置；失败不影响模型登录。
         saveUsageControlKey(grant.controlKey);
-        return {
-          access: grant.runtimeKey,
-          refresh: grant.runtimeKey,
-          expires: Date.now() + 10 * 365 * 24 * 60 * 60 * 1000,
-        };
+        return { access: grant.runtimeKey, refresh: grant.runtimeKey, expires: Date.now() + 10 * 365 * 24 * 60 * 60 * 1000 };
       },
-      async refreshToken(credentials) {
-        return credentials;
-      },
-      getApiKey(credentials) {
-        return credentials.access;
-      },
+      async refreshToken(credentials) { return credentials; },
+      getApiKey(credentials) { return credentials.access; },
     },
   });
+  const agentDir = getAgentDir();
+  ensureModelsJson(agentDir);
+  console.error(`[opendesign-bridge] ${BRIDGE_VERSION} · agent dir ${agentDir}`);
 }
 
 // ── OpenDesign 设备授权（本地定制）─────────────────────────────────────────
