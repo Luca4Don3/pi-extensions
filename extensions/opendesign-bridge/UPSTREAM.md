@@ -15,6 +15,7 @@
 1. 保持上游的目录布局：`index.ts`、`opendesign-live.ts`、`donors-opendesign.ts` 原样收录，未修改逻辑。
 2. 新增本目录的 `package.json`，声明 `pi.extensions: ["./index.ts"]`，使其可作为独立 Pi 包安装，同时被根 manifest 的 `extensions/*/index.ts` 自动发现。
 3. 未收录上游的 `scripts/` 与 `README.md`（上游说明见其仓库）。
+4. `index.ts` 新增 `oauth` 网页登录（设备授权）：`/login opendesign` 选择 `OpenDesign (account)` 后展示授权链接与验证码，成功后把 runtime key 交给 pi、把 control key 写入 `~/.pi/agent/subscription-usage.json` 供额度查询使用。其余 provider 逻辑未改。
 
 ## 与 subscription-usage 的关系
 

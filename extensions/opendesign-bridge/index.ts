@@ -33,7 +33,7 @@
  * arrive through the live layer with probed values — no manual sync needed.
  */
 
-import { readFileSync } from "node:fs";
+import { readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { getAgentDir, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -87,5 +87,198 @@ export default async function (pi: ExtensionAPI) {
     // Mode 2 only: Mode 1 must not pass `models` (it would replace the
     // models.json list) and passes no `baseUrl` either, so models.json wins.
     ...(hasModels ? {} : { baseUrl: cfg?.baseUrl ?? OPENDESIGN_BASE_URL, models: STATIC_MODELS }),
+    // 本地定制：网页设备授权登录，一次拿到 runtime key 与额度 control key。
+    oauth: {
+      name: "OpenDesign (account)",
+      isSubscription: true,
+      async login(callbacks) {
+        const device = await startOpenDesignDeviceLogin();
+        callbacks.onDeviceCode({
+          userCode: device.userCode,
+          verificationUri: device.activationUrl,
+          intervalSeconds: Math.max(1, Math.round(device.intervalMs / 1000)),
+          expiresInSeconds: Math.max(
+            1,
+            Math.round((device.expiresAt - Date.now()) / 1000),
+          ),
+        });
+        const grant = await pollOpenDesignDeviceLogin(device, callbacks.signal);
+        // 顺带写入 usage 的额度配置；失败不影响模型登录。
+        saveUsageControlKey(grant.controlKey);
+        return {
+          access: grant.runtimeKey,
+          refresh: grant.runtimeKey,
+          expires: Date.now() + 10 * 365 * 24 * 60 * 60 * 1000,
+        };
+      },
+      async refreshToken(credentials) {
+        return credentials;
+      },
+      getApiKey(credentials) {
+        return credentials.access;
+      },
+    },
   });
+}
+
+// ── OpenDesign 设备授权（本地定制）─────────────────────────────────────────
+// 登录入口：/login opendesign → OpenDesign (account)。
+// 控制面凭据只发往 amr-api，模型 runtime key 由 pi 保存供 amr-link 使用。
+
+const CONTROL_ORIGIN = "https://amr-api.open-design.ai";
+const DEVICE_PATH = "/api/v1/cli/device-authorizations";
+const ACTIVATE_ORIGIN = "https://open-design.ai";
+const ACTIVATE_PATH = "/cloud/cli/activate";
+
+interface OpenDesignDeviceAuthorization {
+  activationUrl: string;
+  userCode: string;
+  deviceId: string;
+  deviceSecret: string;
+  expiresAt: number;
+  intervalMs: number;
+}
+
+async function startOpenDesignDeviceLogin(): Promise<OpenDesignDeviceAuthorization> {
+  const response = await fetch(`${CONTROL_ORIGIN}${DEVICE_PATH}`, {
+    method: "POST",
+    headers: {
+      Accept: "application/json",
+      "Content-Type": "application/json",
+      "User-Agent": "pi-opendesign-bridge",
+    },
+    body: JSON.stringify({
+      cliVersion: "0.1.4",
+      host: "pi-opendesign-bridge",
+      profile: "prod",
+    }),
+    redirect: "error",
+  });
+  if (!response.ok) {
+    throw new Error(
+      `OpenDesign device authorization returned HTTP ${response.status}.`,
+    );
+  }
+  const body = (await response.json()) as Record<string, unknown>;
+  const activationUrl = String(body.activationUrl ?? "").trim();
+  const userCode = String(body.userCode ?? "").trim();
+  const deviceId = String(body.deviceId ?? "").trim();
+  const deviceSecret = String(body.deviceSecret ?? "").trim();
+  const url = new URL(activationUrl);
+  if (
+    url.origin !== ACTIVATE_ORIGIN ||
+    url.pathname !== ACTIVATE_PATH ||
+    url.username ||
+    url.password ||
+    url.hash ||
+    !userCode ||
+    !deviceId ||
+    !deviceSecret ||
+    /[\u0000-\u001f\u007f]/.test(userCode + deviceId + deviceSecret)
+  ) {
+    throw new Error("OpenDesign device authorization response was not trusted.");
+  }
+  const parsedExpiry =
+    typeof body.expiresAt === "string" ? Date.parse(body.expiresAt) : Number.NaN;
+  const now = Date.now();
+  const expiresAt = Math.min(
+    Number.isFinite(parsedExpiry) ? parsedExpiry : now + 10 * 60 * 1000,
+    now + 15 * 60 * 1000,
+  );
+  if (expiresAt <= now) {
+    throw new Error("OpenDesign authorization code already expired.");
+  }
+  const seconds = Number(body.pollIntervalSeconds);
+  return {
+    activationUrl: url.href,
+    userCode,
+    deviceId,
+    deviceSecret,
+    expiresAt,
+    intervalMs:
+      Number.isFinite(seconds) && seconds > 0
+        ? Math.max(1000, seconds * 1000)
+        : 2000,
+  };
+}
+
+async function pollOpenDesignDeviceLogin(
+  device: OpenDesignDeviceAuthorization,
+  signal?: AbortSignal,
+): Promise<{ runtimeKey: string; controlKey: string }> {
+  while (Date.now() < device.expiresAt) {
+    if (signal?.aborted) throw new Error("OpenDesign login was cancelled.");
+    await new Promise((resolve) =>
+      setTimeout(resolve, Math.min(device.intervalMs, device.expiresAt - Date.now())),
+    );
+    if (signal?.aborted) throw new Error("OpenDesign login was cancelled.");
+    const response = await fetch(
+      `${CONTROL_ORIGIN}${DEVICE_PATH}/${encodeURIComponent(device.deviceId)}/token`,
+      {
+        method: "POST",
+        headers: {
+          Accept: "application/json",
+          "Content-Type": "application/json",
+          "User-Agent": "pi-opendesign-bridge",
+        },
+        body: JSON.stringify({ deviceSecret: device.deviceSecret }),
+        redirect: "error",
+        ...(signal ? { signal } : {}),
+      },
+    );
+    if (
+      response.status === 401 ||
+      response.status === 403 ||
+      response.status === 404
+    ) {
+      throw new Error("OpenDesign device authorization expired or was denied.");
+    }
+    if (!response.ok) continue;
+    const body = (await response.json()) as Record<string, unknown>;
+    const status = typeof body.status === "string" ? body.status.toLowerCase() : "";
+    if (
+      ["expired", "canceled", "cancelled", "denied", "rejected"].includes(status)
+    ) {
+      throw new Error("OpenDesign device authorization expired or was denied.");
+    }
+    if (status === "pending") continue;
+    const user =
+      body.user && typeof body.user === "object" && !Array.isArray(body.user)
+        ? (body.user as Record<string, unknown>)
+        : {};
+    const runtimeKey = String(body.runtimeKey ?? user.runtimeKey ?? "").trim();
+    const controlKey = String(body.controlKey ?? user.controlKey ?? "").trim();
+    if (
+      !/^sk-amr-[!-~]+$/.test(runtimeKey) ||
+      !/^vela_ctrl_[!-~]+$/.test(controlKey)
+    ) {
+      throw new Error("OpenDesign authorization did not return valid credentials.");
+    }
+    return { runtimeKey, controlKey };
+  }
+  throw new Error(
+    "OpenDesign authorization code expired; run /login opendesign again.",
+  );
+}
+
+function saveUsageControlKey(controlKey: string): void {
+  try {
+    const file = join(getAgentDir(), "subscription-usage.json");
+    let current: Record<string, unknown> = {};
+    try {
+      const parsed = JSON.parse(readFileSync(file, "utf8")) as unknown;
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+        current = parsed as Record<string, unknown>;
+      }
+    } catch {
+      // 没有配置文件或内容损坏时，从空对象开始。
+    }
+    writeFileSync(
+      file,
+      `${JSON.stringify({ ...current, opendesignControlKey: controlKey }, null, 2)}\n`,
+      { mode: 0o600 },
+    );
+  } catch {
+    // 额度配置写入失败不应让模型登录失败。
+  }
 }
