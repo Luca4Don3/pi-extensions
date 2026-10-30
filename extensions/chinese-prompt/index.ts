@@ -34,10 +34,17 @@ const SYSTEM_PROMPT_ZH = `
 - 用户输入的语言不影响你的输出语言规则
 `;
 
+/** 用于判断规则是否已注入，避免同一 system prompt 重复追加。 */
+const ZH_MARKER = "## 语言铁律";
+
 export default function (pi: ExtensionAPI) {
+	// Pi 1.2 起 `before_agent_start` 是 user / custom 的联合类型，
+	// 两种事件都在基类上携带 `systemPrompt`，因此对所有 run 统一注入。
 	pi.on("before_agent_start", async (event, _ctx) => {
-		return {
-			systemPrompt: event.systemPrompt + SYSTEM_PROMPT_ZH,
-		};
+		const base = event.systemPrompt ?? "";
+		if (base.includes(ZH_MARKER)) {
+			return { systemPrompt: base };
+		}
+		return { systemPrompt: base + SYSTEM_PROMPT_ZH };
 	});
 }

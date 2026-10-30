@@ -630,9 +630,17 @@ export default function (pi: ExtensionAPI) {
 			// 避免链式执行到一半才发现等级不可用。
 			let modelConfigs: ResolvedModelConfig[];
 			try {
+				// 兼容旧宿主：getThinkingLevel 在较新的 Pi 上才提供；缺失时给出明确错误，
+				// 而不是让子进程启动后才发现没有等级上限。
+				const parentThinking =
+					ctx.thinkingLevel ??
+					(typeof pi.getThinkingLevel === "function" ? pi.getThinkingLevel() : undefined);
+				if (!parentThinking) {
+					throw new Error("无法确认主会话的思考等级，拒绝启动子代理。");
+				}
 				const parentModelConfig = {
 					model: ctx.model,
-					thinkingLevel: ctx.thinkingLevel ?? pi.getThinkingLevel(),
+					thinkingLevel: parentThinking,
 				};
 				const resolveTaskConfig = (agent: string, thinking?: ThinkingLevel) =>
 					resolveModelConfig(parentModelConfig, { model: params.model, thinking: thinking ?? params.thinking }, agent);
