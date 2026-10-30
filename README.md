@@ -165,9 +165,11 @@ pi -e ~/pi-extensions/extensions/subagent/index.ts
 4. 根 `package.json` 的 `pi.extensions` 已用 glob（`extensions/*/index.ts`），通常无需改动
 5. 提交并推送；本地执行 `pi update` 拉取，再在 `settings.json` 的过滤列表里按需启用
 
-## 版本
+## 版本与兼容性
 
 根 `package.json` 的版本是集合版本，与各子包版本相互独立：根版本表示仓库整体发布，子包版本记录各插件自身的变更。`extensions/pi-token-speed` 的版本跟随上游收录时保持一致。具体版本号以各目录的 `package.json` 为准。
+
+最低支持 Pi 1.1.0，CI 使用最新稳定版（`@latest`）；`pi-token-speed` 自身要求 Pi >= 0.85.1。Node 侧要求 `>=22.19.0`（pi 1.4.0 的 engines 下限），因此 Node 20 / 21 不在支持范围，Node 22 / 24 为 LTS，Node 23 仅作非 LTS 回归。
 
 ---
 
@@ -408,7 +410,7 @@ for p in pi-ai pi-agent-core pi-tui; do
 done
 ```
 
-持续集成（CI）固定安装 `@earendil-works/pi-coding-agent@1.1.0`，在 Node.js 22 与 24 上执行严格类型检查及离线用例。类型检查覆盖扩展源码，测试及示例目录不纳入编译检查；测试由 `npm test` 单独执行。根 `tsconfig.json` 排除了 `extensions/pi-token-speed/**`，因为上游使用 bundler 风格的无扩展名相对导入，与 NodeNext 解析不一致；该目录运行时由 pi 的 jiti 加载，不受影响。持续集成成功不代表真实网络冒烟或安全审计已通过。
+持续集成（CI）在 Node.js 22、23 与 24 上执行，Pi 使用最新稳定版（`@latest`）以追踪上游 API 变化。Node 20 与 21 不在支持范围：pi 1.4.0 要求 Node >=22.19.0，旧版 `0.74.2` 虽支持 Node 20，但扩展使用的 `ctx.thinkingLevel`、`pi.getThinkingLevel()` 等 API 不在该版本中。类型检查覆盖扩展源码，测试及示例目录不纳入编译检查；测试由 `npm test` 单独执行。根 `tsconfig.json` 排除了 `extensions/pi-token-speed/**`，因为上游使用 bundler 风格的无扩展名相对导入，与 NodeNext 解析不一致；该目录运行时由 pi 的 jiti 加载，不受影响。持续集成成功不代表真实网络冒烟或安全审计已通过。
 
 本地执行 `npm run typecheck` 前，需安装并链接与工作流一致的 `typescript@5.9.3` 和 `@types/node@22.19.19`：
 
