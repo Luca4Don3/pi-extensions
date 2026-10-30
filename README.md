@@ -22,23 +22,33 @@ pi-extensions/
 ├── extensions/
 │   ├── subagent/
 │   │   ├── index.ts              # 工具入口
-│   │   ├── agents.ts             # agent 发现逻辑
+│   │   ├── agents.ts             # agent 发现
+│   │   ├── model-config.ts       # 模型与思考等级解析
+│   │   ├── concurrency.ts        # 并发调度
+│   │   ├── output-buffer.ts      # 输出缓冲与去重
+│   │   ├── process-lifecycle.ts  # 子进程生命周期
+│   │   ├── spawn-failure.ts      # 启动失败诊断
+│   │   ├── usage.ts              # 用量统计
+│   │   ├── message-output.ts     # 结果提取
 │   │   ├── examples/agents/      # 示例 agent 定义
-│   │   └── tests/mock.test.mjs
+│   │   └── tests/                # 离线测试
 │   ├── chinese-prompt/
 │   │   ├── index.ts
 │   │   └── package.json
 │   ├── opencode-fallback/
-│       ├── index.ts
-│       ├── package.json
-│       └── tests/mock.test.mjs
+│   │   ├── index.ts
+│   │   ├── package.json
+│   │   └── tests/                # 离线测试
 │   └── pi-token-speed/
 │       ├── index.ts              # 上游入口转发
+│       ├── package.json
 │       ├── src/                  # 上游 0.12.0 源码（MIT）
 │       ├── LICENSE.md
 │       └── UPSTREAM.md
 ├── .github/workflows/ci.yml
+├── tsconfig.json
 ├── package.json                  # 根 manifest：pi.extensions 声明所有插件入口
+├── LICENSE
 └── README.md
 ```
 
@@ -66,9 +76,17 @@ pi-extensions/
 
 这个仓库是**插件集合**，不是一个「装上就全用」的单一扩展。设计上仓库只是「存放位置 + 分发渠道」，**每个插件目录都是完整的独立包**，按需单独安装。
 
+当前仓库包含 4 个插件，用 git 源整仓安装会加载全部插件，再用 `pi config` 或过滤列表按需启用：
+
+```bash
+pi install git:github.com/Luca4Don3/pi-extensions
+```
+
+如果只想装其中几个，用方式一（按目录）或方式二（过滤）。
+
 Pi 的 git 源在源码层面把 `packageRoot` 固定为 clone 目录（`package-manager.js`：`metadata.packageRoot = installedPath`），所以 `pi install git:...` 只能按**仓库**粒度安装；要按**目录**粒度安装，用下面的本地路径源。
 
-### 方式一：克隆后按目录独立安装（推荐）
+### 方式一：克隆后按目录独立安装
 
 ```bash
 git clone https://github.com/Luca4Don3/pi-extensions ~/pi-extensions
@@ -110,13 +128,16 @@ pi install git:github.com/Luca4Don3/pi-extensions
   "packages": [
     {
       "source": "git:github.com/Luca4Don3/pi-extensions",
-      "extensions": ["extensions/subagent/index.ts"]
+      "extensions": [
+        "extensions/subagent/index.ts",
+        "extensions/pi-token-speed/index.ts"
+      ]
     }
   ]
 }
 ```
 
-写成字符串形式会加载 manifest 声明的**全部**插件，集合会越来越大，建议一律用对象形式。
+写成字符串形式会加载 manifest 声明的**全部**插件（当前为 subagent、chinese-prompt、opencode-fallback、pi-token-speed），集合会越来越大，建议一律用对象形式。
 
 ```bash
 pi update git:github.com/Luca4Don3/pi-extensions
@@ -143,6 +164,10 @@ pi -e ~/pi-extensions/extensions/subagent/index.ts
 3. 在 `extensions/<name>/tests/` 下补离线测试
 4. 根 `package.json` 的 `pi.extensions` 已用 glob（`extensions/*/index.ts`），通常无需改动
 5. 提交并推送；本地执行 `pi update` 拉取，再在 `settings.json` 的过滤列表里按需启用
+
+## 版本
+
+根 `package.json` 的版本是集合版本，与各子包版本相互独立：根版本表示仓库整体发布，子包版本记录各插件自身的变更。`extensions/pi-token-speed` 的版本跟随上游收录时保持一致。具体版本号以各目录的 `package.json` 为准。
 
 ---
 
@@ -286,7 +311,71 @@ cp extensions/subagent/examples/agents/*.md ~/.pi/agent/agents/
 
 代价说明：代理不可用时，上述四类模型会直接失败。这是「出口不漂移」的必然代价。
 
-## 已迁出的插件
+---
+
+# Token Speed
+
+在状态栏实时显示模型输出的 tokens-per-second（TPS）、首 token 延迟（TTFT）与 token 统计。本目录收录自上游 [pi-token-speed](https://github.com/gsanhueza/pi-token-speed)，来源、改动与同步方式见 [`extensions/pi-token-speed/UPSTREAM.md`](extensions/pi-token-speed/UPSTREAM.md)。
+
+## 显示内容
+
+| 显示模式 | 说明 |
+| --- | --- |
+| `tps`（默认） | 只显示实时 TPS，例如 `TPS: 42.0 tok/s` |
+| `ttft` | 附加首 token 延迟 |
+| `stats` | 附加输出 token 数与耗时 |
+| `full` | 同时附加统计与 TTFT |
+
+TPS 按滑动窗口计算，默认窗口 1 秒。四档速度阈值与颜色可在 `/tps` 菜单里调整。首轮流式开始前或空闲时显示 `TPS: --`。
+
+## 命令
+
+| 命令 | 作用 |
+| --- | --- |
+| `/tps` | 打开设置菜单：显示模式、图标、阈值、颜色、滑动窗口、更新间隔 |
+| `/tps overrides` | 按 provider 维护覆盖配置 |
+
+## 配置
+
+在 `~/.pi/agent/settings.json` 的 `tokenSpeed` 段配置，全部键可选：
+
+```json
+{
+  "tokenSpeed": {
+    "display": "tps",
+    "icon": "⚡",
+    "slidingWindow": 1000,
+    "updateInterval": 0,
+    "useProviderTokens": false,
+    "countStrategy": "direct",
+    "endTpsBehavior": "average",
+    "formatDuration": false,
+    "thresholds": { "slow": 0, "medium": 15, "fast": 30, "blazing": 45 },
+    "colors": {
+      "slow": "#ff4444",
+      "medium": "#ffaa00",
+      "fast": "#00ff88",
+      "blazing": "#44ddff"
+    },
+    "providerOverrides": {
+      "anthropic": { "display": "ttft", "thresholds": { "fast": 60 } }
+    }
+  }
+}
+```
+
+- `thresholds` / `colors` / `displayColors` 按档位合并，覆盖单个档位不会清空同组其它值
+- `providerOverrides` 按模型的 provider id 匹配，未写的键回落到基础配置
+- `display`、`icon`、阈值、颜色、`updateInterval` 在 provider 切换后立即生效；`slidingWindow` 等引擎侧键在下一轮流式开始时生效
+- 无效键会在会话开始时以警告提示并回落到默认值
+
+## 说明
+
+- `src/` 与上游 0.12.0 一致，未修改逻辑；入口 `index.ts` 只做转发，使启动列表与 `pi config` 显示 `pi-extensions:pi-token-speed`
+- 该目录被根 `tsconfig.json` 排除，不参与本地与 CI 类型检查，运行时由 pi 的 jiti 加载
+- 上游同步命令见 `UPSTREAM.md`
+
+# 已迁出的插件
 
 以下两个插件曾在本仓库内维护，现已合并并迁移到 [dsh-web-search](https://github.com/Luca4Don3/dsh-web-search)：
 
@@ -299,7 +388,7 @@ cp extensions/subagent/examples/agents/*.md ~/.pi/agent/agents/
 
 ## 开发与测试
 
-以下测试覆盖仓库内**所有**插件：
+以下测试覆盖仓库内自研的三个插件（`subagent`、`chinese-prompt`、`opencode-fallback`）；`pi-token-speed` 为上游收录代码，未包含其测试。
 
 ```bash
 # 离线自动化测试（使用网络与密钥库假实现）
@@ -319,7 +408,7 @@ for p in pi-ai pi-agent-core pi-tui; do
 done
 ```
 
-持续集成（CI）固定安装 `@earendil-works/pi-coding-agent@1.1.0`，在 Node.js 22 与 24 上执行严格类型检查及离线用例。类型检查覆盖扩展源码，测试及示例目录不纳入编译检查；测试由 `npm test` 单独执行。持续集成成功不代表真实网络冒烟或安全审计已通过。
+持续集成（CI）固定安装 `@earendil-works/pi-coding-agent@1.1.0`，在 Node.js 22 与 24 上执行严格类型检查及离线用例。类型检查覆盖扩展源码，测试及示例目录不纳入编译检查；测试由 `npm test` 单独执行。根 `tsconfig.json` 排除了 `extensions/pi-token-speed/**`，因为上游使用 bundler 风格的无扩展名相对导入，与 NodeNext 解析不一致；该目录运行时由 pi 的 jiti 加载，不受影响。持续集成成功不代表真实网络冒烟或安全审计已通过。
 
 本地执行 `npm run typecheck` 前，需安装并链接与工作流一致的 `typescript@5.9.3` 和 `@types/node@22.19.19`：
 
@@ -339,4 +428,8 @@ npm run typecheck
 
 ## License
 
-MIT
+本仓库整体采用 MIT，见根目录 [LICENSE](LICENSE)。
+
+### 第三方组件
+
+`extensions/pi-token-speed/` 收录自 [pi-token-speed](https://github.com/gsanhueza/pi-token-speed)，同样采用 MIT，版权归原作者 Gabriel Sanhueza。原始许可证见 [`extensions/pi-token-speed/LICENSE.md`](extensions/pi-token-speed/LICENSE.md)，收录版本、上游提交与改动记录见 [`UPSTREAM.md`](extensions/pi-token-speed/UPSTREAM.md)。
