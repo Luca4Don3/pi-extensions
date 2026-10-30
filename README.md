@@ -13,6 +13,7 @@
 | Subagent | `extensions/subagent/` | `pi install ~/pi-extensions/extensions/subagent` | 把任务委派给独立上下文的子 agent（single / parallel / chain） |
 | Chinese Prompt | `extensions/chinese-prompt/` | `pi install ~/pi-extensions/extensions/chinese-prompt` | 注入中文强约束 system prompt，推理与输出全程简体中文 |
 | OpenCode Fallback | `extensions/opencode-fallback/` | `pi install ~/pi-extensions/extensions/opencode-fallback` | 受限及未知模型固定代理，其余模型直连优先；模型请求不重放 |
+| Token Speed | `extensions/pi-token-speed/` | `pi install ~/pi-extensions/extensions/pi-token-speed` | 状态栏实时显示 TPS / TTFT / token 统计；收录自上游 pi-token-speed（MIT），见 `UPSTREAM.md` |
 
 ## 仓库结构
 
@@ -27,10 +28,15 @@ pi-extensions/
 │   ├── chinese-prompt/
 │   │   ├── index.ts
 │   │   └── package.json
-│   └── opencode-fallback/
+│   ├── opencode-fallback/
 │       ├── index.ts
 │       ├── package.json
 │       └── tests/mock.test.mjs
+│   └── pi-token-speed/
+│       ├── index.ts              # 上游入口转发
+│       ├── src/                  # 上游 0.12.0 源码（MIT）
+│       ├── LICENSE.md
+│       └── UPSTREAM.md
 ├── .github/workflows/ci.yml
 ├── package.json                  # 根 manifest：pi.extensions 声明所有插件入口
 └── README.md
