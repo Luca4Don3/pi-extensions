@@ -1,7 +1,7 @@
 {
   "name": "@luca4don3/pi-extensions",
   "version": "0.8.0-beta.1",
-  "description": "A collection of independently installable Pi extensions: subagent, chinese-prompt, and opencode-fallback.",
+  "description": "A collection of independently installable Pi extensions: subagent, chinese-prompt, opencode-fallback, and token-speed.",
   "type": "module",
   "keywords": [
     "pi-package",
@@ -9,7 +9,7 @@
     "pi-extension",
     "pi-extensions",
     "subagent",
-    "mcp"
+    "token-speed"
   ],
   "license": "MIT",
   "repository": {
