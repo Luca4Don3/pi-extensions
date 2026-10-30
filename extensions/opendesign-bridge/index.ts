@@ -33,7 +33,7 @@
  * arrive through the live layer with probed values — no manual sync needed.
  */
 
-import { readFileSync, writeFileSync } from "node:fs";
+import { copyFileSync, existsSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { getAgentDir, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -64,14 +64,60 @@ function readPackageVersion(): string | undefined {
   }
 }
 import {
-  makeRefreshModels,
   readProviderConfig,
   STATIC_MODELS,
   OPENDESIGN_BASE_URL,
 } from "./opendesign-live.ts";
 
+/**
+ * 本地定制：pi 1.4 下 Mode 2 的静态 models 注册未生效，改为在 models.json 中
+ * 补一份 opendesign provider（幂等，保留其他 providers，写入前备份）。
+ */
+function ensureModelsJson(agentDir: string): void {
+  const file = join(agentDir, "models.json");
+  let current: Record<string, unknown> = {};
+  const exists = existsSync(file);
+  if (exists) {
+    try {
+      const parsed = JSON.parse(readFileSync(file, "utf8")) as unknown;
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return;
+      current = parsed as Record<string, unknown>;
+    } catch {
+      return;
+    }
+  }
+  const rawProviders = current.providers;
+  const providers =
+    rawProviders && typeof rawProviders === "object" && !Array.isArray(rawProviders)
+      ? { ...(rawProviders as Record<string, unknown>) }
+      : {};
+  const existing = providers.opendesign;
+  if (existing && typeof existing === "object") {
+    const list = (existing as { models?: unknown }).models;
+    if (Array.isArray(list) && list.length > 0) return;
+  }
+  providers.opendesign = {
+    baseUrl: OPENDESIGN_BASE_URL,
+    api: "openai-completions",
+    models: STATIC_MODELS,
+  };
+  try {
+    if (exists) {
+      copyFileSync(file, `${file}.bak-opendesign-${Date.now()}`);
+    }
+    writeFileSync(
+      file,
+      `${JSON.stringify({ ...current, providers }, null, 2)}\n`,
+      { mode: 0o600 },
+    );
+  } catch {
+    // 模型列表写入失败时保持只读回退，不阻断 provider 注册。
+  }
+}
+
 export default async function (pi: ExtensionAPI) {
   const agentDir = getAgentDir();
+  ensureModelsJson(agentDir);
   const cfg = readProviderConfig(agentDir);
   const hasModels = Array.isArray(cfg?.models) && cfg.models.length > 0;
 
@@ -83,10 +129,10 @@ export default async function (pi: ExtensionAPI) {
     name: `OpenDesign ${BRIDGE_VERSION}`,
     api: "openai-completions",
     authHeader: true,
-    refreshModels: makeRefreshModels({ agentDir, fallbackBaseUrl: OPENDESIGN_BASE_URL }),
-    // Mode 2 only: Mode 1 must not pass `models` (it would replace the
-    // models.json list) and passes no `baseUrl` either, so models.json wins.
-    ...(hasModels ? {} : { baseUrl: cfg?.baseUrl ?? OPENDESIGN_BASE_URL, models: STATIC_MODELS }),
+    // 本地定制：pi 1.4 下 refreshModels 会清空 models.json 的模型，
+    // 改为直接注册当前模型列表（models.json 优先，缺失时用 STATIC_MODELS）。
+    baseUrl: cfg?.baseUrl ?? OPENDESIGN_BASE_URL,
+    models: hasModels ? (cfg?.models ?? STATIC_MODELS) : STATIC_MODELS,
     // 本地定制：网页设备授权登录，一次拿到 runtime key 与额度 control key。
     oauth: {
       name: "OpenDesign (account)",
