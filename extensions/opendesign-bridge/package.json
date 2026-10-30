@@ -1,0 +1,16 @@
+{
+  "name": "@luca4don3/pi-extension-opendesign-bridge",
+  "version": "0.3.1",
+  "private": true,
+  "description": "Vendored OpenDesign provider bridge for the pi-extensions collection.",
+  "type": "module",
+  "license": "MIT",
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  }
+}
