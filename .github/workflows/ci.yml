@@ -27,7 +27,7 @@ jobs:
           node-version: ${{ matrix.node }}
 
       - name: Install Pi and typecheck tools (global)
-        run: npm install -g @earendil-works/pi-coding-agent@1.1.0 typescript@5.9.3 @types/node@22.19.19
+        run: npm install -g @earendil-works/pi-coding-agent@latest typescript@5.9.3 @types/node@22.19.19
 
       - name: Link runtime dependencies from the global package
         run: |
