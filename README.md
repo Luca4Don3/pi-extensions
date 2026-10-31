@@ -13,6 +13,7 @@
 | Subagent | `extensions/subagent/` | `pi install ~/pi-extensions/extensions/subagent` | 把任务委派给独立上下文的子 agent（single / parallel / chain） |
 | Chinese Prompt | `extensions/chinese-prompt/` | `pi install ~/pi-extensions/extensions/chinese-prompt` | 注入中文强约束 system prompt，推理与输出全程简体中文 |
 | OpenCode Fallback | `extensions/opencode-fallback/` | `pi install ~/pi-extensions/extensions/opencode-fallback` | 受限及未知模型固定代理，其余模型直连优先；模型请求不重放 |
+| OpenDesign Bridge | `extensions/opendesign-bridge/` | `pi install ~/pi-extensions/extensions/opendesign-bridge` | 注册 `opendesign` provider 与动态模型目录；收录自上游 pi-opendesign-bridge（MIT），见 `UPSTREAM.md` |
 | Token Speed | `extensions/pi-token-speed/` | `pi install ~/pi-extensions/extensions/pi-token-speed` | 状态栏实时显示 TPS / TTFT / token 统计；收录自上游 pi-token-speed（MIT），见 `UPSTREAM.md` |
 
 ## 仓库结构
@@ -39,10 +40,17 @@ pi-extensions/
 │   │   ├── index.ts
 │   │   ├── package.json
 │   │   └── tests/                # 离线测试
-│   └── pi-token-speed/
-│       ├── index.ts              # 上游入口转发
+│   ├── pi-token-speed/
+│   │   ├── index.ts              # 上游入口转发
+│   │   ├── package.json
+│   │   ├── src/                  # 上游 0.12.0 源码（MIT）
+│   │   ├── LICENSE.md
+│   │   └── UPSTREAM.md
+│   └── opendesign-bridge/
+│       ├── index.ts              # provider 注册
+│       ├── opendesign-live.ts    # 动态模型目录
+│       ├── donors-opendesign.ts
 │       ├── package.json
-│       ├── src/                  # 上游 0.12.0 源码（MIT）
 │       ├── LICENSE.md
 │       └── UPSTREAM.md
 ├── .github/workflows/ci.yml
@@ -410,7 +418,7 @@ for p in pi-ai pi-agent-core pi-tui; do
 done
 ```
 
-持续集成（CI）在 Node.js 22、23 与 24 上执行，Pi 使用最新稳定版（`@latest`）以追踪上游 API 变化。Node 20 与 21 不在支持范围：pi 1.4.0 要求 Node >=22.19.0，旧版 `0.74.2` 虽支持 Node 20，但扩展使用的 `ctx.thinkingLevel`、`pi.getThinkingLevel()` 等 API 不在该版本中。类型检查覆盖扩展源码，测试及示例目录不纳入编译检查；测试由 `npm test` 单独执行。根 `tsconfig.json` 排除了 `extensions/pi-token-speed/**`，因为上游使用 bundler 风格的无扩展名相对导入，与 NodeNext 解析不一致；该目录运行时由 pi 的 jiti 加载，不受影响。持续集成成功不代表真实网络冒烟或安全审计已通过。
+持续集成（CI）在 Node.js 22、23 与 24 上执行，Pi 使用最新稳定版（`@latest`）以追踪上游 API 变化。Node 20 与 21 不在支持范围：pi 1.4.0 要求 Node >=22.19.0，旧版 `0.74.2` 虽支持 Node 20，但扩展使用的 `ctx.thinkingLevel`、`pi.getThinkingLevel()` 等 API 不在该版本中。类型检查覆盖扩展源码，测试及示例目录不纳入编译检查；测试由 `npm test` 单独执行。根 `tsconfig.json` 排除了 `extensions/pi-token-speed/**` 与 `extensions/opendesign-bridge/**`，因为上游使用 bundler 风格的相对导入（含 `.ts` 扩展名），与 NodeNext 解析不一致；这两个目录运行时由 pi 的 jiti 加载，不受影响。持续集成成功不代表真实网络冒烟或安全审计已通过。
 
 本地执行 `npm run typecheck` 前，需安装并链接与工作流一致的 `typescript@5.9.3` 和 `@types/node@22.19.19`：
 
@@ -435,3 +443,5 @@ npm run typecheck
 ### 第三方组件
 
 `extensions/pi-token-speed/` 收录自 [pi-token-speed](https://github.com/gsanhueza/pi-token-speed)，同样采用 MIT，版权归原作者 Gabriel Sanhueza。原始许可证见 [`extensions/pi-token-speed/LICENSE.md`](extensions/pi-token-speed/LICENSE.md)，收录版本、上游提交与改动记录见 [`UPSTREAM.md`](extensions/pi-token-speed/UPSTREAM.md)。
+
+`extensions/opendesign-bridge/` 收录自 [pi-opendesign-bridge](https://github.com/Lokeraar/pi-opendesign-bridge)，采用 MIT，版权归原作者 Lokeraar。原始许可证见 [`extensions/opendesign-bridge/LICENSE.md`](extensions/opendesign-bridge/LICENSE.md)，收录版本与改动记录见 [`UPSTREAM.md`](extensions/opendesign-bridge/UPSTREAM.md)。
