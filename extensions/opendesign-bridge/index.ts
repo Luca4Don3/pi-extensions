@@ -126,23 +126,40 @@ function ensureModelsJson(agentDir: string): void {
   }
 }
 
+let loginGeneration = 0;
+let loginController: AbortController | undefined;
+
 export default async function (pi: ExtensionAPI) {
   const agentDir = getAgentDir();
   ensureModelsJson(agentDir);
   console.error(`[opendesign-bridge] ${BRIDGE_VERSION} · agent dir ${agentDir}`);
 
+  pi.on("session_shutdown", () => {
+    loginController?.abort();
+    loginController = undefined;
+  });
+
   // 本地定制：pi 1.4 的 registerProvider 会清空 models.json 的模型，
   // 因此模型由 models.json 提供，登录用独立命令写入 runtime key。
+  // 登录轮询绑定 controller 与 generation：重复登录会取消旧轮询，
+  // 旧结果不会覆盖新写入的凭据。
   pi.registerCommand("opendesign-login", {
     description: "Authorize OpenDesign and save runtime/control keys",
     handler: async (_args, ctx) => {
+      loginController?.abort();
+      const controller = new AbortController();
+      loginController = controller;
+      const generation = ++loginGeneration;
       try {
         const device = await startOpenDesignDeviceLogin();
         const hint = device.userCode
           ? `Open ${device.activationUrl} and enter code ${device.userCode}`
           : `Open ${device.activationUrl}`;
         ctx.ui.notify(`${hint} (expires in 15 min)`, "info");
-        const grant = await pollOpenDesignDeviceLogin(device);
+        const grant = await pollOpenDesignDeviceLogin(device, {
+          signal: controller.signal,
+        });
+        if (generation !== loginGeneration || controller.signal.aborted) return;
         saveUsageControlKey(grant.controlKey);
         saveModelsApiKey(agentDir, grant.runtimeKey);
         ctx.ui.notify(
@@ -150,10 +167,13 @@ export default async function (pi: ExtensionAPI) {
           "info",
         );
       } catch (error) {
+        if (controller.signal.aborted) return;
         ctx.ui.notify(
           `OpenDesign login failed: ${error instanceof Error ? error.message : String(error)}`,
           "error",
         );
+      } finally {
+        if (loginController === controller) loginController = undefined;
       }
     },
   });
