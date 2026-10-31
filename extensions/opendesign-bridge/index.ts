@@ -96,10 +96,21 @@ function ensureModelsJson(agentDir: string): void {
     const list = (existing as { models?: unknown }).models;
     if (Array.isArray(list) && list.length > 0) return;
   }
+  let source: unknown = STATIC_MODELS;
+  try {
+    const store = JSON.parse(
+      readFileSync(join(agentDir, "models-store.json"), "utf8"),
+    ) as { opendesign?: { models?: unknown } };
+    const stored = store?.opendesign?.models;
+    if (Array.isArray(stored) && stored.length > 0) source = stored;
+  } catch {
+    // models-store.json 缺失或损坏时退回静态模型。
+  }
   providers.opendesign = {
     baseUrl: OPENDESIGN_BASE_URL,
     api: "openai-completions",
-    models: STATIC_MODELS,
+    authHeader: true,
+    models: source,
   };
   try {
     if (exists) {
@@ -115,37 +126,37 @@ function ensureModelsJson(agentDir: string): void {
   }
 }
 
-import { PROVIDER_MODELS } from "./models.generated.ts";
-
 export default async function (pi: ExtensionAPI) {
-  pi.registerProvider("opendesign", {
-    name: `OpenDesign ${BRIDGE_VERSION}`,
-    api: "openai-completions",
-    authHeader: true,
-    baseUrl: OPENDESIGN_BASE_URL,
-    models: PROVIDER_MODELS,
-    oauth: {
-      name: "OpenDesign (account)",
-      isSubscription: true,
-      async login(callbacks) {
-        const device = await startOpenDesignDeviceLogin();
-        callbacks.onDeviceCode({
-          userCode: device.userCode,
-          verificationUri: device.activationUrl,
-          intervalSeconds: Math.max(1, Math.round(device.intervalMs / 1000)),
-          expiresInSeconds: Math.max(1, Math.round((device.expiresAt - Date.now()) / 1000)),
-        });
-        const grant = await pollOpenDesignDeviceLogin(device, callbacks.signal);
-        saveUsageControlKey(grant.controlKey);
-        return { access: grant.runtimeKey, refresh: grant.runtimeKey, expires: Date.now() + 10 * 365 * 24 * 60 * 60 * 1000 };
-      },
-      async refreshToken(credentials) { return credentials; },
-      getApiKey(credentials) { return credentials.access; },
-    },
-  });
   const agentDir = getAgentDir();
   ensureModelsJson(agentDir);
   console.error(`[opendesign-bridge] ${BRIDGE_VERSION} · agent dir ${agentDir}`);
+
+  // 本地定制：pi 1.4 的 registerProvider 会清空 models.json 的模型，
+  // 因此模型由 models.json 提供，登录用独立命令写入 runtime key。
+  pi.registerCommand("opendesign-login", {
+    description: "Authorize OpenDesign and save runtime/control keys",
+    handler: async (_args, ctx) => {
+      try {
+        const device = await startOpenDesignDeviceLogin();
+        const hint = device.userCode
+          ? `Open ${device.activationUrl} and enter code ${device.userCode}`
+          : `Open ${device.activationUrl}`;
+        ctx.ui.notify(`${hint} (expires in 15 min)`, "info");
+        const grant = await pollOpenDesignDeviceLogin(device);
+        saveUsageControlKey(grant.controlKey);
+        saveModelsApiKey(agentDir, grant.runtimeKey);
+        ctx.ui.notify(
+          "OpenDesign authorized. Restart pi to load the model list with the new key.",
+          "info",
+        );
+      } catch (error) {
+        ctx.ui.notify(
+          `OpenDesign login failed: ${error instanceof Error ? error.message : String(error)}`,
+          "error",
+        );
+      }
+    },
+  });
 }
 
 // ── OpenDesign 设备授权（本地定制）─────────────────────────────────────────
@@ -286,6 +297,32 @@ async function pollOpenDesignDeviceLogin(
   throw new Error(
     "OpenDesign authorization code expired; run /login opendesign again.",
   );
+}
+
+function saveModelsApiKey(agentDir: string, runtimeKey: string): void {
+  if (!/^sk-amr-[!-~]+$/.test(runtimeKey)) {
+    throw new Error("Refusing to save an invalid OpenDesign runtime key.");
+  }
+  const file = join(agentDir, "models.json");
+  let current: Record<string, unknown> = {};
+  try {
+    const parsed = JSON.parse(readFileSync(file, "utf8")) as unknown;
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      current = parsed as Record<string, unknown>;
+    }
+  } catch {
+    throw new Error(`${file} is not valid JSON; fix or remove it before signing in.`);
+  }
+  const providers =
+    current.providers && typeof current.providers === "object" && !Array.isArray(current.providers)
+      ? { ...(current.providers as Record<string, unknown>) }
+      : {};
+  const opendesign =
+    providers.opendesign && typeof providers.opendesign === "object" && !Array.isArray(providers.opendesign)
+      ? { ...(providers.opendesign as Record<string, unknown>) }
+      : {};
+  providers.opendesign = { ...opendesign, apiKey: runtimeKey, authHeader: true };
+  writeFileSync(file, `${JSON.stringify({ ...current, providers }, null, 2)}\n`, { mode: 0o600 });
 }
 
 function saveUsageControlKey(controlKey: string): void {

@@ -15,8 +15,8 @@
 1. 保持上游的目录布局：`index.ts`、`opendesign-live.ts`、`donors-opendesign.ts` 原样收录，未修改逻辑。
 2. 新增本目录的 `package.json`，声明 `pi.extensions: ["./index.ts"]`，使其可作为独立 Pi 包安装，同时被根 manifest 的 `extensions/*/index.ts` 自动发现。
 3. 未收录上游的 `scripts/` 与 `README.md`（上游说明见其仓库）。
-4. `index.ts` 新增 `oauth` 网页登录（设备授权）：`/login opendesign` 选择 `OpenDesign (account)` 后展示授权链接与验证码，成功后把 runtime key 交给 pi、把 control key 写入 `~/.pi/agent/subscription-usage.json` 供额度查询使用。其余 provider 逻辑未改。
-5. 模型注册改为静态快照 `models.generated.ts`（由 `models.json` 的 opendesign 模型生成），并在启动时用 `ensureModelsJson` 幂等补齐 `~/.pi/agent/models.json`（保留其他 providers，写入前备份）。原因是 pi 1.4 下 `refreshModels` 会清空 models.json 的模型，且 `registerProvider` 必须在扩展 default 的第一条语句执行才能生效。
+4. `index.ts` 新增 `/opendesign-login` 网页登录（设备授权）：展示授权链接与验证码，成功后把 runtime key 写入 `~/.pi/agent/models.json` 的 `providers.opendesign.apiKey`、把 control key 写入 `~/.pi/agent/subscription-usage.json` 供额度查询使用。pi 1.4 下不再调用 `registerProvider`（它会清空 models.json 的模型），provider 配置由 `ensureModelsJson` 维护。
+5. `ensureModelsJson` 在启动时幂等补齐 `~/.pi/agent/models.json` 的 opendesign provider：优先取 `models-store.json` 中已有的 opendesign 模型，缺失时用 `STATIC_MODELS`；保留其他 providers，写入前备份。
 
 ## 与 subscription-usage 的关系
 
