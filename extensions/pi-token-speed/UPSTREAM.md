@@ -19,7 +19,7 @@
 4. `src/core/engine.ts` 改为 step 级 decode 统计（参考 DSH）：每次 `text_start` 记录首 token 时间，`message_end` 累加 `decodeMs` 与 provider 上报的 `usage.output`；`tpsAvg` 用 `ΣdecodeTokens / (ΣdecodeMs / 1000)`，修复多轮工具调用时"本 turn 总 token / 最后一段耗时"导致的 TPS 虚高。
 5. `src/core/events.ts`、`src/core/message-handlers.ts`、`src/index.ts` 增加 `message_end` 接线；`agent_end` 渲染后重置 step 累计。
 6. `src/core/sliding-window.ts` 在窗口内少于 2 个事件时返回 0，避免首 token 用 100ms 下限造成的假尖峰。
-7. 默认值：`countStrategy: "estimate"`、`useProviderTokens: false`。实时 TPS 用词边界估算（provider 的累计 `usage.output` 在流式中会一次性跳到最终值，直接用于窗口会让实时 TPS 虚高到数百）；平均 TPS 仍用 step 累加的 provider output token。`direct` 可在 `/tps` 菜单选择，但它统计的是 delta 数而非 token 数。
+7. 实时 TPS 改为 DSH 式累计平均：`累计 token / 累计 decode 时间`（首 token → now），provider 上报 `usage.output` 时优先使用，否则用 `estimate` 累计；累计时间不足 100ms 时显示 0，避免首 delta 尖峰。平均 TPS 仍用 step 累加的 provider output token。默认 `countStrategy: "estimate"`、`useProviderTokens: true`；`direct` 可在 `/tps` 菜单选择，但它统计的是 delta 数而非 token 数。
 
 
 ## 同步上游

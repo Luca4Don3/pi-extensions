@@ -1,6 +1,6 @@
 import { ScalarSettingsItem } from "./scalar";
 
-export const USE_PROVIDER_TOKENS_DEFAULT = false;
+export const USE_PROVIDER_TOKENS_DEFAULT = true;
 
 /**
  * Boolean toggle: use the provider's token count vs the extension's counter.
