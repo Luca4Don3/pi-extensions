@@ -7,7 +7,6 @@ import {
   END_TPS_BEHAVIOR_DEFAULT,
   type EndTpsBehavior,
 } from "../settings/items/end-tps-behavior";
-import { MIN_SLIDING_WINDOW } from "../config/constants";
 import { SLIDING_WINDOW_DEFAULT } from "../settings/items/sliding-window";
 import { USE_PROVIDER_TOKENS_DEFAULT } from "../settings/items/use-provider-tokens";
 import { SlidingWindow } from "./sliding-window";
@@ -174,19 +173,7 @@ export class TokenSpeedEngine {
    * - `"last"`: returns the last sliding window measurement.
    */
   get tps(): number {
-    if (this._isStreaming) {
-      // DSH-style live reading: cumulative provider tokens over cumulative
-      // decode time (first token -> now). It converges instead of spiking
-      // when a provider reports usage in bursts.
-      const first = this._stepFirstTokenTime || this._startTime;
-      const elapsedMs = this.now() - first;
-      const tokens =
-        this._countedUsageOutput > 0 ? this._countedUsageOutput : this._tokenCount;
-      // Below the minimum window the divisor is too small to be meaningful;
-      // reporting it would show a fake burst on the first delta.
-      if (elapsedMs < MIN_SLIDING_WINDOW || tokens <= 0) return 0;
-      return (tokens * 1000) / elapsedMs;
-    }
+    if (this._isStreaming) return this._slidingWindow.getTps(this.now());
     if (this._endTpsBehavior === "last") return this._tps;
     return this.tpsAvg;
   }
@@ -285,7 +272,6 @@ export class TokenSpeedEngine {
    * Stops streaming.
    */
   stop(): void {
-    this._tps = this.tps;
     this._isStreaming = false;
     this._endTime = this.now();
     this._slidingWindow.reset();
@@ -318,6 +304,7 @@ export class TokenSpeedEngine {
 
     this._tokenCount += tokens;
     this._slidingWindow.record(tokens);
+    this._tps = this._slidingWindow.getTps(this.now());
   }
 
   /**
