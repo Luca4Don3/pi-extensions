@@ -11,7 +11,9 @@ import { SLIDING_WINDOW_DEFAULT } from "../settings/items/sliding-window";
 import { USE_PROVIDER_TOKENS_DEFAULT } from "../settings/items/use-provider-tokens";
 import { SlidingWindow } from "./sliding-window";
 
-const TOKEN_REGEX = /\w+|[^\s\w]/g;
+const WORD_REGEX = /[A-Za-z0-9_]+/g;
+const CJK_REGEX = /[\u3400-\u4dbf\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af]/g;
+const SYMBOL_REGEX = /[^A-Za-z0-9_\u3400-\u4dbf\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af\s]/g;
 
 export class TokenSpeedEngine {
   private _isStreaming = false;
@@ -316,7 +318,9 @@ export class TokenSpeedEngine {
    */
   private estimateTokens(text: string): number {
     if (!text) return 0;
-    const matches = text.match(TOKEN_REGEX);
-    return matches ? matches.length : 0;
+    const words = text.match(WORD_REGEX)?.length ?? 0;
+    const cjk = text.match(CJK_REGEX)?.length ?? 0;
+    const symbols = Math.ceil((text.match(SYMBOL_REGEX)?.length ?? 0) / 3);
+    return words + cjk + symbols;
   }
 }

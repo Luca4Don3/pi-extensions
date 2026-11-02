@@ -11,7 +11,7 @@ export const COMPACTION_THRESHOLD = 5000;
 /**
  * Minimum sliding window duration (ms) — 100ms is the smallest meaningful window
  */
-export const MIN_SLIDING_WINDOW = 100;
+export const MIN_SLIDING_WINDOW = 1000;
 
 /**
  * Maximum sliding window duration (ms) — 30s is the largest practical window
