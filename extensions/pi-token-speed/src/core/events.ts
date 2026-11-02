@@ -86,15 +86,27 @@ export class EventManager {
   }
 
   /**
-   * Reconciles the total token count, stops streaming, and updates the renderer.
+   * Closes the current decode step with the assistant message's usage.
+   * Called for every assistant message so multi-step turns accumulate
+   * decode time per step instead of dividing the whole turn by the last
+   * step's elapsed time.
+   */
+  handleMessageEnd(event: { message?: { role?: string; usage?: { output?: number } } }): void {
+    if (event.message?.role !== "assistant") return;
+    this.engine.endStep(event.message.usage?.output ?? 0);
+  }
+
+  /**
+   * Stops streaming, renders the turn result, then resets the decode
+   * accumulator for the next turn.
    *
-   * @param event The message_end event payload.
+   * @param event The agent_end event payload.
    * @param ctx The Pi extension context.
    */
   handleAgentEnd(event: AgentEndEvent, ctx: ExtensionContext): void {
     this.engine.stop();
 
-    // Only assistant and toolResult messages carry usage data
+    // Keep the turn's total as a display/fallback value.
     const outputTokens = event.messages.reduce((acc, curr) => {
       if (curr.role === "assistant") {
         return acc + curr.usage.output;
@@ -104,8 +116,9 @@ export class EventManager {
       }
       return acc;
     }, 0);
-
     this.engine.reconcileTotal(outputTokens);
+
     this.renderer.update(ctx);
+    this.engine.finishTurn();
   }
 }

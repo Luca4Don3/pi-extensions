@@ -61,6 +61,9 @@ export class SlidingWindow {
       windowTokenCount += this.events[i].tokens;
     }
 
+    // One event only: a single timestamp gives no measurable rate, and the
+    // MIN_SLIDING_WINDOW floor would report a fake burst. Wait for the next.
+    if (this.events.length - this.windowStartIndex < 2) return 0;
     if (windowTokenCount === 0) return 0;
 
     // Measure span from the first in-window event.

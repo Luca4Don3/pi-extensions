@@ -30,6 +30,12 @@ export class TokenSpeedEngine {
   private _tps = 0;
   private _countedUsageOutput = 0;
 
+  // Step-level decode accounting (DSH-style):
+  // decodeMs = first token -> message end, decodeTokens = provider output tokens.
+  private _stepFirstTokenTime = 0;
+  private _stepDecodeMs = 0;
+  private _stepDecodeTokens = 0;
+
   private _slidingWindow: SlidingWindow;
   private _useProviderTokens = USE_PROVIDER_TOKENS_DEFAULT;
   private _countStrategy: CountStrategy = COUNT_STRATEGY_DEFAULT;
@@ -167,7 +173,7 @@ export class TokenSpeedEngine {
    * - `"last"`: returns the last sliding window measurement.
    */
   get tps(): number {
-    if (this._isStreaming) return this._tps;
+    if (this._isStreaming) return this._slidingWindow.getTps(this.now());
     if (this._endTpsBehavior === "last") return this._tps;
     return this.tpsAvg;
   }
@@ -177,6 +183,11 @@ export class TokenSpeedEngine {
    * Computed as total tokens / elapsed seconds. Returns 0 if no time has elapsed.
    */
   get tpsAvg(): number {
+    // DSH-style: sum provider output tokens over summed decode time
+    // (first token -> step end), so multi-step turns do not inflate TPS.
+    if (this._stepDecodeMs > 0 && this._stepDecodeTokens > 0) {
+      return this._stepDecodeTokens / (this._stepDecodeMs / 1000);
+    }
     if (this.elapsedSeconds <= 0) return 0;
     return this._tokenCount / this.elapsedSeconds;
   }
@@ -202,6 +213,42 @@ export class TokenSpeedEngine {
     this._countedUsageOutput = 0;
     this._tps = 0;
     this._pausedMs = 0;
+  }
+
+  /**
+   * Marks the first token of a step. Decode time is measured from here
+   * to the matching `endStep`, excluding TTFT and tool execution.
+   */
+  startStep(): void {
+    // Keep the first token of this step: text_start may be followed by
+    // toolcall_start in the same message, and only the first one starts
+    // the decode clock.
+    if (this._stepFirstTokenTime === 0) this._stepFirstTokenTime = this.now();
+  }
+
+  /**
+   * Closes the current step and accumulates its decode time and provider
+   * output tokens. No-op when no step is open.
+   *
+   * @param outputTokens Provider-reported output tokens for this step.
+   */
+  endStep(outputTokens: number): void {
+    if (this._stepFirstTokenTime === 0) return;
+    this._stepDecodeMs += Math.max(this.now() - this._stepFirstTokenTime, 0);
+    if (Number.isFinite(outputTokens) && outputTokens > 0) {
+      this._stepDecodeTokens += outputTokens;
+    }
+    this._stepFirstTokenTime = 0;
+  }
+
+  /**
+   * Resets the turn-level decode accumulator after the turn has been
+   * rendered. Called at the end of a turn so the next turn starts clean.
+   */
+  finishTurn(): void {
+    this._stepFirstTokenTime = 0;
+    this._stepDecodeMs = 0;
+    this._stepDecodeTokens = 0;
   }
 
   /**
