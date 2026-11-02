@@ -16,6 +16,11 @@
 1. 入口从上游的 `src/index.ts` 调整为 `extensions/pi-token-speed/index.ts`，仅做转发。这样 pi 的启动资源列表与 `pi config` 显示为 `pi-extensions:pi-token-speed`，而不是 `src/index.ts`。
 2. `src/**` 与上游 0.12.0 保持一致，未修改任何逻辑、配置项、命令或默认值。
 3. 未收录上游的 `tests/`、`package-lock.json` 与构建脚本；本目录被根 `tsconfig.json` 排除，因为上游使用 bundler 风格的无扩展名相对导入，与根配置的 NodeNext 解析不一致。运行时由 pi 的 jiti 加载，不受影响。
+4. `src/core/engine.ts` 改为 step 级 decode 统计（参考 DSH）：每次 `text_start` 记录首 token 时间，`message_end` 累加 `decodeMs` 与 provider 上报的 `usage.output`；`tpsAvg` 用 `ΣdecodeTokens / (ΣdecodeMs / 1000)`，修复多轮工具调用时"本 turn 总 token / 最后一段耗时"导致的 TPS 虚高。
+5. `src/core/events.ts`、`src/core/message-handlers.ts`、`src/index.ts` 增加 `message_end` 接线；`agent_end` 渲染后重置 step 累计。
+6. `src/core/sliding-window.ts` 在窗口内少于 2 个事件时返回 0，避免首 token 用 100ms 下限造成的假尖峰。
+7. 默认值调整为 `useProviderTokens: true`、`countStrategy: "estimate"`：provider 上报 output token 时优先使用，否则用词边界估算；`direct` 仍可在 `/tps` 菜单选择，但它统计的是 delta 数而非 token 数。
+
 
 ## 同步上游
 

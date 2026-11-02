@@ -2,7 +2,7 @@ import { ScalarSettingsItem } from "./scalar";
 
 export type CountStrategy = "estimate" | "direct";
 
-export const COUNT_STRATEGY_DEFAULT: CountStrategy = "direct";
+export const COUNT_STRATEGY_DEFAULT: CountStrategy = "estimate";
 
 const COUNT_STRATEGY_LABELS: Record<CountStrategy, string> = {
   estimate: "Estimate (calculated)",

@@ -20,6 +20,7 @@ export class StreamStartHandler implements MessageHandler {
     this.engine.applyProvider(this.getProvider(ctx));
     this.engine.stopTTFT();
     this.engine.start();
+    this.engine.startStep();
   }
 }
 
