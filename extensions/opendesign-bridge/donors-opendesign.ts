@@ -71,6 +71,12 @@ export interface ModelEntry {
   name?: string;
   api?: string;
   provider?: string;
+  /**
+   * Model kind as Pi's catalog records it since models.dev v2: `chat`,
+   * `classifier` or `image`. Absent on hand-written entries and in older
+   * catalogs, which are all chat; treated as `chat` then.
+   */
+  type?: string;
   reasoning?: boolean;
   thinkingLevelMap?: ThinkingLevelMap;
   input?: Array<"text" | "image">;
@@ -617,6 +623,14 @@ export function readBundledCatalog(
       // "free" models are deliberately excluded: they routinely ship with
       // capabilities cut down, so their numbers describe a reduced product.
       if (/free$/i.test(entry.id)) continue;
+      // ONLY chat models may donate. Since models.dev v2 a catalog can hold
+      // classifier and image models too, and the SAME id may appear as both:
+      // `openai.json` lists `gpt-6-luna` under `openai-decisions` (classifier,
+      // 922k context) and under `openai-responses` (chat, 272k). Without this
+      // filter the donor read whichever one the JSON happened to list last and
+      // described a chat model with a classifier's numbers. An absent `type`
+      // means a hand-written or older entry, which is chat.
+      if (entry.type !== undefined && entry.type !== "chat") continue;
       const bare = bareName(entry.id);
       if (!models.has(bare)) models.set(bare, entry);
       if (typeof entry.name === "string") {

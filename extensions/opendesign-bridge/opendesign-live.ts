@@ -130,16 +130,29 @@ export const THINKING_LEVELS: Array<Exclude<ThinkingLevel, "off">> = [
  *   - kimi-k2.7-code: max
  *   - gpt-6-luna / gpt-6.1-sol: minimal (official OpenAI spec)
  * `xhigh`/`max` must be listed explicitly or Pi never offers them.
+ *
+ * `deepseek-v4.1-flash-eco` is placed in OFF_NONE by inheritance: the gateway
+ * publishes the same `cost` tier and the same context/output budgets as its
+ * parent `deepseek-v4.1-flash`, and the only documented difference is that it
+ * drops `image` input. That inference is unverified — run with
+ * PI_OPENDESIGN_REPROBE=1 to measure it before relying on `off`.
  */
 const OFF_NONE = new Set<string>([
   "deepseek-v4-flash",
   "deepseek-v4-flash-vision-exp",
   "deepseek-v4-pro",
   "deepseek-v4.1-flash",
+  "deepseek-v4.1-flash-eco",
   "gpt-6-luna",
   "mimo-v2.6-flash",
   "mimo-v2.6-pro",
 ]);
+/**
+ * Models whose `off` the gateway refuses. Kept separate from OFF_NONE so a
+ * model that later leaves the catalogue keeps its recorded `off` semantics if
+ * it ever comes back — membership here is a fact about the model, not about
+ * whether it is currently served.
+ */
 const OFF_UNSUPPORTED = new Set<string>([
   "glm-5.3-flash",
   "glm-5.3-flashx",
@@ -180,10 +193,14 @@ export const STATIC_MODELS: LiveModelConfig[] = ([
   ["deepseek-v4-flash-vision-exp", 1_048_000, 232_000, true],
   ["deepseek-v4-pro", 1_048_000, 232_000, false],
   ["deepseek-v4.1-flash", 1_048_000, 232_000, true],
+  // eco variant of deepseek-v4.1-flash: same gateway metadata (context_limit,
+  // context_budget, output_budget, cost tier), only `input_modalities` differs
+  // — it omits `image`. Reasoning ability is inherited from the parent id and
+  // is INFERRED, not measured, until PI_OPENDESIGN_REPROBE confirms it.
+  ["deepseek-v4.1-flash-eco", 1_048_000, 232_000, false],
   ["glm-5.3-flash", 1_048_000, 128_000, true],
   ["glm-5.3-flashx", 1_000_000, 128_000, true],
   ["gpt-6-luna", 1_050_000, 128_000, true],
-  ["gpt-6.1-sol", 1_050_000, 128_000, true],
   ["kimi-k2.7-code", 262_000, 262_000, true],
   ["mimo-v2.6-flash", 1_048_000, 131_072, true],
   ["mimo-v2.6-pro", 1_048_000, 131_072, true],
