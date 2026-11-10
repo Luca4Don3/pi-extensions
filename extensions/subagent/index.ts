@@ -490,6 +490,24 @@ const AgentScopeSchema = StringEnum(["user", "project", "both"] as const, {
 });
 
 /**
+ * `params` 的类型来源随宿主版本变化。
+ *
+ * Pi 1.5 起工具参数校验换到 `@earendil-works/pi-schema`，`StringEnum` 的返回类型
+ * 不再是 TypeBox 的 `TUnsafe<T>`，`Static` 在部分 tsconfig 下退化成 `{}`。
+ * 运行期生成的仍是 `{type:"string", enum:[...]}`，校验结果正确；这里只把类型
+ * 收回声明式的联合类型，不改变任何运行行为。
+ */
+const AGENT_SCOPES: readonly AgentScope[] = ["user", "project", "both"];
+
+function asAgentScope(value: unknown): AgentScope {
+	return AGENT_SCOPES.includes(value as AgentScope) ? (value as AgentScope) : "user";
+}
+
+function asThinkingLevel(value: unknown): ThinkingLevel | undefined {
+	return THINKING_LEVELS.includes(value as ThinkingLevel) ? (value as ThinkingLevel) : undefined;
+}
+
+/**
  * 宿主授权用的环境变量名：只有宿主显式把它设为 true 时，
  * 才允许跳过项目级 agent 的确认。
  *
@@ -572,7 +590,7 @@ export default function (pi: ExtensionAPI) {
 		parameters: SubagentParams,
 
 		async execute(_toolCallId, params, signal, onUpdate, ctx) {
-			const agentScope: AgentScope = params.agentScope ?? "user";
+			const agentScope: AgentScope = asAgentScope(params.agentScope);
 			const discovery = discoverAgents(ctx.cwd, agentScope);
 			const agents = discovery.agents;
 			const confirmProjectAgents = params.confirmProjectAgents ?? true;
@@ -642,8 +660,12 @@ export default function (pi: ExtensionAPI) {
 					model: ctx.model,
 					thinkingLevel: parentThinking,
 				};
-				const resolveTaskConfig = (agent: string, thinking?: ThinkingLevel) =>
-					resolveModelConfig(parentModelConfig, { model: params.model, thinking: thinking ?? params.thinking }, agent);
+				const resolveTaskConfig = (agent: string, thinking?: unknown) =>
+					resolveModelConfig(
+						parentModelConfig,
+						{ model: params.model, thinking: asThinkingLevel(thinking) ?? asThinkingLevel(params.thinking) },
+						agent,
+					);
 				modelConfigs = hasChain
 					? params.chain!.map((step) => resolveTaskConfig(step.agent, step.thinking))
 					: hasTasks
@@ -909,7 +931,7 @@ export default function (pi: ExtensionAPI) {
 		},
 
 		renderCall(args, theme, _context) {
-			const scope: AgentScope = args.agentScope ?? "user";
+			const scope: AgentScope = asAgentScope(args.agentScope);
 			if (args.chain && args.chain.length > 0) {
 				let text =
 					theme.fg("toolTitle", theme.bold("subagent ")) +
