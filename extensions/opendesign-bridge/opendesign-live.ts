@@ -119,55 +119,62 @@ export const THINKING_LEVELS: Array<Exclude<ThinkingLevel, "off">> = [
 ];
 
 /**
- * `off` behaviour (measured 2026-10-01 against the gateway):
- *   - `"none"`: `reasoning_effort:"none"` accepted AND disables thinking (0
- *     reasoning tokens) — deepseek family, gpt-6-luna, mimo-v2.6 family.
- *   - `null`: rejected HTTP 400 (glm-5.3*, gpt-6.1-sol) or no effect
- *     (kimi-k2.7-code always thinks). `off` disappears from the UI.
- * Levels the gateway rejects are `null` so `clampThinkingLevel` snaps to the
- * nearest supported level instead of sending one the API refuses:
- *   - glm-5.3*: minimal/medium/xhigh (official spec: low/high/max only)
- *   - kimi-k2.7-code: max
- *   - gpt-6-luna / gpt-6.1-sol: minimal (official OpenAI spec)
+ * `off` behaviour, re-measured 2026-11-10 (`reasoning_effort:"none"` ×3):
+ *   - `"none"`: accepted AND disables thinking (0 reasoning tokens).
+ *   - `null`: rejected HTTP 400, or accepted but still thinks. `off`
+ *     disappears from the UI.
+ *
+ * A level the gateway rejects is `null` so `clampThinkingLevel` snaps to the
+ * nearest supported one instead of sending a request that fails.
  * `xhigh`/`max` must be listed explicitly or Pi never offers them.
  *
- * `deepseek-v4.1-flash-eco` is placed in OFF_NONE by inheritance: the gateway
- * publishes the same `cost` tier and the same context/output budgets as its
- * parent `deepseek-v4.1-flash`, and the only documented difference is that it
- * drops `image` input. That inference is unverified — run with
- * PI_OPENDESIGN_REPROBE=1 to measure it before relying on `off`.
+ * `deepseek-v4.1-flash-eco` was MEASURED, not inherited: all eight levels
+ * answer 200 and `none` yields 0 reasoning tokens, same as its parent. The
+ * inference in the previous revision is now a recorded fact.
  */
 const OFF_NONE = new Set<string>([
+  "claude-haiku-5.5",
   "deepseek-v4-flash",
   "deepseek-v4-flash-vision-exp",
   "deepseek-v4-pro",
   "deepseek-v4.1-flash",
   "deepseek-v4.1-flash-eco",
   "gpt-6-luna",
+  "hy4-preview",
   "mimo-v2.6-flash",
   "mimo-v2.6-pro",
 ]);
 /**
- * Models whose `off` the gateway refuses. Kept separate from OFF_NONE so a
- * model that later leaves the catalogue keeps its recorded `off` semantics if
- * it ever comes back — membership here is a fact about the model, not about
- * whether it is currently served.
+ * Models without a usable `off`: glm-5.3* and kimi-k2.7-code accept the value
+ * but keep thinking, minimax-m3.1-flash rejects it outright. Kept separate
+ * from OFF_NONE so a model that leaves the catalogue keeps its recorded
+ * semantics if it ever comes back — membership here is a fact about the
+ * model, not about whether it is currently served.
  */
 const OFF_UNSUPPORTED = new Set<string>([
   "glm-5.3-flash",
   "glm-5.3-flashx",
   "gpt-6.1-sol",
   "kimi-k2.7-code",
+  "minimax-m3.1-flash",
 ]);
+/**
+ * Thinking levels the gateway answers with HTTP 400, measured 2026-11-10 and
+ * confirmed stable over three requests each.
+ *
+ * This is a per-id table, not a family rule. The rules it replaced were wrong
+ * in both directions: they rejected `minimal`/`xhigh` on every `glm-5.3*`
+ * though only `medium` fails, and they rejected `minimal` on `gpt-6-luna`
+ * though it answers 200. A family prefix cannot express either.
+ */
+const REJECTED_LEVELS: Record<string, readonly Exclude<ThinkingLevel, "off">[]> = {
+  "glm-5.3-flash": ["medium"],
+  "glm-5.3-flashx": ["medium"],
+  "kimi-k2.7-code": ["max"],
+};
 
 export function thinkingLevelMap(id: string): ThinkingLevelMap {
-  const rejected = id.startsWith("glm-5.3")
-    ? new Set<string>(["minimal", "medium", "xhigh"])
-    : id === "kimi-k2.7-code"
-      ? new Set<string>(["max"])
-      : id.startsWith("gpt-6")
-        ? new Set<string>(["minimal"])
-        : new Set<string>();
+  const rejected = new Set<string>(REJECTED_LEVELS[id] ?? []);
 
   const map: ThinkingLevelMap = {};
   if (OFF_NONE.has(id)) map.off = "none";
@@ -185,25 +192,31 @@ export function thinkingLevelMap(id: string): ThinkingLevelMap {
  *   GLM-5.3 and GPT-6 (luna/sol) cap output at 128K officially, below the
  *   gateway budget, so 128K wins there.
  *
+ * This list must stay complete against `models.json`: whatever that file
+ * declares has to be reachable here too, or a user with an empty `models.json`
+ * silently loses models the gateway still serves.
+ *
  * `cost` is mandatory: Pi's usage calculator crashes without it. `compat` must
  * live per model: `applyExtension()` does not merge a provider-level compat.
  */
 export const STATIC_MODELS: LiveModelConfig[] = ([
+  ["claude-haiku-5.5", 1_000_000, 128_000, true],
   ["deepseek-v4-flash", 1_048_000, 232_000, false],
   ["deepseek-v4-flash-vision-exp", 1_048_000, 232_000, true],
   ["deepseek-v4-pro", 1_048_000, 232_000, false],
   ["deepseek-v4.1-flash", 1_048_000, 232_000, true],
   // eco variant of deepseek-v4.1-flash: same gateway metadata (context_limit,
   // context_budget, output_budget, cost tier), only `input_modalities` differs
-  // — it omits `image`. Reasoning ability is inherited from the parent id and
-  // is INFERRED, not measured, until PI_OPENDESIGN_REPROBE confirms it.
+  // — it omits `image`.
   ["deepseek-v4.1-flash-eco", 1_048_000, 232_000, false],
   ["glm-5.3-flash", 1_048_000, 128_000, true],
   ["glm-5.3-flashx", 1_000_000, 128_000, true],
   ["gpt-6-luna", 1_050_000, 128_000, true],
+  ["hy4-preview", 1_048_000, 64_000, false],
   ["kimi-k2.7-code", 262_000, 262_000, true],
   ["mimo-v2.6-flash", 1_048_000, 131_072, true],
   ["mimo-v2.6-pro", 1_048_000, 131_072, true],
+  ["minimax-m3.1-flash", 1_000_000, 524_288, true],
 ] as Array<[string, number, number, boolean]>).map(([id, contextWindow, maxTokens, images]) => ({
   id,
   name: id,
