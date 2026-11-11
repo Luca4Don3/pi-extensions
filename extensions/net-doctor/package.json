@@ -1,0 +1,15 @@
+{
+  "name": "@luca4don3/pi-extension-net-doctor",
+  "version": "0.1.0",
+  "private": true,
+  "description": "按 host 施加链路策略（直连 IPv4 / 代理），并提供只读链路诊断命令。",
+  "type": "module",
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  }
+}
