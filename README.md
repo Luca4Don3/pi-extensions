@@ -13,6 +13,7 @@
 | Subagent | `extensions/subagent/` | `pi install ~/pi-extensions/extensions/subagent` | 把任务委派给独立上下文的子 agent（single / parallel / chain） |
 | Chinese Prompt | `extensions/chinese-prompt/` | `pi install ~/pi-extensions/extensions/chinese-prompt` | 注入中文强约束 system prompt，推理与输出全程简体中文 |
 | OpenCode Fallback | `extensions/opencode-fallback/` | `pi install ~/pi-extensions/extensions/opencode-fallback` | 受限及未知模型固定代理，其余模型直连优先；模型请求不重放 |
+| Net Doctor | `extensions/net-doctor/` | `pi install ~/pi-extensions/extensions/net-doctor` | 按 host 施加链路策略（直连 IPv4 / 代理），并提供 `/net-doctor` 只读诊断对照表 |
 | OpenDesign Bridge | `extensions/opendesign-bridge/` | `pi install ~/pi-extensions/extensions/opendesign-bridge` | 注册 `opendesign` provider 与动态模型目录；收录自上游 pi-opendesign-bridge（MIT），见 `UPSTREAM.md` |
 | Token Speed | `extensions/pi-token-speed/` | `pi install ~/pi-extensions/extensions/pi-token-speed` | 状态栏实时显示 TPS / TTFT / token 统计；收录自上游 pi-token-speed（MIT），见 `UPSTREAM.md` |
 
@@ -38,6 +39,16 @@ pi-extensions/
 │   │   └── package.json
 │   ├── opencode-fallback/
 │   │   ├── index.ts
+│   │   ├── package.json
+│   │   └── tests/                # 离线测试
+│   ├── net-doctor/
+│   │   ├── index.ts              # 命令入口 + 策略安装
+│   │   ├── hosts.ts              # 厂商链路注册表（数据）
+│   │   ├── dispatchers.ts        # undici agent 与解析
+│   │   ├── router.ts             # 按 host 注入 dispatcher
+│   │   ├── probe.ts              # 只读测量
+│   │   ├── report.ts             # 对照表与结论
+│   │   ├── config.ts             # 策略覆盖持久化
 │   │   ├── package.json
 │   │   └── tests/                # 离线测试
 │   ├── pi-token-speed/
@@ -320,6 +331,80 @@ cp extensions/subagent/examples/agents/*.md ~/.pi/agent/agents/
 只对 `opencode.ai` 及其子域生效；`opencode.ai.example.com` 这类相似域名不会被误判。
 
 代价说明：代理不可用时，上述四类模型会直接失败。这是「出口不漂移」的必然代价。
+
+---
+
+# Net Doctor
+
+按 host 施加链路策略，并提供只读的链路诊断。它解决的是「同一个域名，直连、强制 IPv4、走代理三条路里哪条对」的问题。
+
+## 为什么不是「优选 IP + 改 hosts」
+
+社区工具（如 `open-design-ip-optimizer`）的做法是把域名在 hosts 里钉到某个 Cloudflare 边缘 IP。本机实测否决了这条路：
+
+| 路径 | 成功率 | p50 | 落点 |
+| --- | --- | --- | --- |
+| Pi 默认（`autoSelectFamily` 等待 2s） | 5/5 | 2815ms | SJC / LHR / LAX 漂移 |
+| 强制 IPv4 直连 | 5/5 | **718ms** | 稳定 SJC |
+| 强制 IPv6 | **3/5** | 743ms | 40% 连接超时 |
+| hosts 固定到 CF 优选 IP | **0/5** | — | 全部 `CONNECT_TIMEOUT` |
+| 走代理 | 时段相关 | 722–785ms | 曾经 0/5 `ECONNRESET` |
+
+两个结论：
+
+1. 根因是 **IPv6 路径质量 + `autoSelectFamily` 的 2s 回退**，不是边缘机房选错。强制 IPv4 就解决了，不需要改任何系统文件。
+2. **anycast 的「IP → 机房」映射随线路漂移**。同一批候选 IP 在本机分别落到 LHR / HKG / SJC，与作者标定的机房并不一致。把它写进 hosts 等于把一条线路的实测快照固化成全局配置。
+
+## 分类依据：边缘可观测性
+
+注册表按「能不能看到边缘身份」分两类，不按厂商重要性：
+
+| `edge` | 判据 | 能做什么 |
+| --- | --- | --- |
+| `cloudflare` | 域名前置在 Cloudflare，有 `/cdn-cgi/trace` 可读 `colo` | 可以验证优选是否生效 |
+| `opaque` | 没有等价的边缘身份端点（自有 / Azure / AWS 边缘） | 只能测延迟，**不能**用 IP 优选 |
+
+新增厂商是加一行数据，不是加一个分支。注册表还记录了本机 DNS 污染的实测：`chatgpt.com`、`api.openai.com`、`api.x.ai` 均解析到不属于对应厂商的地址空间（分别属 DreamHost 与 Facebook 段）。这三类只能依赖代理端解析，改 hosts 没有意义。具体地址不入库，因为写死一份会过期的快照比不写更糟。
+
+## 命令
+
+| 命令 | 作用 |
+| --- | --- |
+| `/net-doctor` | 测量全部端点：直连默认 / 直连 IPv4 / 代理 |
+| `/net-doctor <过滤串>` | 只测匹配的 host 或 provider |
+| `/net-doctor set <host> <mode>` | 覆盖策略，立即生效 |
+| `/net-doctor reset` | 清除全部覆盖 |
+
+`mode` 取值：`direct-v4` / `direct` / `proxy` / `passthrough`。
+
+## 安全边界
+
+- **不改 hosts、不改 DNS、不需要提权**。只给命中的请求注入 `dispatcher`。
+- 只对注册表里 `mode !== "passthrough"` 的 host 生效，其余原样透传（`Reflect.apply` 保留 `this` 与全部参数形状）。
+- **不重试、不重放**。非幂等请求一旦发出就不能再来一次，这个扩展也不承担失败恢复。
+- 策略失效时显式告警，不会静默保留：`summarize()` 会在策略路径失败或反而变慢时直接说明。
+
+## 配置
+
+策略覆盖写在 `~/.pi/agent/net-doctor.json`，不混入 Pi 的 `settings.json`：
+
+```json
+{
+  "routes": {
+    "amr-link.open-design.ai": "proxy"
+  }
+}
+```
+
+文件损坏、字段类型不对、`mode` 非法都按「没有覆盖」处理，不会拦住 Pi 启动。配置里出现未注册的 host 会被忽略，避免拼写错误给未测量过的域名套上策略。
+
+| 环境变量 | 默认 | 说明 |
+| --- | --- | --- |
+| `PI_NET_DOCTOR_PROXY` | 继承 `HTTPS_PROXY`，否则 `http://127.0.0.1:7897` | 诊断与 `proxy` 策略使用的代理 |
+
+## 与 OpenCode Fallback 的边界
+
+`opencode.ai` 在注册表里是 `passthrough`，由 OpenCode Fallback 负责（它还需要按模型固定代理与正文路由）。两个扩展都包装 `globalThis.fetch`，但各自只处理自己的 host，任意加载顺序都安全。
 
 ---
 
