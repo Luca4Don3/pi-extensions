@@ -151,14 +151,12 @@ export default async function (pi: ExtensionAPI) {
       loginController = controller;
       const generation = ++loginGeneration;
       try {
-        const device = await startOpenDesignDeviceLogin();
+        const device = await startOpenDesignDeviceLogin(controller.signal);
         const hint = device.userCode
           ? `Open ${device.activationUrl} and enter code ${device.userCode}`
           : `Open ${device.activationUrl}`;
         ctx.ui.notify(`${hint} (expires in 15 min)`, "info");
-        const grant = await pollOpenDesignDeviceLogin(device, {
-          signal: controller.signal,
-        });
+        const grant = await pollOpenDesignDeviceLogin(device, controller.signal);
         if (generation !== loginGeneration || controller.signal.aborted) return;
         saveUsageControlKey(grant.controlKey);
         saveModelsApiKey(agentDir, grant.runtimeKey);
@@ -180,13 +178,20 @@ export default async function (pi: ExtensionAPI) {
 }
 
 // ── OpenDesign 设备授权（本地定制）─────────────────────────────────────────
-// 登录入口：/login opendesign → OpenDesign (account)。
+// 登录入口：/opendesign-login。
 // 控制面凭据只发往 amr-api，模型 runtime key 由 pi 保存供 amr-link 使用。
 
 const CONTROL_ORIGIN = "https://amr-api.open-design.ai";
 const DEVICE_PATH = "/api/v1/cli/device-authorizations";
 const ACTIVATE_ORIGIN = "https://open-design.ai";
 const ACTIVATE_PATH = "/cloud/cli/activate";
+
+/**
+ * 控制面请求的硬超时。没有它，控制面一卡住，`/opendesign-login` 就永远挂着，
+ * 连 `loginController.abort()` 也解不开——fetch 自己不会因为外部 abort 之外的
+ * 原因放弃。与 `opendesign-live.ts` 里每个请求都带超时的做法保持一致。
+ */
+const CONTROL_TIMEOUT_MS = 20_000;
 
 interface OpenDesignDeviceAuthorization {
   activationUrl: string;
@@ -197,7 +202,9 @@ interface OpenDesignDeviceAuthorization {
   intervalMs: number;
 }
 
-async function startOpenDesignDeviceLogin(): Promise<OpenDesignDeviceAuthorization> {
+async function startOpenDesignDeviceLogin(
+  signal?: AbortSignal,
+): Promise<OpenDesignDeviceAuthorization> {
   const response = await fetch(`${CONTROL_ORIGIN}${DEVICE_PATH}`, {
     method: "POST",
     headers: {
@@ -211,6 +218,10 @@ async function startOpenDesignDeviceLogin(): Promise<OpenDesignDeviceAuthorizati
       profile: "prod",
     }),
     redirect: "error",
+    signal: AbortSignal.any([
+      ...(signal ? [signal] : []),
+      AbortSignal.timeout(CONTROL_TIMEOUT_MS),
+    ]),
   });
   if (!response.ok) {
     throw new Error(
@@ -281,7 +292,12 @@ async function pollOpenDesignDeviceLogin(
         },
         body: JSON.stringify({ deviceSecret: device.deviceSecret }),
         redirect: "error",
-        ...(signal ? { signal } : {}),
+        // 每次轮询也必须有超时：控制面挂住时，这个循环会在 expiresAt 之前
+        // 一直等一个永不返回的响应。
+        signal: AbortSignal.any([
+          ...(signal ? [signal] : []),
+          AbortSignal.timeout(CONTROL_TIMEOUT_MS),
+        ]),
       },
     );
     if (
@@ -315,7 +331,7 @@ async function pollOpenDesignDeviceLogin(
     return { runtimeKey, controlKey };
   }
   throw new Error(
-    "OpenDesign authorization code expired; run /login opendesign again.",
+    "OpenDesign authorization code expired; run /opendesign-login again.",
   );
 }
 
