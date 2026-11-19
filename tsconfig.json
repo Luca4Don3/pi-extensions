@@ -17,7 +17,6 @@
   "exclude": [
     "extensions/**/tests/**",
     "extensions/**/examples/**",
-    "extensions/pi-token-speed/**",
-    "extensions/opendesign-bridge/**"
+    "extensions/pi-token-speed/**"
   ]
 }

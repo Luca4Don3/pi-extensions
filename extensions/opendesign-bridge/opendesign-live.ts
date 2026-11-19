@@ -88,6 +88,12 @@ export interface LiveModelConfig {
   contextWindow: number;
   maxTokens: number;
   compat?: Record<string, unknown>;
+  /**
+   * Declared explicitly rather than left to the index signature: every spread
+   * of it (`{ ...m.provenance, maxTokens: "gateway" }`) needs a known object
+   * type, and `unknown` from the catch-all signature silently forbids that.
+   */
+  provenance?: ValueProvenance;
   [key: string]: unknown;
 }
 

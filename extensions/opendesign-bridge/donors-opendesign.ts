@@ -341,7 +341,7 @@ export function findBundledCatalogs(agentDir: string): CatalogLocation[] {
   // ERR_PACKAGE_PATH_NOT_EXPORTED. The directory is right there next to Pi, so
   // looking for it directly is both simpler and immune to that.
   for (const piPkg of piPackageCandidates()) {
-    push(catalogAt(join(piPkg, "node_modules", "@earendil-works", "pi-ai")), "la que usa Pi");
+    push(catalogAt(join(piPkg, "node_modules", "@earendil-works", "pi-ai")), "global install");
   }
 
   for (const dir of storeCatalogs(agentDir)) push(dir, "pi install");
@@ -747,7 +747,13 @@ export const VENDOR_SPEC: Record<string, VendorSpec> = {};
 
 
 export interface Resolved {
-  entry: ModelEntry;
+  /**
+   * A PARTIAL entry: `resolveModel` builds it field by field, so an `id` is not
+   * guaranteed — the caller already knows which model it asked about. Typing it
+   * as a full `ModelEntry` was the only reason six of these lines needed a
+   * cast, and it let `{}` ("no catalog knows this") be expressed as a model.
+   */
+  entry: PartialModelEntry;
   /** The source that supplied the values, if any. */
   source?: string;
   /** Every other provider that also knows this model: corroboration only. */
@@ -756,6 +762,12 @@ export interface Resolved {
   /** The exact id in the donor catalog that matched, prefix included. */
   matchedId?: string;
 }
+
+/**
+ * A donor-derived entry. Only the fields in `BUNDLED_FIELDS` can appear, so
+ * `id` is absent by construction: the model's identity comes from the caller.
+ */
+export type PartialModelEntry = Partial<ModelEntry>;
 
 const withinTolerance = (a: number, b: number) =>
   Math.abs(a - b) <= ROUNDING_TOLERANCE * Math.max(Math.abs(a), Math.abs(b));
@@ -857,10 +869,15 @@ export function resolveByCorroboration(
     ? field.slice("thinkingLevelMapKey:".length)
     : undefined;
   for (const hit of hits) {
+    // The map is keyed by `ThinkingLevel`, but `levelKey` arrives as a plain
+    // string from the `thinkingLevelMapKey:` protocol. Reading through a
+    // string-keyed view is what that protocol means; the `hasOwnProperty`
+    // check above is what keeps the read honest.
+    const map = hit.entry.thinkingLevelMap as Record<string, string | null> | undefined;
     const value = levelKey === undefined
       ? hit.entry[field]
-      : hit.entry.thinkingLevelMap && Object.prototype.hasOwnProperty.call(hit.entry.thinkingLevelMap, levelKey)
-        ? hit.entry.thinkingLevelMap[levelKey]
+      : map && Object.prototype.hasOwnProperty.call(map, levelKey)
+        ? map[levelKey]
         : undefined;
     if (value === undefined) continue;
     let key: string;
@@ -1029,7 +1046,7 @@ export function resolveModel(
   const anyDonor = knowing[0];
 
   if (spec) {
-    const entry: ModelEntry = anyDonor ? copyFields(anyDonor.entry, BUNDLED_FIELDS) : {};
+    const entry: PartialModelEntry = anyDonor ? copyFields(anyDonor.entry, BUNDLED_FIELDS) : {};
     if (spec.input) entry.input = spec.input;
     if (spec.maxTokens !== undefined) entry.maxTokens = spec.maxTokens;
     if (spec.thinkingLevelMap) entry.thinkingLevelMap = spec.thinkingLevelMap as ThinkingLevelMap;
@@ -1061,7 +1078,7 @@ export function resolveModel(
     // A vendor's explicit value is absolute for that field/key; silence falls
     // through to corroboration. In a reasoning map every key is resolved
     // independently, rather than letting a partial vendor map erase the rest.
-    const entry: ModelEntry = {};
+    const entry: PartialModelEntry = {};
     for (const field of BUNDLED_FIELDS) {
       if (field === "thinkingLevelMap") continue;
       if (official.entry[field] !== undefined && isPossibleValue(official.entry, field))
@@ -1081,7 +1098,7 @@ export function resolveModel(
     if (levels.size) {
       const map: Record<string, string | null> = {};
       for (const level of levels) {
-        const officialMap = official.entry.thinkingLevelMap;
+        const officialMap = official.entry.thinkingLevelMap as Record<string, string | null> | undefined;
         if (officialMap && Object.prototype.hasOwnProperty.call(officialMap, level)) {
           map[level] = officialMap[level];
           continue;
@@ -1106,7 +1123,7 @@ export function resolveModel(
   //    the reseller with the strongest claim: without a majority the field
   //    falls back to OpenRouter.
   if (knowing.length) {
-    const entry: ModelEntry = {};
+    const entry: PartialModelEntry = {};
     let decided = 0;
     for (const field of BUNDLED_FIELDS) {
       const r = resolveByCorroboration(knowing, field, undefined, primary);
@@ -1140,8 +1157,8 @@ export function resolveModel(
   return { entry: {}, corroborating: [], rule: "none" };
 }
 
-function copyFields(from: ModelEntry, fields: readonly string[]): ModelEntry {
-  const out: ModelEntry = {};
+function copyFields(from: ModelEntry, fields: readonly string[]): PartialModelEntry {
+  const out: PartialModelEntry = {};
   for (const field of fields) {
     if (from[field] !== undefined) (out as Record<string, unknown>)[field] = from[field];
   }
@@ -1161,7 +1178,7 @@ export default async function opendesignDonorsHelper(): Promise<void> {}
 // ---------------------------------------------------------------------------
 
 export interface OverlayResult {
-  entry: ModelEntry;
+  entry: PartialModelEntry;
   /** The provider that decided the most fields, if any. */
   source?: string;
   /** The exact id that matched, prefix included, so the match is auditable. */
@@ -1205,7 +1222,7 @@ export function overlayDonors(
     if (!before.has(field)) before.set(field, JSON.stringify(out[field]));
   };
 
-  const take = (entry: ModelEntry, fields: readonly string[]) => {
+  const take = (entry: PartialModelEntry, fields: readonly string[]) => {
     for (const field of fields) {
       const value = entry[field];
       if (value === undefined || value === null) continue; // silence, not a value
